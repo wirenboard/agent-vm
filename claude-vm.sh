@@ -111,7 +111,7 @@ VMEOF
 }
 
 claude-vm() {
-  local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9-' '-')-$$"
+  local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
   local host_dir="$(pwd)"
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
