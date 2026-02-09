@@ -175,6 +175,75 @@ VMEOF
   echo "Template ready. Run 'claude-vm' in any project directory."
 }
 
+_claude_vm_security_snapshot() {
+  local host_dir="$1"
+  local snapshot_file="$2"
+  # Backup .git/config for potential restoration
+  if [ -f "${host_dir}/.git/config" ]; then
+    cp "${host_dir}/.git/config" "${snapshot_file}.git-config"
+  fi
+  {
+    find "${host_dir}/.git/hooks" -type f -exec shasum {} \; 2>/dev/null
+    shasum "${host_dir}/.git/config" 2>/dev/null
+    for f in .claude-vm.runtime.sh CLAUDE.md Makefile; do
+      if [ -f "${host_dir}/${f}" ]; then
+        shasum "${host_dir}/${f}"
+      else
+        echo "ABSENT  ${host_dir}/${f}"
+      fi
+    done
+  } | sort > "$snapshot_file"
+}
+
+_claude_vm_security_check() {
+  local host_dir="$1"
+  local snapshot_file="$2"
+  local after_file
+  after_file="$(mktemp)"
+  _claude_vm_security_snapshot "$host_dir" "$after_file"
+
+  if ! diff -q "$snapshot_file" "$after_file" >/dev/null 2>&1; then
+    echo ""
+    echo "⚠️  Security: files modified by the VM session:"
+    diff "$snapshot_file" "$after_file" | grep '^[<>]' | sed 's/^</  Removed:/;s/^>/  Added\/Changed:/'
+    echo ""
+
+    # Check specifically for new/modified hooks
+    local new_hooks
+    new_hooks=$(diff "$snapshot_file" "$after_file" | grep '^>' | grep '\.git/hooks' | awk '{print $NF}')
+    if [ -n "$new_hooks" ]; then
+      echo "⚠️  WARNING: New/modified git hooks detected (these run on YOUR machine):"
+      while read -r hook; do
+        echo "    $hook"
+      done <<< "$new_hooks"
+      echo ""
+      read -r -p "Remove these hooks? [Y/n] " answer
+      if [[ -z "$answer" || "$answer" =~ ^[Yy] ]]; then
+        while read -r hook; do
+          rm -f "$hook"
+          echo "  Removed: $hook"
+        done <<< "$new_hooks"
+      fi
+    fi
+
+    # Check for .git/config changes
+    if diff "$snapshot_file" "$after_file" | grep -q '\.git/config'; then
+      echo "⚠️  WARNING: .git/config was modified during the VM session."
+      echo "    ${host_dir}/.git/config"
+      local config_backup="${snapshot_file}.git-config"
+      # Restore .git/config from the pre-session backup if the user agrees
+      if [ -f "$config_backup" ]; then
+        read -r -p "Restore .git/config from pre-session backup? [Y/n] " answer
+        if [[ -z "$answer" || "$answer" =~ ^[Yy] ]]; then
+          cp "$config_backup" "${host_dir}/.git/config"
+          echo "  Restored: ${host_dir}/.git/config"
+        fi
+      fi
+    fi
+  fi
+  rm -f "$after_file" "${after_file}.git-config"
+}
+
 claude-vm() {
   local args=("$@")
   local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
@@ -185,16 +254,27 @@ claude-vm() {
     return 1
   fi
 
+  # Security: snapshot before session
+  local security_snapshot
+  security_snapshot="$(mktemp)"
+
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
+    rm -f "$security_snapshot" "${security_snapshot}.git-config"
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
+  _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
+
+  # Ensure .git/hooks exists for read-only mount
+  mkdir -p "${host_dir}/.git/hooks"
+
   echo "Starting VM '$vm_name'..."
+  # Mount project dir writable, but .git/hooks and .git/config read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${host_dir}/.git/config\",\"writable\":false}]" \
     --tty=false &>/dev/null
 
   limactl start "$vm_name" &>/dev/null
@@ -206,6 +286,7 @@ claude-vm() {
   fi
 
   limactl shell --workdir "$host_dir" "$vm_name" claude --dangerously-skip-permissions "${args[@]}"
+  _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_cleanup
   trap - EXIT INT TERM
@@ -220,15 +301,26 @@ claude-vm-shell() {
     return 1
   fi
 
+  # Security: snapshot before session
+  local security_snapshot
+  security_snapshot="$(mktemp)"
+
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
+    rm -f "$security_snapshot" "${security_snapshot}.git-config"
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
+  _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
+
+  # Ensure .git/hooks exists for read-only mount
+  mkdir -p "${host_dir}/.git/hooks"
+
+  # Mount project dir writable, but .git/hooks and .git/config read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${host_dir}/.git/config\",\"writable\":false}]" \
     --tty=false &>/dev/null
 
   limactl start "$vm_name" &>/dev/null
@@ -241,6 +333,7 @@ claude-vm-shell() {
   echo "VM: $vm_name | Dir: $host_dir"
   echo "Type 'exit' to stop and delete the VM"
   limactl shell --workdir "$host_dir" "$vm_name" bash -l
+  _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_shell_cleanup
   trap - EXIT INT TERM
