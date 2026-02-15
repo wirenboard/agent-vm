@@ -76,6 +76,8 @@ claude-vm-setup() {
   echo "Creating VM template..."
   limactl create --name="$CLAUDE_VM_TEMPLATE" template:debian-13 \
     --set '.mounts=[]' \
+    --set '.containerd.system=false' \
+    --set '.containerd.user=false' \
     --disk="$disk" \
     --memory="$memory" \
     --tty=false
@@ -86,8 +88,10 @@ claude-vm-setup() {
 
   echo "Installing base packages..."
   limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get update
+  # sshfs is required for Lima's reverse-sshfs mounts; pre-installing it avoids
+  # a slow apt-get update + install on every clone boot (~15s savings)
   limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git curl jq
+    git curl jq sshfs
 
   if ! $minimal; then
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -134,10 +138,6 @@ claude-vm-setup() {
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://claude.ai/install.sh | bash"
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'echo "export PATH=\$HOME/.local/bin:\$HOME/.claude/local/bin:\$PATH" >> ~/.bashrc'
 
-  # Authenticate Claude (saves token in template, inherited by clones)
-  echo "Setting up Claude authentication..."
-  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "claude 'Ok I am logged in, I can exit now.'"
-
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
     echo "Configuring Chrome MCP server..."
@@ -163,6 +163,23 @@ fi
 VMEOF
   fi
 
+  # Pre-configure fuse for reverse-sshfs mounts (avoids setup delay on clone boot)
+  limactl shell "$CLAUDE_VM_TEMPLATE" sudo bash -c '
+    for conf in /etc/fuse.conf /etc/fuse3.conf; do
+      if [ -e "$conf" ]; then
+        grep -q "^user_allow_other" "$conf" || echo "user_allow_other" >> "$conf"
+      fi
+    done
+  '
+
+  # Disable SSH host key regeneration on clones (reuse template keys, saves ~1s per boot)
+  limactl shell "$CLAUDE_VM_TEMPLATE" sudo bash -c '
+    cat > /etc/cloud/cloud.cfg.d/99-lima-fast.cfg << CIEOF
+ssh_deletekeys: false
+ssh_genkeytypes: []
+CIEOF
+  '
+
   # Run user's custom setup script if it exists
   local user_setup="$HOME/.claude-vm.setup.sh"
   if [ -f "$user_setup" ]; then
@@ -173,6 +190,33 @@ VMEOF
   limactl stop "$CLAUDE_VM_TEMPLATE"
 
   echo "Template ready. Run 'claude-vm' in any project directory."
+}
+
+_claude_vm_start_proxy() {
+  local host_dir="$1"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  echo "Starting API proxy..."
+  exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
+  _claude_vm_proxy_pid=$!
+  if ! read -r -t 5 _claude_vm_proxy_port <&3; then
+    echo "Error: API proxy failed to start." >&2
+    kill "$_claude_vm_proxy_pid" 2>/dev/null
+    exec 3<&-
+    return 1
+  fi
+  exec 3<&-
+  echo "API proxy listening on port $_claude_vm_proxy_port"
+}
+
+_claude_vm_write_dummy_credentials() {
+  local vm_name="$1"
+  # Write dummy credentials so Claude Code detects a Max subscription
+  # (selects Opus model, etc.) — real auth is handled by the host proxy
+  limactl shell "$vm_name" bash -c 'mkdir -p ~/.claude && cat > ~/.claude/.credentials.json << '\''CREDS'\''
+{"claudeAiOauth":{"accessToken":"dummy","refreshToken":"dummy","expiresAt":9999999999999,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}
+CREDS'
 }
 
 _claude_vm_security_snapshot() {
@@ -254,12 +298,15 @@ claude-vm() {
     return 1
   fi
 
+  _claude_vm_start_proxy "$host_dir" || return 1
+
   # Security: snapshot before session
   local security_snapshot
   security_snapshot="$(mktemp)"
 
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
+    [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
@@ -272,12 +319,18 @@ claude-vm() {
   mkdir -p "${host_dir}/.git/hooks"
 
   echo "Starting VM '$vm_name'..."
-  # Mount project dir writable, but .git/hooks and .git/config read-only at the Lima level (VM root cannot override)
+  # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
+  # Note: .git/config is a file (not a directory) so it cannot be a Lima mount;
+  # it is protected via the pre/post-session security check instead.
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${host_dir}/.git/config\",\"writable\":false}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false}]" \
+    --set '.containerd.system=false' \
+    --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
   limactl start "$vm_name" &>/dev/null
+
+  _claude_vm_write_dummy_credentials "$vm_name"
 
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
@@ -285,7 +338,9 @@ claude-vm() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
-  limactl shell --workdir "$host_dir" "$vm_name" claude --dangerously-skip-permissions "${args[@]}"
+  limactl shell --workdir "$host_dir" "$vm_name" \
+    env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+    claude --dangerously-skip-permissions "${args[@]}"
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_cleanup
@@ -301,12 +356,15 @@ claude-vm-shell() {
     return 1
   fi
 
+  _claude_vm_start_proxy "$host_dir" || return 1
+
   # Security: snapshot before session
   local security_snapshot
   security_snapshot="$(mktemp)"
 
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
+    [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
@@ -318,12 +376,16 @@ claude-vm-shell() {
   # Ensure .git/hooks exists for read-only mount
   mkdir -p "${host_dir}/.git/hooks"
 
-  # Mount project dir writable, but .git/hooks and .git/config read-only at the Lima level (VM root cannot override)
+  # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${host_dir}/.git/config\",\"writable\":false}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false}]" \
+    --set '.containerd.system=false' \
+    --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
   limactl start "$vm_name" &>/dev/null
+
+  _claude_vm_write_dummy_credentials "$vm_name"
 
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
@@ -331,8 +393,11 @@ claude-vm-shell() {
   fi
 
   echo "VM: $vm_name | Dir: $host_dir"
+  echo "API proxy: http://host.lima.internal:${_claude_vm_proxy_port}"
   echo "Type 'exit' to stop and delete the VM"
-  limactl shell --workdir "$host_dir" "$vm_name" bash -l
+  limactl shell --workdir "$host_dir" "$vm_name" \
+    env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+    bash -l
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_shell_cleanup
