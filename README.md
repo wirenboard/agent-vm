@@ -95,6 +95,62 @@ npm install
 docker compose up -d
 ```
 
+## GitHub MCP Proxy
+
+The GitHub MCP proxy (`github-mcp-proxy.py`) runs on the host and gives the VM access to a single GitHub repository via the [GitHub MCP Server](https://github.com/github/github-mcp-server), without exposing any credentials to the VM.
+
+### How it works
+
+1. The proxy runs on the host, listening on a local port
+2. The VM connects to the proxy over Lima's host networking
+3. The proxy injects the GitHub token and forwards requests to GitHub's MCP endpoint
+4. **Repo scope enforcement** ensures the VM can only access the configured repository
+
+### Security layers
+
+The proxy enforces repo scoping through multiple layers:
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Owner/repo check** | Tool arguments with `owner`/`repo` must match the configured repo. Missing values are auto-injected. |
+| **Search query scoping** | `repo:OWNER/REPO` is injected into search queries. `org:` and `user:` qualifiers are rejected. |
+| **Tool allowlist** | Unknown tools are blocked by default (default-deny). Non-repo-scoped tools (`search_users`, `get_teams`, etc.) are blocked. |
+| **Server-side filtering** | `X-MCP-Toolsets` header limits GitHub's server to `repos,issues,pull_requests,git,labels` by default. |
+| **Lockdown mode** | `X-MCP-Lockdown` is enabled by default, hiding issue details from users without push access. |
+| **Header protection** | VM cannot override `X-MCP-*` headers — the proxy strips them before injecting host-configured values. |
+
+### Usage
+
+```bash
+GITHUB_MCP_TOKEN=ghu_... \
+GITHUB_MCP_OWNER=myorg \
+GITHUB_MCP_REPO=myrepo \
+  python3 github-mcp-proxy.py
+# Prints the listening port to stdout
+```
+
+### Configuration
+
+| Env var | Description | Default |
+|---------|-------------|---------|
+| `GITHUB_MCP_TOKEN` | GitHub token (required) | — |
+| `GITHUB_MCP_OWNER` | Repository owner (required) | — |
+| `GITHUB_MCP_REPO` | Repository name (required) | — |
+| `GITHUB_MCP_TOOLSETS` | Comma-separated [toolsets](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md) | `repos,issues,pull_requests,git,labels` |
+| `GITHUB_MCP_TOOLS` | Comma-separated tool names (fine-grained) | *(all in allowed toolsets)* |
+| `GITHUB_MCP_READONLY` | Set to `1` for read-only mode | `0` |
+| `GITHUB_MCP_LOCKDOWN` | Set to `0` to disable lockdown | `1` |
+| `GITHUB_MCP_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
+
+### GitHub App token generation
+
+Two helper scripts generate repo-scoped tokens via a GitHub App:
+
+- **`github_app_token.sh`** — Pure bash. Generates installation tokens from a GitHub App private key.
+- **`github_app_token_demo.py`** — Python. Supports device flow (OAuth) for user tokens, with caching.
+
+See the scripts for usage instructions.
+
 ## How it works
 
 1. **`claude-vm-setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code, and stops it as a reusable template
