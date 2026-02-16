@@ -97,18 +97,29 @@ docker compose up -d
 
 ## GitHub MCP Proxy
 
-The GitHub MCP proxy (`github-mcp-proxy.py`) runs on the host and gives the VM access to a single GitHub repository via the [GitHub MCP Server](https://github.com/github/github-mcp-server), without exposing any credentials to the VM.
+The GitHub MCP proxy gives the VM access to a single GitHub repository via the [GitHub MCP Server](https://github.com/github/github-mcp-server), without exposing any credentials to the VM.
 
-### How it works
+When you run `claude-vm` inside a git repo with a GitHub remote, it automatically:
 
-1. The proxy runs on the host, listening on a local port
-2. The VM connects to the proxy over Lima's host networking
-3. The proxy injects the GitHub token and forwards requests to GitHub's MCP endpoint
-4. **Repo scope enforcement** ensures the VM can only access the configured repository
+1. Detects the repository from `git remote`
+2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
+3. Starts the proxy on the host, listening on a local port
+4. Configures the VM to connect to the proxy over Lima's host networking
 
-### Security layers
+The proxy injects the GitHub token into upstream requests and enforces repo scope, so the VM can only access the current repository.
 
-The proxy enforces repo scoping through multiple layers:
+### Token generation and scoping
+
+Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using the [device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow):
+
+1. **One-time setup**: Create a GitHub App with `contents: write` permission and install it on your org/account. The App's Client ID is configured in `claude-vm.sh`.
+2. **Per-session**: `github_app_token_demo.py` initiates the device flow — you approve in a browser, and a user access token is returned.
+3. **Repo scoping**: The `--repo` flag resolves the repository's numeric ID and passes it as `repository_id` during the OAuth token exchange. GitHub scopes the resulting token to that single repository at the API level.
+4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired, so you only need to re-authorize when the refresh token expires.
+
+### Defense-in-depth
+
+Even though the token is already scoped to one repository by GitHub, the proxy adds multiple enforcement layers:
 
 | Layer | Mechanism |
 |-------|-----------|
@@ -119,7 +130,9 @@ The proxy enforces repo scoping through multiple layers:
 | **Lockdown mode** | `X-MCP-Lockdown` is enabled by default, hiding issue details from users without push access. |
 | **Header protection** | VM cannot override `X-MCP-*` headers — the proxy strips them before injecting host-configured values. |
 
-### Usage
+### Standalone usage
+
+The proxy can also be run independently of `claude-vm`:
 
 ```bash
 GITHUB_MCP_TOKEN=ghu_... \
@@ -141,15 +154,6 @@ GITHUB_MCP_REPO=myrepo \
 | `GITHUB_MCP_READONLY` | Set to `1` for read-only mode | `0` |
 | `GITHUB_MCP_LOCKDOWN` | Set to `0` to disable lockdown | `1` |
 | `GITHUB_MCP_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
-
-### GitHub App token generation
-
-Two helper scripts generate repo-scoped tokens via a GitHub App:
-
-- **`github_app_token.sh`** — Pure bash. Generates installation tokens from a GitHub App private key.
-- **`github_app_token_demo.py`** — Python. Supports device flow (OAuth) for user tokens, with caching.
-
-See the scripts for usage instructions.
 
 ## How it works
 
