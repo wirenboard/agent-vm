@@ -55,7 +55,7 @@ cd your-project
 claude-vm
 ```
 
-Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions`. The VM is deleted when Claude exits.
+Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
 
 Any arguments passed to `claude-vm` are forwarded to the `claude` command:
 

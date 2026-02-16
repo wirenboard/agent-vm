@@ -138,6 +138,7 @@ claude-vm-setup() {
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://claude.ai/install.sh | bash"
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'echo "export PATH=\$HOME/.local/bin:\$HOME/.claude/local/bin:\$PATH" >> ~/.bashrc'
 
+
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
     echo "Configuring Chrome MCP server..."
@@ -219,6 +220,131 @@ _claude_vm_write_dummy_credentials() {
 CREDS'
 }
 
+_claude_vm_start_github_mcp() {
+  local host_dir="$1"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # Detect repo from git remote
+  local repo_url
+  repo_url=$(git -C "$host_dir" remote get-url origin 2>/dev/null)
+  if [ -z "$repo_url" ]; then
+    echo "Warning: No git remote found, skipping GitHub MCP" >&2
+    return 1
+  fi
+
+  # Parse owner/repo from remote URL
+  local owner repo
+  read -r owner repo < <(python3 -c "
+import re, sys
+url = sys.argv[1]
+for pat in [r'git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$',
+            r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$']:
+    m = re.match(pat, url)
+    if m:
+        print(m.group(1), m.group(2))
+        sys.exit(0)
+sys.exit(1)
+" "$repo_url")
+  if [ -z "$owner" ] || [ -z "$repo" ]; then
+    echo "Warning: Cannot parse GitHub remote '$repo_url', skipping GitHub MCP" >&2
+    return 1
+  fi
+
+  # Get scoped user token via device flow
+  echo "Requesting GitHub token for $owner/$repo..."
+  local token
+  token=$(python3 "$script_dir/github_app_token_demo.py" \
+    user-token --client-id Iv23liisR1WdpJmDUPLT \
+    --repo "$repo_url" --token-only \
+    --cache-dir "$HOME/.cache/claude-vm")
+  if [ -z "$token" ]; then
+    echo "Warning: Failed to get GitHub token, skipping GitHub MCP" >&2
+    return 1
+  fi
+
+  # Start GitHub MCP proxy (injects token, enforces repo scope)
+  echo "Starting GitHub MCP proxy..."
+  exec 4< <(GITHUB_MCP_TOKEN="$token" GITHUB_MCP_OWNER="$owner" GITHUB_MCP_REPO="$repo" \
+    GITHUB_MCP_PROXY_DEBUG="${GITHUB_MCP_PROXY_DEBUG:-0}" \
+    python3 "$script_dir/github-mcp-proxy.py")
+  _claude_vm_github_mcp_pid=$!
+  if ! read -r -t 5 _claude_vm_github_mcp_port <&4; then
+    echo "Warning: GitHub MCP proxy failed to start" >&2
+    kill "$_claude_vm_github_mcp_pid" 2>/dev/null
+    exec 4<&-
+    return 1
+  fi
+  exec 4<&-
+  echo "GitHub MCP proxy on port $_claude_vm_github_mcp_port (scope: $owner/$repo)"
+
+  # Start Git HTTP proxy (injects token, enforces repo scope)
+  echo "Starting Git HTTP proxy..."
+  exec 5< <(GITHUB_MCP_TOKEN="$token" GITHUB_MCP_OWNER="$owner" GITHUB_MCP_REPO="$repo" \
+    python3 "$script_dir/github-git-proxy.py")
+  _claude_vm_git_proxy_pid=$!
+  if ! read -r -t 5 _claude_vm_git_proxy_port <&5; then
+    echo "Warning: Git HTTP proxy failed to start" >&2
+    kill "$_claude_vm_git_proxy_pid" 2>/dev/null
+    exec 5<&-
+    # Non-fatal: MCP still works, just no git push
+  else
+    echo "Git HTTP proxy on port $_claude_vm_git_proxy_port (scope: $owner/$repo)"
+  fi
+  exec 5<&-
+
+  # Export for use by other functions
+  _claude_vm_github_owner="$owner"
+  _claude_vm_github_repo="$repo"
+}
+
+_claude_vm_inject_github_mcp() {
+  local vm_name="$1"
+  local port="$2"
+  limactl shell "$vm_name" bash -c "
+    CONFIG=\$HOME/.claude.json
+    if [ -f \"\$CONFIG\" ]; then
+      jq '.mcpServers.github = {\"type\":\"http\",\"url\":\"http://host.lima.internal:${port}/mcp\"}' \
+        \"\$CONFIG\" > \"\$CONFIG.tmp\" && mv \"\$CONFIG.tmp\" \"\$CONFIG\"
+    else
+      echo '{\"mcpServers\":{\"github\":{\"type\":\"http\",\"url\":\"http://host.lima.internal:${port}/mcp\"}}}' > \"\$CONFIG\"
+    fi
+  "
+}
+
+_claude_vm_inject_git_proxy() {
+  local vm_name="$1"
+  local git_port="$2"
+  local owner="$3"
+  local repo="$4"
+
+  # Configure git to route github.com through the proxy
+  limactl shell "$vm_name" bash -c "
+    git config --global url.\"http://host.lima.internal:${git_port}/\".insteadOf \"git@github.com:\"
+    git config --global url.\"http://host.lima.internal:${git_port}/\".insteadOf \"https://github.com/\"
+  "
+
+  # Write Claude instructions about git access
+  limactl shell "$vm_name" bash -c "
+    mkdir -p \$HOME/.claude
+    cat >> \$HOME/.claude/CLAUDE.md << 'INSTRUCTIONS'
+
+# Git access
+
+Git push and pull to GitHub work out of the box. The remote URL is automatically
+rewritten to go through a host-side proxy that injects credentials. You can use
+standard git commands:
+
+    git push origin main
+    git push origin HEAD:my-branch
+    git pull origin main
+
+The proxy only allows access to the current repository (${owner}/${repo}).
+Pushes to other repositories will be rejected.
+INSTRUCTIONS
+  "
+}
+
 _claude_vm_security_snapshot() {
   local host_dir="$1"
   local snapshot_file="$2"
@@ -289,7 +415,14 @@ _claude_vm_security_check() {
 }
 
 claude-vm() {
-  local args=("$@")
+  local use_github=false
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --github) use_github=true; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
   local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
   local host_dir="$(pwd)"
 
@@ -300,6 +433,10 @@ claude-vm() {
 
   _claude_vm_start_proxy "$host_dir" || return 1
 
+  if $use_github; then
+    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+  fi
+
   # Security: snapshot before session
   local security_snapshot
   security_snapshot="$(mktemp)"
@@ -307,6 +444,8 @@ claude-vm() {
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
+    [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
+    [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
@@ -332,6 +471,14 @@ claude-vm() {
 
   _claude_vm_write_dummy_credentials "$vm_name"
 
+  if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
+    _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
+  fi
+  if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
+    _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
+      "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+  fi
+
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
     echo "Running project runtime setup..."
@@ -340,6 +487,7 @@ claude-vm() {
 
   limactl shell --workdir "$host_dir" "$vm_name" \
     env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+    IS_SANDBOX=1 \
     claude --dangerously-skip-permissions "${args[@]}"
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
@@ -348,6 +496,13 @@ claude-vm() {
 }
 
 claude-vm-shell() {
+  local use_github=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --github) use_github=true; shift ;;
+      *) shift ;;
+    esac
+  done
   local vm_name="claude-debug-$$"
   local host_dir="$(pwd)"
 
@@ -358,6 +513,10 @@ claude-vm-shell() {
 
   _claude_vm_start_proxy "$host_dir" || return 1
 
+  if $use_github; then
+    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+  fi
+
   # Security: snapshot before session
   local security_snapshot
   security_snapshot="$(mktemp)"
@@ -365,6 +524,8 @@ claude-vm-shell() {
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
+    [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
+    [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
@@ -387,6 +548,14 @@ claude-vm-shell() {
 
   _claude_vm_write_dummy_credentials "$vm_name"
 
+  if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
+    _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
+  fi
+  if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
+    _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
+      "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+  fi
+
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
@@ -394,6 +563,12 @@ claude-vm-shell() {
 
   echo "VM: $vm_name | Dir: $host_dir"
   echo "API proxy: http://host.lima.internal:${_claude_vm_proxy_port}"
+  if [ -n "$_claude_vm_github_mcp_port" ]; then
+    echo "GitHub MCP: http://host.lima.internal:${_claude_vm_github_mcp_port}/mcp"
+  fi
+  if [ -n "$_claude_vm_git_proxy_port" ]; then
+    echo "Git proxy:  http://host.lima.internal:${_claude_vm_git_proxy_port}"
+  fi
   echo "Type 'exit' to stop and delete the VM"
   limactl shell --workdir "$host_dir" "$vm_name" \
     env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
