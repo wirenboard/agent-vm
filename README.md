@@ -55,7 +55,7 @@ cd your-project
 claude-vm
 ```
 
-Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions`. The VM is deleted when Claude exits.
+Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
 
 Any arguments passed to `claude-vm` are forwarded to the `claude` command:
 
@@ -94,6 +94,66 @@ Create this file at the root of any project. It runs inside the cloned VM each t
 npm install
 docker compose up -d
 ```
+
+## GitHub MCP Proxy
+
+The GitHub MCP proxy gives the VM access to a single GitHub repository via the [GitHub MCP Server](https://github.com/github/github-mcp-server), without exposing any credentials to the VM.
+
+When you run `claude-vm` inside a git repo with a GitHub remote, it automatically:
+
+1. Detects the repository from `git remote`
+2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
+3. Starts the proxy on the host, listening on a local port
+4. Configures the VM to connect to the proxy over Lima's host networking
+
+The proxy injects the GitHub token into upstream requests and enforces repo scope, so the VM can only access the current repository.
+
+### Token generation and scoping
+
+Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using the [device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow):
+
+1. **One-time setup**: Create a GitHub App with `contents: write` permission and install it on your org/account. The App's Client ID is configured in `claude-vm.sh`.
+2. **Per-session**: `github_app_token_demo.py` initiates the device flow — you approve in a browser, and a user access token is returned.
+3. **Repo scoping**: The `--repo` flag resolves the repository's numeric ID and passes it as `repository_id` during the OAuth token exchange. GitHub scopes the resulting token to that single repository at the API level.
+4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired, so you only need to re-authorize when the refresh token expires.
+
+### Defense-in-depth
+
+Even though the token is already scoped to one repository by GitHub, the proxy adds multiple enforcement layers:
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Owner/repo check** | Tool arguments with `owner`/`repo` must match the configured repo. Missing values are auto-injected. |
+| **Search query scoping** | `repo:OWNER/REPO` is injected into search queries. `org:` and `user:` qualifiers are rejected. |
+| **Tool allowlist** | Unknown tools are blocked by default (default-deny). Non-repo-scoped tools (`search_users`, `get_teams`, etc.) are blocked. |
+| **Server-side filtering** | `X-MCP-Toolsets` header limits GitHub's server to `repos,issues,pull_requests,git,labels` by default. |
+| **Lockdown mode** | `X-MCP-Lockdown` is enabled by default, hiding issue details from users without push access. |
+| **Header protection** | VM cannot override `X-MCP-*` headers — the proxy strips them before injecting host-configured values. |
+
+### Standalone usage
+
+The proxy can also be run independently of `claude-vm`:
+
+```bash
+GITHUB_MCP_TOKEN=ghu_... \
+GITHUB_MCP_OWNER=myorg \
+GITHUB_MCP_REPO=myrepo \
+  python3 github-mcp-proxy.py
+# Prints the listening port to stdout
+```
+
+### Configuration
+
+| Env var | Description | Default |
+|---------|-------------|---------|
+| `GITHUB_MCP_TOKEN` | GitHub token (required) | — |
+| `GITHUB_MCP_OWNER` | Repository owner (required) | — |
+| `GITHUB_MCP_REPO` | Repository name (required) | — |
+| `GITHUB_MCP_TOOLSETS` | Comma-separated [toolsets](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md) | `repos,issues,pull_requests,git,labels` |
+| `GITHUB_MCP_TOOLS` | Comma-separated tool names (fine-grained) | *(all in allowed toolsets)* |
+| `GITHUB_MCP_READONLY` | Set to `1` for read-only mode | `0` |
+| `GITHUB_MCP_LOCKDOWN` | Set to `0` to disable lockdown | `1` |
+| `GITHUB_MCP_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
 
 ## How it works
 
