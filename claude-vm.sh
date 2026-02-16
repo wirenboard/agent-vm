@@ -317,11 +317,21 @@ _claude_vm_inject_git_proxy() {
   local git_port="$2"
   local owner="$3"
   local repo="$4"
+  local proxy_base="http://host.lima.internal:${git_port}/${owner}/${repo}"
 
-  # Configure git to route github.com through the proxy
+  # Get git user identity from host
+  local git_name git_email
+  git_name=$(git config user.name 2>/dev/null || echo "")
+  git_email=$(git config user.email 2>/dev/null || echo "")
+
+  # Rewrite only this repo's URLs through the proxy.
+  # git insteadOf is prefix-matched, so "git@github.com:owner/repo" matches
+  # both "git@github.com:owner/repo.git" and "git@github.com:owner/repo".
   limactl shell "$vm_name" bash -c "
-    git config --global url.\"http://host.lima.internal:${git_port}/\".insteadOf \"git@github.com:\"
-    git config --global url.\"http://host.lima.internal:${git_port}/\".insteadOf \"https://github.com/\"
+    git config --global url.\"${proxy_base}\".insteadOf \"git@github.com:${owner}/${repo}\"
+    git config --global --add url.\"${proxy_base}\".insteadOf \"https://github.com/${owner}/${repo}\"
+    ${git_name:+git config --global user.name \"$git_name\"}
+    ${git_email:+git config --global user.email \"$git_email\"}
   "
 
   # Write Claude instructions about git access
@@ -331,16 +341,16 @@ _claude_vm_inject_git_proxy() {
 
 # Git access
 
-Git push and pull to GitHub work out of the box. The remote URL is automatically
-rewritten to go through a host-side proxy that injects credentials. You can use
-standard git commands:
+Git push and pull to GitHub work out of the box for this repository.
+The remote URL is automatically rewritten to go through a host-side proxy
+that injects credentials. You can use standard git commands:
 
     git push origin main
     git push origin HEAD:my-branch
     git pull origin main
 
-The proxy only allows access to the current repository (${owner}/${repo}).
-Pushes to other repositories will be rejected.
+Only ${owner}/${repo} has credentials configured. Other repos will require
+their own authentication.
 INSTRUCTIONS
   "
 }

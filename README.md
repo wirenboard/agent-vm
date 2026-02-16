@@ -95,18 +95,17 @@ npm install
 docker compose up -d
 ```
 
-## GitHub MCP Proxy
+## GitHub Integration
 
-The GitHub MCP proxy gives the VM access to a single GitHub repository via the [GitHub MCP Server](https://github.com/github/github-mcp-server), without exposing any credentials to the VM.
-
-When you run `claude-vm` inside a git repo with a GitHub remote, it automatically:
+When you run `claude-vm --github` inside a git repo with a GitHub remote, it automatically:
 
 1. Detects the repository from `git remote`
 2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
-3. Starts the proxy on the host, listening on a local port
-4. Configures the VM to connect to the proxy over Lima's host networking
+3. Starts two host-side proxies: one for the GitHub MCP Server, one for Git HTTP
+4. Configures the VM so both `git push`/`pull` and MCP tools work transparently
+5. Writes instructions to `~/.claude/CLAUDE.md` in the VM so Claude knows git is available
 
-The proxy injects the GitHub token into upstream requests and enforces repo scope, so the VM can only access the current repository.
+No credentials are ever exposed to the VM. Both proxies inject the token on the host side and enforce repo scope.
 
 ### Token generation and scoping
 
@@ -117,7 +116,33 @@ Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using t
 3. **Repo scoping**: The `--repo` flag resolves the repository's numeric ID and passes it as `repository_id` during the OAuth token exchange. GitHub scopes the resulting token to that single repository at the API level.
 4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired, so you only need to re-authorize when the refresh token expires.
 
-### Defense-in-depth
+### Git HTTP Proxy
+
+The Git HTTP proxy (`github-git-proxy.py`) lets the VM push and pull via standard git commands without SSH keys or tokens in the VM.
+
+**How it works:**
+
+1. The proxy runs on the host, listening on HTTP
+2. `claude-vm.sh` configures git's `url.<proxy>.insteadOf` in the VM's `~/.gitconfig` to rewrite the repo's SSH and HTTPS URLs through the proxy
+3. The proxy injects Basic auth (`x-access-token:TOKEN`) for requests matching the configured repo
+4. Requests for other repos are forwarded without credentials (they fail auth on GitHub's side)
+5. The host's git `user.name` and `user.email` are copied into the VM
+
+**Configuration:**
+
+| Env var | Description | Default |
+|---------|-------------|---------|
+| `GITHUB_MCP_TOKEN` | GitHub token (required) | — |
+| `GITHUB_MCP_OWNER` | Repository owner (required) | — |
+| `GITHUB_MCP_REPO` | Repository name (required) | — |
+| `GITHUB_GIT_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
+| `GITHUB_GIT_PROXY_LOG_DIR` | Directory for log file | `.` |
+
+### GitHub MCP Proxy
+
+The GitHub MCP proxy (`github-mcp-proxy.py`) gives the VM access to GitHub's [MCP Server](https://github.com/github/github-mcp-server) for issues, PRs, code search, and other API operations.
+
+**Defense-in-depth:**
 
 Even though the token is already scoped to one repository by GitHub, the proxy adds multiple enforcement layers:
 
@@ -130,19 +155,7 @@ Even though the token is already scoped to one repository by GitHub, the proxy a
 | **Lockdown mode** | `X-MCP-Lockdown` is enabled by default, hiding issue details from users without push access. |
 | **Header protection** | VM cannot override `X-MCP-*` headers — the proxy strips them before injecting host-configured values. |
 
-### Standalone usage
-
-The proxy can also be run independently of `claude-vm`:
-
-```bash
-GITHUB_MCP_TOKEN=ghu_... \
-GITHUB_MCP_OWNER=myorg \
-GITHUB_MCP_REPO=myrepo \
-  python3 github-mcp-proxy.py
-# Prints the listening port to stdout
-```
-
-### Configuration
+**Configuration:**
 
 | Env var | Description | Default |
 |---------|-------------|---------|
@@ -154,6 +167,21 @@ GITHUB_MCP_REPO=myrepo \
 | `GITHUB_MCP_READONLY` | Set to `1` for read-only mode | `0` |
 | `GITHUB_MCP_LOCKDOWN` | Set to `0` to disable lockdown | `1` |
 | `GITHUB_MCP_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
+
+### Standalone usage
+
+Both proxies can be run independently of `claude-vm`:
+
+```bash
+# MCP proxy
+GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
+  python3 github-mcp-proxy.py
+
+# Git HTTP proxy
+GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
+  python3 github-git-proxy.py
+# Both print the listening port to stdout
+```
 
 ## How it works
 
