@@ -95,6 +95,18 @@ npm install
 docker compose up -d
 ```
 
+## Claude API Proxy
+
+The host-side API proxy (`claude-vm-proxy.py`) keeps your Claude credentials out of the VM entirely. It reads OAuth tokens from the host's `~/.claude/.credentials.json` (or `ANTHROPIC_API_KEY` env var), injects them into requests, and forwards to `api.anthropic.com`. The VM only sees `ANTHROPIC_BASE_URL` pointing at the proxy.
+
+**OAuth token refresh:** When the OAuth access token is about to expire (within 5 minutes), the proxy automatically refreshes it using the standard OAuth `refresh_token` grant against `platform.claude.com`. The refreshed token is saved back to disk atomically (with file locking for concurrency safety). This uses only Python stdlib (`http.client`) — no external dependencies required.
+
+| Env var | Description | Default |
+|---------|-------------|---------|
+| `ANTHROPIC_API_KEY` | API key (takes priority over OAuth) | — |
+| `CLAUDE_VM_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
+| `CLAUDE_VM_PROXY_LOG_DIR` | Directory for log file | `.` |
+
 ## GitHub Integration
 
 When you run `claude-vm --github` inside a git repo with a GitHub remote, it automatically:

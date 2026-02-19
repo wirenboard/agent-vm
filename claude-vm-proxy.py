@@ -11,6 +11,7 @@ Usage:
     # Prints the listening port to stdout, then serves until SIGTERM.
 """
 
+import fcntl
 import http.client
 import http.server
 import json
@@ -20,12 +21,21 @@ import ssl
 import sys
 import socketserver
 import time
+import threading
 
 API_HOST = "api.anthropic.com"
 API_PORT = 443
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+CREDENTIALS_DIR = os.path.expanduser("~/.claude")
+TOKEN_HOST = "platform.claude.com"
+TOKEN_PATH = "/v1/oauth/token"
+_token_use_tls = True  # Tests set this to False to use plain HTTP mock server
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
+EXPIRY_BUFFER_SECS = 300  # Refresh 5 minutes before expiry (matches Claude CLI)
 DEBUG = os.environ.get("CLAUDE_VM_PROXY_DEBUG", "0") == "1"
 _log_file = None
+_refresh_lock = threading.Lock()
 
 
 def _get_log_file():
@@ -53,6 +63,161 @@ def redact(value, show=8):
     return value[:show] + "..."
 
 
+def _read_oauth_creds():
+    """Read OAuth credentials from disk. Returns (creds_dict, oauth_section, error)."""
+    try:
+        with open(CREDENTIALS_PATH, "r") as f:
+            creds = json.load(f)
+    except FileNotFoundError:
+        return None, None, (
+            "No credentials found. Set ANTHROPIC_API_KEY or run 'claude' on "
+            "the host to create ~/.claude/.credentials.json"
+        )
+    except (json.JSONDecodeError, OSError) as e:
+        return None, None, f"Failed to read credentials: {e}"
+
+    oauth = creds.get("claudeAiOauth", {})
+    return creds, oauth, None
+
+
+def _is_token_expiring(oauth):
+    """Check if token is expired or within EXPIRY_BUFFER_SECS of expiry."""
+    expires_at = oauth.get("expiresAt")
+    if not expires_at:
+        return False
+    try:
+        expires_ts = float(expires_at) / 1000
+    except (ValueError, TypeError):
+        return False
+    return time.time() + EXPIRY_BUFFER_SECS > expires_ts
+
+
+def _refresh_oauth_token(refresh_token):
+    """Exchange refresh_token for a new access_token via Anthropic's OAuth endpoint.
+    Returns (new_oauth_dict, error_message)."""
+    payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": OAUTH_SCOPES,
+    }).encode()
+
+    try:
+        if _token_use_tls:
+            conn = http.client.HTTPSConnection(TOKEN_HOST, timeout=30)
+        else:
+            conn = http.client.HTTPConnection(TOKEN_HOST, timeout=30)
+        try:
+            conn.request("POST", TOKEN_PATH, body=payload, headers={
+                "Content-Type": "application/json",
+            })
+            resp = conn.getresponse()
+            body = resp.read()
+        finally:
+            conn.close()
+        if resp.status != 200:
+            debug(f"Token refresh HTTP {resp.status}: {body[:200].decode(errors='replace')}")
+            return None, f"Token refresh failed (HTTP {resp.status})"
+        data = json.loads(body)
+    except Exception as e:
+        return None, f"Token refresh failed: {e}"
+
+    access_token = data.get("access_token")
+    if not access_token:
+        return None, "Token refresh response missing access_token"
+
+    new_refresh = data.get("refresh_token", refresh_token)
+    expires_in = int(data.get("expires_in", 3600))
+    expires_at = int(time.time() * 1000) + expires_in * 1000
+    scopes = data.get("scope", OAUTH_SCOPES).split()
+
+    new_oauth = {
+        "accessToken": access_token,
+        "refreshToken": new_refresh,
+        "expiresAt": expires_at,
+        "scopes": scopes,
+    }
+    return new_oauth, None
+
+
+def _save_credentials(creds):
+    """Write credentials back to disk atomically with a file lock."""
+    lock_path = os.path.join(CREDENTIALS_DIR, ".credentials.lock")
+    tmp_path = CREDENTIALS_PATH + ".tmp"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # Re-read to merge with any concurrent changes to other keys
+            try:
+                with open(CREDENTIALS_PATH, "r") as f:
+                    disk_creds = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                disk_creds = {}
+            disk_creds["claudeAiOauth"] = creds["claudeAiOauth"]
+            with open(tmp_path, "w") as f:
+                json.dump(disk_creds, f, indent=2)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, CREDENTIALS_PATH)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    except OSError as e:
+        print(f"[proxy] WARNING: Failed to save credentials: {e}", file=sys.stderr)
+        debug(f"Failed to save credentials: {e}")
+        # Clean up tmp file if it exists
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _ensure_fresh_token():
+    """Ensure we have a valid, non-expired OAuth token.
+    Re-reads credentials (host Claude may have refreshed), and if still
+    expired, performs the refresh and saves the result.
+    Returns (token, error_message)."""
+
+    # Re-read from disk (host Claude CLI may have refreshed already)
+    creds, oauth, err = _read_oauth_creds()
+    if err:
+        return None, err
+
+    token = oauth.get("accessToken")
+    if not token:
+        return None, (
+            "No accessToken in ~/.claude/.credentials.json. "
+            "Run 'claude' on the host to authenticate."
+        )
+
+    if not _is_token_expiring(oauth):
+        return token, None
+
+    # Token is expiring/expired — need to refresh
+    refresh_token = oauth.get("refreshToken")
+    if not refresh_token:
+        return None, (
+            "OAuth token expired and no refreshToken available. "
+            "Run 'claude' on the host to re-authenticate."
+        )
+
+    debug("OAuth token expiring, attempting refresh...")
+    new_oauth, refresh_err = _refresh_oauth_token(refresh_token)
+    if refresh_err:
+        debug(f"Token refresh failed: {refresh_err}")
+        return None, f"OAuth token expired, refresh failed: {refresh_err}"
+
+    # Preserve subscription info from the old credentials
+    for key in ("subscriptionType", "rateLimitTier"):
+        if key in oauth and key not in new_oauth:
+            new_oauth[key] = oauth[key]
+
+    creds["claudeAiOauth"] = new_oauth
+    _save_credentials(creds)
+    debug(f"Token refreshed, new expiry: {new_oauth['expiresAt']}")
+    return new_oauth["accessToken"], None
+
+
 def get_auth_token():
     """Return (token, is_oauth, error_message). error_message is None on success."""
     # Priority 1: explicit API key
@@ -60,39 +225,16 @@ def get_auth_token():
     if api_key:
         return api_key, False, None
 
-    # Priority 2: OAuth credentials file
-    try:
-        with open(CREDENTIALS_PATH, "r") as f:
-            creds = json.load(f)
-    except FileNotFoundError:
-        return None, False, (
-            "No credentials found. Set ANTHROPIC_API_KEY or run 'claude' on "
-            "the host to create ~/.claude/.credentials.json"
-        )
-    except (json.JSONDecodeError, OSError) as e:
-        return None, False, f"Failed to read credentials: {e}"
-
-    oauth = creds.get("claudeAiOauth", {})
-    token = oauth.get("accessToken")
-    if not token:
-        return None, False, (
-            "No accessToken in ~/.claude/.credentials.json. "
-            "Run 'claude' on the host to authenticate."
-        )
-
-    expires_at = oauth.get("expiresAt")
-    if expires_at:
-        # expiresAt is epoch millis (number or numeric string)
-        try:
-            expires_ts = float(expires_at) / 1000
-        except (ValueError, TypeError):
-            expires_ts = None
-
-        if expires_ts and time.time() > expires_ts:
-            return None, False, (
-                "OAuth token expired. Run 'claude' on the host to refresh."
-            )
-
+    # Priority 2: OAuth credentials file (with auto-refresh)
+    # Fast path: if token is valid, return without acquiring the lock
+    creds, oauth, read_err = _read_oauth_creds()
+    if not read_err and oauth.get("accessToken") and not _is_token_expiring(oauth):
+        return oauth["accessToken"], True, None
+    # Slow path: lock and refresh (re-checks inside to handle races)
+    with _refresh_lock:
+        token, err = _ensure_fresh_token()
+    if err:
+        return None, False, err
     return token, True, None
 
 
@@ -107,7 +249,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         token, is_oauth, err = get_auth_token()
         if err:
             debug(f"AUTH ERROR: {err}")
-            self.send_error_response(401, err)
+            # Don't leak detailed error messages (may contain credential fragments)
+            self.send_error_response(401, "Authentication failed. Check proxy logs.")
             return
 
         # Read request body
