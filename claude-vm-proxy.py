@@ -438,9 +438,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 class QuietServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    allow_reuse_address = True
+    allow_reuse_address = False  # Bind to random port; no need for SO_REUSEADDR
     daemon_threads = True
-    timeout = 60  # Inbound connection timeout (Finding #15: Slowloris defense)
+    timeout = 60  # Inbound connection timeout (Slowloris defense)
 
 
 def main():
