@@ -33,6 +33,20 @@ _token_use_tls = True  # Tests set this to False to use plain HTTP mock server
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
 EXPIRY_BUFFER_SECS = 300  # Refresh 5 minutes before expiry (matches Claude CLI)
+MAX_REQUEST_BODY = 32 * 1024 * 1024  # 32 MB max request body
+ALLOWED_PATH_PREFIXES = ("/v1/",)  # Only allow Claude API endpoints
+ALLOWED_METHODS = ("GET", "POST")  # Only methods the Claude API uses
+# Upstream response headers to forward to the VM (allowlist)
+FORWARDED_RESPONSE_HEADERS = frozenset({
+    "content-type", "x-request-id", "request-id",
+    "retry-after", "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset", "anthropic-ratelimit-input-tokens-limit",
+    "anthropic-ratelimit-input-tokens-remaining", "anthropic-ratelimit-input-tokens-reset",
+    "anthropic-ratelimit-output-tokens-limit", "anthropic-ratelimit-output-tokens-remaining",
+    "anthropic-ratelimit-output-tokens-reset",
+})
 DEBUG = os.environ.get("CLAUDE_VM_PROXY_DEBUG", "0") == "1"
 _log_file = None
 _refresh_lock = threading.Lock()
@@ -42,7 +56,8 @@ def _get_log_file():
     global _log_file
     if _log_file is None:
         log_path = os.path.join(os.environ.get("CLAUDE_VM_PROXY_LOG_DIR", "."), "claude-vm-proxy.log")
-        _log_file = open(log_path, "a")
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        _log_file = os.fdopen(fd, "a")
     return _log_file
 
 
@@ -246,6 +261,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_request(self):
+        # Validate HTTP method
+        if self.command not in ALLOWED_METHODS:
+            self.send_error_response(405, f"Method {self.command} not allowed")
+            return
+
+        # Validate request path (Finding #1: prevent access to arbitrary endpoints)
+        if not any(self.path.startswith(p) for p in ALLOWED_PATH_PREFIXES):
+            debug(f"BLOCKED path: {self.path}")
+            self.send_error_response(403, "Path not allowed")
+            return
+
         token, is_oauth, err = get_auth_token()
         if err:
             debug(f"AUTH ERROR: {err}")
@@ -253,8 +279,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_response(401, "Authentication failed. Check proxy logs.")
             return
 
-        # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
+        # Read request body with size limit (Finding #4: prevent memory exhaustion)
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self.send_error_response(400, "Invalid Content-Length")
+            return
+        if content_length < 0 or content_length > MAX_REQUEST_BODY:
+            self.send_error_response(413, "Request body too large")
+            return
         body = self.rfile.read(content_length) if content_length else None
 
         debug(f">>> {self.command} {self.path} ({content_length} bytes)")
@@ -329,7 +362,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             latency_ms = (time.monotonic() - t0) * 1000
         except Exception as e:
             debug(f"  UPSTREAM ERROR: {e}")
-            self.send_error_response(502, f"Failed to connect to API: {e}")
+            self.send_error_response(502, "Failed to connect to upstream API")
             return
 
         # Determine if upstream used chunked transfer (i.e. streaming)
@@ -350,11 +383,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Streaming: forward headers, re-chunk the decoded body
             self.send_response(upstream.status)
             for key, value in upstream_headers:
-                lower = key.lower()
-                if lower in ("transfer-encoding", "content-length",
-                             "connection", "keep-alive"):
-                    continue
-                self.send_header(key, value)
+                if key.lower() in FORWARDED_RESPONSE_HEADERS:
+                    self.send_header(key, value)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             total_bytes = 0
@@ -388,11 +418,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass
             self.send_response(upstream.status)
             for key, value in upstream_headers:
-                lower = key.lower()
-                if lower in ("transfer-encoding", "content-length",
-                             "connection", "keep-alive"):
-                    continue
-                self.send_header(key, value)
+                if key.lower() in FORWARDED_RESPONSE_HEADERS:
+                    self.send_header(key, value)
             self.send_header("Content-Length", str(len(body_data)))
             self.end_headers()
             self.wfile.write(body_data)
@@ -406,19 +433,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # Handle all HTTP methods
     do_GET = do_request
     do_POST = do_request
-    do_PUT = do_request
-    do_PATCH = do_request
-    do_DELETE = do_request
-    do_HEAD = do_request
-    do_OPTIONS = do_request
 
 
 class QuietServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    timeout = 60  # Inbound connection timeout (Finding #15: Slowloris defense)
 
 
 def main():
