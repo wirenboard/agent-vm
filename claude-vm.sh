@@ -141,7 +141,7 @@ claude-vm-setup() {
   # Skip first-run onboarding wizard (theme picker + login prompt)
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c '
     mkdir -p ~/.claude
-    echo "{\"theme\":\"dark\",\"hasCompletedOnboarding\":true,\"skipDangerousModePermissionPrompt\":true}" > ~/.claude/settings.json
+    echo "{\"theme\":\"dark\",\"hasCompletedOnboarding\":true,\"skipDangerousModePermissionPrompt\":true,\"effortLevel\":\"high\"}" > ~/.claude/settings.json
   '
 
   if ! $minimal; then
