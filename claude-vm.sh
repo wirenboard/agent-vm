@@ -138,6 +138,11 @@ claude-vm-setup() {
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://claude.ai/install.sh | bash"
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'echo "export PATH=\$HOME/.local/bin:\$HOME/.claude/local/bin:\$PATH" >> ~/.bashrc'
 
+  # Skip first-run onboarding wizard (theme picker + login prompt)
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -c '
+    mkdir -p ~/.claude
+    echo "{\"theme\":\"dark\",\"hasCompletedOnboarding\":true}" > ~/.claude/settings.json
+  '
 
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
@@ -218,6 +223,52 @@ _claude_vm_write_dummy_credentials() {
   limactl shell "$vm_name" bash -c 'mkdir -p ~/.claude && cat > ~/.claude/.credentials.json << '\''CREDS'\''
 {"claudeAiOauth":{"accessToken":"dummy","refreshToken":"dummy","expiresAt":9999999999999,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}
 CREDS'
+}
+
+_claude_vm_setup_session_persistence() {
+  local vm_name="$1"
+  local host_dir="$2"
+  limactl shell "$vm_name" bash -c '
+    SESSION_DIR="'"$host_dir"'/.agent-vm/claude-sessions"
+    mkdir -p ~/.claude \
+      "$SESSION_DIR/projects" \
+      "$SESSION_DIR/file-history" \
+      "$SESSION_DIR/todos" \
+      "$SESSION_DIR/plans"
+    ln -sfn "$SESSION_DIR/projects" ~/.claude/projects
+    ln -sfn "$SESSION_DIR/file-history" ~/.claude/file-history
+    ln -sfn "$SESSION_DIR/todos" ~/.claude/todos
+    ln -sfn "$SESSION_DIR/plans" ~/.claude/plans
+    touch "$SESSION_DIR/history.jsonl"
+    ln -sfn "$SESSION_DIR/history.jsonl" ~/.claude/history.jsonl
+
+    if [ ! -f "$SESSION_DIR/claude.json" ]; then
+      if [ -f ~/.claude.json ] && [ ! -L ~/.claude.json ]; then
+        cp ~/.claude.json "$SESSION_DIR/claude.json"
+      else
+        echo '{}' > "$SESSION_DIR/claude.json"
+      fi
+    fi
+    ln -sfn "$SESSION_DIR/claude.json" ~/.claude.json
+  '
+}
+
+_claude_vm_ensure_onboarding_config() {
+  local vm_name="$1"
+  limactl shell "$vm_name" bash -c '
+    CONFIG="$HOME/.claude.json"
+    if [ ! -f "$CONFIG" ]; then
+      echo "{}" > "$CONFIG"
+    fi
+
+    jq ".hasCompletedOnboarding = true | .lastOnboardingVersion = (.lastOnboardingVersion // \"vm\")" \
+      "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+  '
+}
+
+_claude_vm_has_session_history() {
+  local host_dir="$1"
+  [ -s "${host_dir}/.agent-vm/claude-sessions/history.jsonl" ]
 }
 
 _claude_vm_start_github_mcp() {
@@ -425,11 +476,11 @@ _claude_vm_security_check() {
 }
 
 claude-vm() {
-  local use_github=false
+  local use_github=true
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --github) use_github=true; shift ;;
+      --no-git) use_github=false; shift ;;
       *) args+=("$1"); shift ;;
     esac
   done
@@ -480,6 +531,8 @@ claude-vm() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
+  _claude_vm_ensure_onboarding_config "$vm_name"
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
@@ -495,10 +548,20 @@ claude-vm() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
+  local claude_args=("${args[@]}")
+  if [ ${#claude_args[@]} -eq 0 ] && ! _claude_vm_has_session_history "$host_dir"; then
+    echo "First run detected; priming session to skip Claude greeting..."
+    limactl shell --workdir "$host_dir" "$vm_name" \
+      env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+      IS_SANDBOX=1 \
+      claude --dangerously-skip-permissions -p "Initialize session state. Reply with exactly: Ready." >/dev/null
+    claude_args=(--continue)
+  fi
+
   limactl shell --workdir "$host_dir" "$vm_name" \
     env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
     IS_SANDBOX=1 \
-    claude --dangerously-skip-permissions "${args[@]}"
+    claude --dangerously-skip-permissions "${claude_args[@]}"
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_cleanup
@@ -506,10 +569,10 @@ claude-vm() {
 }
 
 claude-vm-shell() {
-  local use_github=false
+  local use_github=true
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --github) use_github=true; shift ;;
+      --no-git) use_github=false; shift ;;
       *) shift ;;
     esac
   done
@@ -557,6 +620,8 @@ claude-vm-shell() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
+  _claude_vm_ensure_onboarding_config "$vm_name"
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"

@@ -95,6 +95,27 @@ npm install
 docker compose up -d
 ```
 
+## Session persistence
+
+VMs are ephemeral — each `claude-vm` invocation creates a fresh clone and deletes it on exit. To make `claude --continue` and `claude --resume` work across VM launches, session data is persisted in the project directory.
+
+**How it works:**
+
+1. A `.agent-vm/claude-sessions/` directory is created in the project root
+2. Claude's session-related directories (`projects`, `file-history`, `todos`, `plans`) and `history.jsonl` are symlinked from `~/.claude/` to `.agent-vm/claude-sessions/`
+3. Ephemeral config (`.credentials.json`, `CLAUDE.md`) stays in-VM and is not persisted
+4. `~/.claude.json` is persisted as `.agent-vm/claude-sessions/claude.json` to preserve onboarding/project state
+5. `hasCompletedOnboarding=true` is enforced before launch to prevent first-run greeting loops
+
+Add `.agent-vm/` to your `.gitignore`.
+
+```bash
+claude-vm -p "remember ZEBRA"        # First session
+claude-vm --continue                  # Picks up where the last session left off
+```
+
+If you launch `claude-vm` with no arguments on a brand new project, it auto-primes a tiny throwaway session and then opens `--continue` so you do not get stuck on Claude's first-run greeting.
+
 ## Claude API Proxy
 
 The host-side API proxy (`claude-vm-proxy.py`) keeps your Claude credentials out of the VM entirely. It reads OAuth tokens from the host's `~/.claude/.credentials.json` (or `ANTHROPIC_API_KEY` env var), injects them into requests, and forwards to `api.anthropic.com`. The VM only sees `ANTHROPIC_BASE_URL` pointing at the proxy.
@@ -109,7 +130,7 @@ The host-side API proxy (`claude-vm-proxy.py`) keeps your Claude credentials out
 
 ## GitHub Integration
 
-When you run `claude-vm --github` inside a git repo with a GitHub remote, it automatically:
+When you run `claude-vm` inside a git repo with a GitHub remote, it automatically:
 
 1. Detects the repository from `git remote`
 2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
