@@ -255,9 +255,11 @@ _claude_vm_setup_session_persistence() {
 
 _claude_vm_ensure_onboarding_config() {
   local vm_name="$1"
+  local host_dir="$2"
   limactl shell "$vm_name" bash -c '
     CONFIG="$HOME/.claude.json"
     SETTINGS="$HOME/.claude/settings.json"
+    PROJECT_PATH="'"$host_dir"'"
 
     mkdir -p "$HOME/.claude"
 
@@ -272,7 +274,14 @@ _claude_vm_ensure_onboarding_config() {
       echo "{}" > "$CONFIG"
     fi
 
-    jq ".hasCompletedOnboarding = true | .lastOnboardingVersion = (.lastOnboardingVersion // \"vm\")" \
+    jq --arg project_path "$PROJECT_PATH" \
+      ".hasCompletedOnboarding = true
+       | .lastOnboardingVersion = (.lastOnboardingVersion // \"vm\")
+       | .effortCalloutDismissed = true
+       | .projects = (.projects // {})
+       | .projects[
+           \$project_path
+         ] = ((.projects[\$project_path] // {}) + {hasTrustDialogAccepted: true})" \
       "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
   '
 }
@@ -543,7 +552,7 @@ claude-vm() {
 
   _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
-  _claude_vm_ensure_onboarding_config "$vm_name"
+  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
@@ -632,7 +641,7 @@ claude-vm-shell() {
 
   _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
-  _claude_vm_ensure_onboarding_config "$vm_name"
+  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
