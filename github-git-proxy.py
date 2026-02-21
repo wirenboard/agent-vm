@@ -38,6 +38,10 @@ REPO = os.environ.get("GITHUB_MCP_REPO", "")
 DEBUG = os.environ.get("GITHUB_GIT_PROXY_DEBUG", "0") == "1"
 LOG_DIR = os.environ.get("GITHUB_GIT_PROXY_LOG_DIR", ".")
 
+# Retry settings for transient upstream errors (5xx)
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 4]
+
 # GitHub git HTTP uses Basic auth with x-access-token as username
 _BASIC_AUTH = "Basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
 
@@ -67,6 +71,32 @@ def log(msg):
 def debug(msg):
     if DEBUG:
         log(msg)
+
+
+def _looks_like_html(body_bytes):
+    """Check if a response body is HTML."""
+    if body_bytes:
+        prefix = body_bytes[:256].lstrip()
+        if prefix.startswith((b"<", b"<!DOCTYPE", b"<!doctype")):
+            return True
+    return False
+
+
+def _save_error_response(status, body_bytes, context=""):
+    """Save an error response body to a file for debugging. Returns the path."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"github-git-error-{ts}-{status}.html"
+    path = os.path.join(LOG_DIR, filename)
+    try:
+        with open(path, "wb") as f:
+            if context:
+                f.write(f"<!-- {context} -->\n".encode())
+            f.write(body_bytes)
+        log(f"  saved error response to {path}")
+    except OSError as e:
+        log(f"  failed to save error response: {e}")
+        path = None
+    return path
 
 
 class GitProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -102,29 +132,57 @@ class GitProxyHandler(http.server.BaseHTTPRequestHandler):
             headers["Content-Length"] = str(len(body))
 
         ctx = ssl.create_default_context()
-        try:
-            t0 = time.monotonic()
-            conn = http.client.HTTPSConnection("github.com", 443, context=ctx, timeout=300)
-            conn.request(self.command, self.path, body=body, headers=headers)
-            resp = conn.getresponse()
-            latency_ms = (time.monotonic() - t0) * 1000
-        except Exception as e:
-            log(f"  UPSTREAM ERROR: {e}")
-            self.send_error(502, str(e))
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+                log(f"  retry {attempt}/{MAX_RETRIES} after {delay}s")
+                time.sleep(delay)
+
+            conn = None
+            try:
+                t0 = time.monotonic()
+                conn = http.client.HTTPSConnection("github.com", 443, context=ctx, timeout=300)
+                conn.request(self.command, self.path, body=body, headers=headers)
+                resp = conn.getresponse()
+                latency_ms = (time.monotonic() - t0) * 1000
+            except Exception as e:
+                if conn:
+                    conn.close()
+                log(f"  UPSTREAM ERROR (attempt {attempt + 1}): {e}")
+                last_error = str(e)
+                continue
+
+            resp_body = resp.read()
+            conn.close()
+            debug(f"<<< {resp.status} ({latency_ms:.0f}ms, {len(resp_body)} bytes)")
+
+            # On 5xx with HTML body, save the error and retry
+            if resp.status >= 500:
+                if _looks_like_html(resp_body):
+                    ctx_msg = f"HTTP {resp.status} from github.com{self.path} attempt {attempt + 1}"
+                    _save_error_response(resp.status, resp_body, ctx_msg)
+                    last_error = f"GitHub returned HTTP {resp.status} (HTML error page)"
+                    log(f"  got HTML error page ({len(resp_body)} bytes), will retry")
+                else:
+                    last_error = f"GitHub returned HTTP {resp.status}"
+                    log(f"  got {resp.status} ({len(resp_body)} bytes), will retry")
+                continue
+
+            # Success or non-5xx — forward response
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                if key.lower() in ("transfer-encoding", "connection", "keep-alive"):
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
             return
 
-        # Forward response
-        resp_body = resp.read()
-        conn.close()
-        debug(f"<<< {resp.status} ({latency_ms:.0f}ms, {len(resp_body)} bytes)")
-        self.send_response(resp.status)
-        for key, value in resp.getheaders():
-            if key.lower() in ("transfer-encoding", "connection", "keep-alive"):
-                continue
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(resp_body)))
-        self.end_headers()
-        self.wfile.write(resp_body)
+        # All retries exhausted
+        log(f"  all {MAX_RETRIES + 1} attempts failed: {last_error}")
+        self.send_error(502, f"GitHub unavailable after {MAX_RETRIES + 1} attempts: {last_error}")
 
     do_GET = proxy
     do_POST = proxy

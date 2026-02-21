@@ -33,10 +33,38 @@ TARGET_REPO = os.environ.get("TARGET_REPO", "agent-vm")
 
 VERBOSE = False
 
+# Retry settings for transient GitHub errors (5xx)
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 4]
+ERROR_LOG_DIR = os.environ.get("GITHUB_TOKEN_LOG_DIR", ".")
+
 
 def verbose(msg):
     if VERBOSE:
         print(f"  [verbose] {msg}", file=sys.stderr)
+
+
+def _looks_like_html(body_str):
+    """Check if a response body is HTML."""
+    prefix = body_str[:256].lstrip()
+    return prefix.startswith(("<", "<!DOCTYPE", "<!doctype"))
+
+
+def _save_error_body(status, body_str, context=""):
+    """Save an error response body to a file for debugging. Returns the path."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"github-token-error-{ts}-{status}.html"
+    path = os.path.join(ERROR_LOG_DIR, filename)
+    try:
+        with open(path, "w") as f:
+            if context:
+                f.write(f"<!-- {context} -->\n")
+            f.write(body_str)
+        verbose(f"saved error response to {path}")
+    except OSError as e:
+        verbose(f"failed to save error response: {e}")
+        path = None
+    return path
 
 
 def parse_repo(repo_str):
@@ -141,34 +169,63 @@ def cmd_create_app():
 
 
 def github_api(method, path, token, token_type="Bearer", body=None):
-    """Make a GitHub API request."""
+    """Make a GitHub API request with retry on 5xx errors."""
     url = f"https://api.github.com{path}"
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("Authorization", f"{token_type} {token}")
-    req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    if data:
-        req.add_header("Content-Type", "application/json")
 
     verbose(f">>> {method} {url}")
     if body:
         verbose(f">>> Body: {json.dumps(body)}")
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            resp_body = resp.read().decode()
-            verbose(f"<<< {resp.status} {resp.reason}")
-            verbose(f"<<< Body: {resp_body[:500]}{'...' if len(resp_body) > 500 else ''}")
-            return json.loads(resp_body)
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        verbose(f"<<< {e.code} {e.reason}")
-        verbose(f"<<< Body: {error_body}")
-        print(f"GitHub API error: {e.code} {e.reason}", file=sys.stderr)
-        print(f"URL: {url}", file=sys.stderr)
-        print(f"Response: {error_body}", file=sys.stderr)
-        sys.exit(1)
+    last_error = None
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+            verbose(f"retry {attempt}/{MAX_RETRIES} after {delay}s")
+            time.sleep(delay)
+
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("Authorization", f"{token_type} {token}")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        if data:
+            req.add_header("Content-Type", "application/json")
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_body = resp.read().decode()
+                verbose(f"<<< {resp.status} {resp.reason}")
+                verbose(f"<<< Body: {resp_body[:500]}{'...' if len(resp_body) > 500 else ''}")
+                return json.loads(resp_body)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            verbose(f"<<< {e.code} {e.reason}")
+            verbose(f"<<< Body: {error_body}")
+            if e.code >= 500:
+                if _looks_like_html(error_body):
+                    _save_error_body(e.code, error_body, f"{method} {url} attempt {attempt + 1}")
+                    last_error = f"{e.code} {e.reason} (HTML error page saved to disk)"
+                else:
+                    last_error = f"{e.code} {e.reason}"
+                print(f"GitHub API error: {e.code} {e.reason} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+                continue
+            # Non-5xx error — don't retry
+            print(f"GitHub API error: {e.code} {e.reason}", file=sys.stderr)
+            print(f"URL: {url}", file=sys.stderr)
+            if _looks_like_html(error_body):
+                saved = _save_error_body(e.code, error_body, f"{method} {url}")
+                print(f"Response body saved to: {saved}", file=sys.stderr)
+            else:
+                print(f"Response: {error_body}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            last_error = str(e.reason)
+            print(f"GitHub API error: {last_error} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+            continue
+
+    print(f"GitHub API error: {last_error} (all {MAX_RETRIES + 1} attempts failed)", file=sys.stderr)
+    print(f"URL: {url}", file=sys.stderr)
+    sys.exit(1)
 
 
 def verify_token(token, token_type="token"):
@@ -267,27 +324,56 @@ def save_cached_token(cache_dir, client_id, owner, repo,
 
 
 def device_flow_request(url, params):
-    """POST to GitHub's OAuth endpoints (form-encoded, JSON response)."""
-    data = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Accept", "application/json")
+    """POST to GitHub's OAuth endpoints (form-encoded, JSON response).
+    Retries on 5xx errors; saves HTML error pages to disk."""
+    encoded_data = urllib.parse.urlencode(params).encode()
 
     verbose(f">>> POST {url}")
     verbose(f">>> Body: {urllib.parse.urlencode(params)}")
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            resp_body = resp.read().decode()
-            verbose(f"<<< {resp.status} {resp.reason}")
-            verbose(f"<<< Body: {resp_body[:500]}{'...' if len(resp_body) > 500 else ''}")
-            return json.loads(resp_body)
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        verbose(f"<<< {e.code} {e.reason}")
-        verbose(f"<<< Body: {error_body}")
-        print(f"OAuth error: {e.code} {e.reason}", file=sys.stderr)
-        print(f"Response: {error_body}", file=sys.stderr)
-        sys.exit(1)
+    last_error = None
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+            verbose(f"retry {attempt}/{MAX_RETRIES} after {delay}s")
+            time.sleep(delay)
+
+        req = urllib.request.Request(url, data=encoded_data, method="POST")
+        req.add_header("Accept", "application/json")
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_body = resp.read().decode()
+                verbose(f"<<< {resp.status} {resp.reason}")
+                verbose(f"<<< Body: {resp_body[:500]}{'...' if len(resp_body) > 500 else ''}")
+                return json.loads(resp_body)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            verbose(f"<<< {e.code} {e.reason}")
+            verbose(f"<<< Body: {error_body}")
+            if e.code >= 500:
+                if _looks_like_html(error_body):
+                    _save_error_body(e.code, error_body, f"POST {url} attempt {attempt + 1}")
+                    last_error = f"{e.code} {e.reason} (HTML error page saved to disk)"
+                else:
+                    last_error = f"{e.code} {e.reason}"
+                print(f"OAuth error: {e.code} {e.reason} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+                continue
+            # Non-5xx error — don't retry
+            print(f"OAuth error: {e.code} {e.reason}", file=sys.stderr)
+            if _looks_like_html(error_body):
+                saved = _save_error_body(e.code, error_body, f"POST {url}")
+                print(f"Response body saved to: {saved}", file=sys.stderr)
+            else:
+                print(f"Response: {error_body}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            last_error = str(e.reason)
+            print(f"OAuth error: {last_error} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+            continue
+
+    print(f"OAuth error: {last_error} (all {MAX_RETRIES + 1} attempts failed)", file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_user_token(client_id, repository_id=None, token_only=False,

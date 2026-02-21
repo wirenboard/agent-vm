@@ -35,6 +35,11 @@ MCP_HOST = "api.githubcopilot.com"
 MCP_PORT = 443
 MCP_PATH = "/mcp/"
 
+# Retry settings for transient upstream errors (5xx)
+MAX_RETRIES = 3           # Total attempts = MAX_RETRIES + 1
+RETRY_DELAYS = [1, 2, 4]  # Seconds between retries (exponential backoff)
+ERROR_LOG_DIR = os.environ.get("GITHUB_MCP_PROXY_LOG_DIR", ".")
+
 TOKEN = os.environ.get("GITHUB_MCP_TOKEN", "")
 OWNER = os.environ.get("GITHUB_MCP_OWNER", "")
 REPO = os.environ.get("GITHUB_MCP_REPO", "")
@@ -121,6 +126,35 @@ KNOWN_TOOLS = (
 def debug(msg):
     if DEBUG:
         print(f"[github-mcp-proxy {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
+
+
+def _looks_like_html(body_bytes, headers):
+    """Check if a response body is HTML (not a normal JSON API error)."""
+    for k, v in headers:
+        if k.lower() == "content-type" and "html" in v.lower():
+            return True
+    if body_bytes:
+        prefix = body_bytes[:256].lstrip()
+        if prefix.startswith((b"<", b"<!DOCTYPE", b"<!doctype")):
+            return True
+    return False
+
+
+def _save_error_response(status, body_bytes, context=""):
+    """Save an error response body to a file for debugging. Returns the path."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"github-mcp-error-{ts}-{status}.html"
+    path = os.path.join(ERROR_LOG_DIR, filename)
+    try:
+        with open(path, "wb") as f:
+            if context:
+                f.write(f"<!-- {context} -->\n".encode())
+            f.write(body_bytes)
+        debug(f"  saved error response to {path}")
+    except OSError as e:
+        debug(f"  failed to save error response: {e}")
+        path = None
+    return path
 
 
 def _enforce_search_scope(tool, args):
@@ -274,78 +308,109 @@ class GitHubMCPProxyHandler(http.server.BaseHTTPRequestHandler):
         if LOCKDOWN:
             headers["X-MCP-Lockdown"] = "true"
 
-        # Forward to GitHub's MCP endpoint
+        # Forward to GitHub's MCP endpoint, with retry on 5xx errors
         ctx = ssl.create_default_context()
-        try:
-            t0 = time.monotonic()
-            conn = http.client.HTTPSConnection(MCP_HOST, MCP_PORT, context=ctx, timeout=300)
-            # Rewrite path to the MCP endpoint
-            upstream_path = MCP_PATH + self.path.lstrip("/")
-            # Normalize double slashes
-            upstream_path = upstream_path.replace("//", "/")
-            conn.request(self.command, upstream_path, body=body, headers=headers)
-            upstream = conn.getresponse()
-            latency_ms = (time.monotonic() - t0) * 1000
-        except Exception as e:
-            debug(f"  UPSTREAM ERROR: {e}")
-            self.send_error_response(502, f"Failed to connect to GitHub MCP: {e}")
+        upstream_path = MCP_PATH + self.path.lstrip("/")
+        upstream_path = upstream_path.replace("//", "/")
+
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+                debug(f"  retry {attempt}/{MAX_RETRIES} after {delay}s")
+                time.sleep(delay)
+
+            conn = None
+            try:
+                t0 = time.monotonic()
+                conn = http.client.HTTPSConnection(MCP_HOST, MCP_PORT, context=ctx, timeout=300)
+                conn.request(self.command, upstream_path, body=body, headers=headers)
+                upstream = conn.getresponse()
+                latency_ms = (time.monotonic() - t0) * 1000
+            except Exception as e:
+                if conn:
+                    conn.close()
+                debug(f"  UPSTREAM ERROR (attempt {attempt + 1}): {e}")
+                last_error = str(e)
+                continue
+
+            upstream_headers = upstream.getheaders()
+            is_streaming = any(
+                k.lower() == "transfer-encoding" for k, v in upstream_headers
+            )
+
+            debug(f"<<< {upstream.status} {'streaming' if is_streaming else 'complete'} ({latency_ms:.0f}ms)")
+
+            # On 5xx with HTML body, save the error and retry
+            if upstream.status >= 500 and not is_streaming:
+                body_data = upstream.read()
+                conn.close()
+                if _looks_like_html(body_data, upstream_headers):
+                    ctx_msg = f"HTTP {upstream.status} from {MCP_HOST}{upstream_path} attempt {attempt + 1}"
+                    _save_error_response(upstream.status, body_data, ctx_msg)
+                    last_error = f"GitHub returned HTTP {upstream.status} (HTML error page)"
+                    debug(f"  got HTML error page ({len(body_data)} bytes), will retry")
+                    continue
+                else:
+                    # Non-HTML 5xx (JSON error) — still retry
+                    last_error = f"GitHub returned HTTP {upstream.status}"
+                    debug(f"  got {upstream.status} ({len(body_data)} bytes), will retry")
+                    continue
+
+            # Success or non-5xx error — forward response
+            if is_streaming:
+                self.send_response(upstream.status)
+                for key, value in upstream_headers:
+                    lower = key.lower()
+                    if lower in ("transfer-encoding", "content-length",
+                                 "connection", "keep-alive"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                total_bytes = 0
+                try:
+                    while True:
+                        data = upstream.read(8192)
+                        if not data:
+                            break
+                        total_bytes += len(data)
+                        self.wfile.write(f"{len(data):x}\r\n".encode())
+                        self.wfile.write(data)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                    debug(f"  streamed {total_bytes} bytes")
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    debug(f"  stream broken: {e} after {total_bytes} bytes")
+                finally:
+                    conn.close()
+            else:
+                body_data = upstream.read()
+                conn.close()
+                debug(f"  body: {len(body_data)} bytes")
+                if DEBUG and len(body_data) < 4096:
+                    try:
+                        debug(f"  {body_data.decode()}")
+                    except UnicodeDecodeError:
+                        pass
+                self.send_response(upstream.status)
+                for key, value in upstream_headers:
+                    lower = key.lower()
+                    if lower in ("transfer-encoding", "content-length",
+                                 "connection", "keep-alive"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body_data)))
+                self.end_headers()
+                self.wfile.write(body_data)
+                self.wfile.flush()
             return
 
-        upstream_headers = upstream.getheaders()
-        is_streaming = any(
-            k.lower() == "transfer-encoding" for k, v in upstream_headers
-        )
-
-        debug(f"<<< {upstream.status} {'streaming' if is_streaming else 'complete'} ({latency_ms:.0f}ms)")
-
-        if is_streaming:
-            self.send_response(upstream.status)
-            for key, value in upstream_headers:
-                lower = key.lower()
-                if lower in ("transfer-encoding", "content-length",
-                             "connection", "keep-alive"):
-                    continue
-                self.send_header(key, value)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            total_bytes = 0
-            try:
-                while True:
-                    data = upstream.read(8192)
-                    if not data:
-                        break
-                    total_bytes += len(data)
-                    self.wfile.write(f"{len(data):x}\r\n".encode())
-                    self.wfile.write(data)
-                    self.wfile.write(b"\r\n")
-                    self.wfile.flush()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-                debug(f"  streamed {total_bytes} bytes")
-            except (BrokenPipeError, ConnectionResetError) as e:
-                debug(f"  stream broken: {e} after {total_bytes} bytes")
-            finally:
-                conn.close()
-        else:
-            body_data = upstream.read()
-            conn.close()
-            debug(f"  body: {len(body_data)} bytes")
-            if DEBUG and len(body_data) < 4096:
-                try:
-                    debug(f"  {body_data.decode()}")
-                except UnicodeDecodeError:
-                    pass
-            self.send_response(upstream.status)
-            for key, value in upstream_headers:
-                lower = key.lower()
-                if lower in ("transfer-encoding", "content-length",
-                             "connection", "keep-alive"):
-                    continue
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(body_data)))
-            self.end_headers()
-            self.wfile.write(body_data)
-            self.wfile.flush()
+        # All retries exhausted
+        debug(f"  all {MAX_RETRIES + 1} attempts failed: {last_error}")
+        self.send_error_response(502, f"GitHub MCP unavailable after {MAX_RETRIES + 1} attempts: {last_error}")
 
     def send_error_response(self, code, message):
         body = json.dumps({"error": {"type": "proxy_error", "message": message}}).encode()
