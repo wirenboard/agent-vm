@@ -67,6 +67,22 @@ def _save_error_body(status, body_str, context=""):
     return path
 
 
+def _copy_to_clipboard(text):
+    """Try to copy text to the system clipboard. Fails silently."""
+    import subprocess
+    import shutil
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["wl-copy"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=5)
+                verbose(f"copied to clipboard via {cmd[0]}")
+                return True
+            except (subprocess.SubprocessError, OSError):
+                pass
+    verbose("no clipboard tool found")
+    return False
+
+
 def parse_repo(repo_str):
     """Parse a repo URL/slug into (owner, name). Accepts:
     - owner/name
@@ -409,10 +425,14 @@ def cmd_user_token(client_id, repository_id=None, token_only=False,
     verbose(f"Device code: {device_code}")
     verbose(f"Polling interval: {interval}s, expires in: {expires_in}s")
 
+    # Copy the user code to clipboard if possible
+    copied = _copy_to_clipboard(user_code)
+    clip_hint = " (copied to clipboard)" if copied else ""
+
     print(file=out)
     print("=" * 60, file=out)
     print(f"  Open:  {verification_uri}", file=out)
-    print(f"  Enter: {user_code}", file=out)
+    print(f"  Enter: {user_code}{clip_hint}", file=out)
     print("=" * 60, file=out)
     print(file=out)
     print(f"Waiting for authorization (expires in {expires_in}s)...", file=out)
