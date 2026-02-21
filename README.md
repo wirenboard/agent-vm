@@ -39,12 +39,12 @@ Options:
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--minimal` | Only install git, curl, jq, and Claude Code. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
+| `--minimal` | Only install git, curl, jq, Claude Code, and OpenCode. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
 | `--disk GB` | VM disk size in GB | 20 |
 | `--memory GB` | VM memory in GB | 8 |
 
 ```bash
-agent-vm setup --minimal                  # Lightweight VM with just Claude
+agent-vm setup --minimal                  # Lightweight VM with only core CLIs
 agent-vm setup --disk 50 --memory 16      # Larger VM for heavy workloads
 ```
 
@@ -133,7 +133,7 @@ agent-vm claude -p "remember ZEBRA"        # First session
 agent-vm claude --continue                  # Picks up where the last session left off
 ```
 
-If you launch `agent-vm claude` with no arguments on a brand new project, it auto-primes a tiny throwaway session and then opens `--continue` so you do not get stuck on Claude's first-run greeting.
+`agent-vm claude` now launches Claude directly without a hidden priming request.
 
 ### OpenCode sessions and configuration
 

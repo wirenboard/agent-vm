@@ -57,7 +57,7 @@ _agent_vm_setup() {
         echo "Create a VM template with Claude Code and OpenCode pre-installed."
         echo ""
         echo "Options:"
-        echo "  --minimal      Only install git, curl, jq, and Claude Code"
+        echo "  --minimal      Only install git, curl, jq, Claude Code, and OpenCode"
         echo "  --disk GB      VM disk size (default: 20)"
         echo "  --memory GB    VM memory (default: 8)"
         echo "  --help         Show this help"
@@ -745,9 +745,22 @@ _agent_vm_run() {
 }
 
 _agent_vm_shell() {
-  local agent="${1:-}"
-  shift 2>/dev/null || true
+  local agent=""
   local use_github=true
+
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    agent="$1"
+    shift
+  fi
+
+  case "$agent" in
+    ""|claude|opencode) ;;
+    *)
+      echo "Error: Unknown agent '$agent' for shell. Use: claude or opencode." >&2
+      return 1
+      ;;
+  esac
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
