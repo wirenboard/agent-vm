@@ -4,7 +4,7 @@ Run AI coding agents inside sandboxed Linux VMs. The agent gets full autonomy wh
 
 Uses [Lima](https://lima-vm.io/) to create lightweight Debian VMs on macOS and Linux. Ships with dev tools, Docker, and a headless Chrome browser with [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) pre-configured.
 
-Currently supports [Claude Code](https://claude.ai/code). Other agents (Codex, etc.) can be added in the future.
+Supports [Claude Code](https://claude.ai/code) and [OpenCode](https://opencode.ai/). Other agents (Codex, etc.) can be added in the future.
 
 Feedbacks welcome!
 
@@ -12,7 +12,7 @@ Feedbacks welcome!
 
 - macOS or Linux
 - [Lima](https://lima-vm.io/docs/installation/) (installed automatically via Homebrew if available)
-- A [Claude subscription](https://claude.ai/) (Pro, Max, or Team)
+- A [Claude subscription](https://claude.ai/) (Pro, Max, or Team) and/or an [OpenCode](https://opencode.ai/) compatible provider
 
 ## Install
 
@@ -30,10 +30,10 @@ echo "source $(pwd)/claude-vm.sh" >> ~/.bashrc  # or bash
 ### One-time setup
 
 ```bash
-claude-vm-setup
+agent-vm setup
 ```
 
-Creates a VM template with dev tools, Docker, Chromium, and Claude Code pre-installed. During setup, Claude will launch once for authentication. After it responds, type `/exit` to continue with the rest of the setup. (We haven't found a way to automate this step yet.)
+Creates a VM template with dev tools, Docker, Chromium, Claude Code, and OpenCode pre-installed. During setup, Claude will launch once for authentication. After it responds, type `/exit` to continue with the rest of the setup. (We haven't found a way to automate this step yet.)
 
 Options:
 
@@ -44,40 +44,59 @@ Options:
 | `--memory GB` | VM memory in GB | 8 |
 
 ```bash
-claude-vm-setup --minimal                  # Lightweight VM with just Claude
-claude-vm-setup --disk 50 --memory 16      # Larger VM for heavy workloads
+agent-vm setup --minimal                  # Lightweight VM with just Claude
+agent-vm setup --disk 50 --memory 16      # Larger VM for heavy workloads
 ```
 
 ### Run Claude in a VM
 
 ```bash
 cd your-project
-claude-vm
+agent-vm claude
 ```
 
 Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
 
-Any arguments passed to `claude-vm` are forwarded to the `claude` command:
+Any arguments are forwarded to the `claude` command:
 
 ```bash
-claude-vm -p "fix all lint errors"        # Run with a prompt
-claude-vm --resume                         # Resume previous session
-claude-vm -c "explain this codebase"       # Continue conversation
+agent-vm claude -p "fix all lint errors"        # Run with a prompt
+agent-vm claude --resume                         # Resume previous session
+agent-vm claude -c "explain this codebase"       # Continue conversation
+```
+
+### Run OpenCode in a VM
+
+```bash
+cd your-project
+agent-vm opencode
+```
+
+Runs [OpenCode](https://opencode.ai/) inside a sandboxed VM instead of Claude Code. Uses the same VM template, proxies, and security model. OpenCode is configured to use the Anthropic provider through the host proxy with all permissions auto-approved (the VM is the sandbox).
+
+Any arguments are forwarded to the `opencode` command:
+
+```bash
+agent-vm opencode run "fix all lint errors"        # Non-interactive mode
+agent-vm opencode --continue                        # Continue last session
+agent-vm opencode -m anthropic/claude-sonnet-4-5    # Specify a model
 ```
 
 ### Debug shell
 
 ```bash
-claude-vm-shell
+agent-vm shell                # Plain shell with API proxy configured
+agent-vm shell claude         # Shell pre-configured for Claude
+agent-vm shell opencode       # Shell pre-configured for OpenCode
 ```
 
-Same as `claude-vm` but drops you into a bash shell instead.
+Drops you into a bash shell inside a fresh VM instead of launching an agent. Useful for debugging or manual testing. When an agent is specified, the shell has that agent's configuration (env vars, MCP servers, etc.) pre-applied.
 
 ## Customization
 
 ### Per-user: `~/.claude-vm.setup.sh`
 
-Create this file in your home directory to install extra tools into the VM template. It runs once during `claude-vm-setup`, as the default VM user (with sudo available):
+Create this file in your home directory to install extra tools into the VM template. It runs once during `agent-vm setup`, as the default VM user (with sudo available):
 
 ```bash
 # ~/.claude-vm.setup.sh
@@ -87,7 +106,7 @@ pip install pandas numpy
 
 ### Per-project: `.claude-vm.runtime.sh`
 
-Create this file at the root of any project. It runs inside the cloned VM each time you call `claude-vm`, just before Claude starts. Use it for project-specific setup like installing dependencies or starting services:
+Create this file at the root of any project. It runs inside the cloned VM each time you run an agent, just before the agent starts. Use it for project-specific setup like installing dependencies or starting services:
 
 ```bash
 # your-project/.claude-vm.runtime.sh
@@ -97,24 +116,34 @@ docker compose up -d
 
 ## Session persistence
 
-VMs are ephemeral — each `claude-vm` invocation creates a fresh clone and deletes it on exit. To make `claude --continue` and `claude --resume` work across VM launches, session data is persisted in the project directory.
+VMs are ephemeral — each invocation creates a fresh clone and deletes it on exit. To make session resume work across VM launches, agent state is persisted outside your project directory.
 
 **How it works:**
 
-1. A `.agent-vm/claude-sessions/` directory is created in the project root
-2. Claude's session-related directories (`projects`, `file-history`, `todos`, `plans`) and `history.jsonl` are symlinked from `~/.claude/` to `.agent-vm/claude-sessions/`
+1. A per-project state directory is created under `${XDG_STATE_HOME:-~/.local/state}/agent-vm/`
+2. Claude's session-related directories (`projects`, `file-history`, `todos`, `plans`) and `history.jsonl` are symlinked from `~/.claude/` to `<state-dir>/claude-sessions/`
 3. Ephemeral config (`.credentials.json`, `CLAUDE.md`) stays in-VM and is not persisted
-4. `~/.claude.json` is persisted as `.agent-vm/claude-sessions/claude.json` to preserve onboarding/project state
+4. `~/.claude.json` is persisted as `<state-dir>/claude-sessions/claude.json` to preserve onboarding/project state
 5. `hasCompletedOnboarding=true` is enforced before launch to prevent first-run greeting loops
 
-Add `.agent-vm/` to your `.gitignore`.
+Set `AGENT_VM_STATE_DIR` to override the state root location.
 
 ```bash
-claude-vm -p "remember ZEBRA"        # First session
-claude-vm --continue                  # Picks up where the last session left off
+agent-vm claude -p "remember ZEBRA"        # First session
+agent-vm claude --continue                  # Picks up where the last session left off
 ```
 
-If you launch `claude-vm` with no arguments on a brand new project, it auto-primes a tiny throwaway session and then opens `--continue` so you do not get stuck on Claude's first-run greeting.
+If you launch `agent-vm claude` with no arguments on a brand new project, it auto-primes a tiny throwaway session and then opens `--continue` so you do not get stuck on Claude's first-run greeting.
+
+### OpenCode sessions and configuration
+
+OpenCode session data is persisted in `<state-dir>/opencode-sessions/` by symlinking `~/.local/share/opencode/` inside the VM.
+
+OpenCode configuration is stored in `<state-dir>/opencode-config/opencode.json` and referenced via the `OPENCODE_CONFIG` env var. It configures:
+- The Anthropic provider pointing to the host proxy
+- All permissions set to `"allow"` (the VM is the sandbox)
+- GitHub MCP server (when available)
+- Autoupdates disabled
 
 ## Claude API Proxy
 
@@ -130,13 +159,13 @@ The host-side API proxy (`claude-vm-proxy.py`) keeps your Claude credentials out
 
 ## GitHub Integration
 
-When you run `claude-vm` inside a git repo with a GitHub remote, it automatically:
+When you run `agent-vm claude` or `agent-vm opencode` inside a git repo with a GitHub remote, it automatically:
 
 1. Detects the repository from `git remote`
 2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
 3. Starts two host-side proxies: one for the GitHub MCP Server, one for Git HTTP
 4. Configures the VM so both `git push`/`pull` and MCP tools work transparently
-5. Writes instructions to `~/.claude/CLAUDE.md` in the VM so Claude knows git is available
+5. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
 
 No credentials are ever exposed to the VM. Both proxies inject the token on the host side and enforce repo scope.
 
@@ -203,7 +232,7 @@ Even though the token is already scoped to one repository by GitHub, the proxy a
 
 ### Standalone usage
 
-Both proxies can be run independently of `claude-vm`:
+Both proxies can be run independently of agent-vm:
 
 ```bash
 # MCP proxy
@@ -218,9 +247,11 @@ GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
 
 ## How it works
 
-1. **`claude-vm-setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code, and stops it as a reusable template
-2. **`claude-vm [args]`** clones the template, mounts your working directory read-write, runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
-3. On exit, the cloned VM is stopped and deleted. The template persists for reuse
+1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode, and stops it as a reusable template
+2. **`agent-vm claude [args]`** clones the template, mounts your working directory read-write, runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
+3. **`agent-vm opencode [args]`** same as above but launches OpenCode instead, with its own config and session persistence
+4. **`agent-vm shell [agent]`** same VM setup but drops into a bash shell for debugging
+5. On exit, the cloned VM is stopped and deleted. The template persists for reuse
 
 Ports opened inside the VM (e.g. by Docker containers) are automatically forwarded to your host by Lima.
 
@@ -234,7 +265,7 @@ Ports opened inside the VM (e.g. by Docker containers) are automatically forward
 | Search | ripgrep, fd-find |
 | Browser | Chromium (headless), xvfb |
 | Containers | Docker Engine, Docker Compose |
-| AI | Claude Code, Chrome DevTools MCP server |
+| AI | Claude Code, OpenCode, Chrome DevTools MCP server |
 
 ## Why a VM?
 

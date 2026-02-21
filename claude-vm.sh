@@ -324,11 +324,6 @@ _claude_vm_ensure_onboarding_config() {
   '
 }
 
-_claude_vm_has_session_history() {
-  local state_dir="$1"
-  [ -s "${state_dir}/claude-sessions/history.jsonl" ]
-}
-
 _claude_vm_start_github_mcp() {
   local host_dir="$1"
   local script_dir
@@ -738,15 +733,6 @@ _agent_vm_run() {
       opencode "${args[@]}"
   else
     local claude_args=("${args[@]}")
-    if [ ${#claude_args[@]} -eq 0 ] && ! _claude_vm_has_session_history "$state_dir"; then
-      echo "First run detected; priming session to skip Claude greeting..."
-      limactl shell --workdir "$host_dir" "$vm_name" \
-        env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
-        IS_SANDBOX=1 \
-        claude --dangerously-skip-permissions -p "Initialize session state. Reply with exactly: Ready." >/dev/null
-      claude_args=(--continue)
-    fi
-
     limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
       IS_SANDBOX=1 \

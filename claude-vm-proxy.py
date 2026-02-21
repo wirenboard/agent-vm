@@ -380,12 +380,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 debug(f"  < {key}: {value}")
 
         if is_streaming:
-            # Streaming: forward headers, re-chunk the decoded body
+            # Streaming: forward headers, re-chunk the decoded body.
+            # Close the connection after streaming to avoid keep-alive
+            # corruption: Python's BaseHTTPRequestHandler struggles to
+            # correctly parse the next request on a persistent connection
+            # after a chunked transfer-encoded response, causing the body
+            # of request N+1 to be concatenated with its HTTP request line.
             self.send_response(upstream.status)
             for key, value in upstream_headers:
                 if key.lower() in FORWARDED_RESPONSE_HEADERS:
                     self.send_header(key, value)
             self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
             total_bytes = 0
             try:
