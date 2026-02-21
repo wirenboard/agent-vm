@@ -1,19 +1,50 @@
 #!/usr/bin/env bash
 #
-# agent-vm / claude-vm: Run Claude Code inside a sandboxed Lima VM
+# agent-vm: Run AI coding agents inside a sandboxed Lima VM
 # Part of https://github.com/sylvinus/agent-vm
 #
 # Source this file in your shell config:
 #   source /path/to/agent-vm/claude-vm.sh
 #
-# Functions:
-#   claude-vm-setup  - Create the VM template (run once)
-#   claude-vm [args] - Run Claude in a fresh VM with cwd mounted (args forwarded to claude)
-#   claude-vm-shell  - Open a debug shell in a fresh VM
+# Usage:
+#   agent-vm setup            - Create the VM template (run once)
+#   agent-vm claude [args]    - Run Claude in a fresh VM (args forwarded to claude)
+#   agent-vm opencode [args]  - Run OpenCode in a fresh VM (args forwarded to opencode)
+#   agent-vm shell [agent]    - Open a debug shell in a fresh VM
 
 CLAUDE_VM_TEMPLATE="claude-template"
 
-claude-vm-setup() {
+_agent_vm_state_root() {
+  if [ -n "${AGENT_VM_STATE_DIR:-}" ]; then
+    printf '%s\n' "$AGENT_VM_STATE_DIR"
+  else
+    printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm"
+  fi
+}
+
+_agent_vm_project_hash() {
+  local host_dir="$1"
+  printf '%s' "$host_dir" | shasum -a 256 | awk '{print $1}'
+}
+
+_agent_vm_project_state_dir() {
+  local host_dir="$1"
+  local root
+  local hash
+  local slug
+  local state_dir
+
+  root="$(_agent_vm_state_root)"
+  hash="$(_agent_vm_project_hash "$host_dir")"
+  slug="$(basename "$host_dir" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')"
+  [ -z "$slug" ] && slug="project"
+
+  state_dir="${root}/${slug}-${hash:0:12}"
+  mkdir -p "$state_dir"
+  printf '%s\n' "$state_dir"
+}
+
+_agent_vm_setup() {
   local minimal=false
   local disk=20
   local memory=8
@@ -21,9 +52,9 @@ claude-vm-setup() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)
-        echo "Usage: claude-vm-setup [--minimal] [--disk GB] [--memory GB]"
+        echo "Usage: agent-vm setup [--minimal] [--disk GB] [--memory GB]"
         echo ""
-        echo "Create a VM template with Claude Code pre-installed."
+        echo "Create a VM template with Claude Code and OpenCode pre-installed."
         echo ""
         echo "Options:"
         echo "  --minimal      Only install git, curl, jq, and Claude Code"
@@ -54,7 +85,7 @@ claude-vm-setup() {
         ;;
       *)
         echo "Unknown option: $1" >&2
-        echo "Usage: claude-vm-setup [--minimal] [--disk GB] [--memory GB]" >&2
+        echo "Usage: agent-vm setup [--minimal] [--disk GB] [--memory GB]" >&2
         return 1
         ;;
     esac
@@ -144,6 +175,13 @@ claude-vm-setup() {
     echo "{\"theme\":\"dark\",\"hasCompletedOnboarding\":true,\"skipDangerousModePermissionPrompt\":true,\"effortLevel\":\"high\"}" > ~/.claude/settings.json
   '
 
+  # Install OpenCode
+  echo "Installing OpenCode..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://opencode.ai/install | bash"
+  # Symlink opencode into ~/.local/bin so it's on the default PATH
+  # (the install script puts it in ~/.opencode/bin which isn't in PATH for non-interactive shells)
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'mkdir -p ~/.local/bin && ln -sf ~/.opencode/bin/opencode ~/.local/bin/opencode'
+
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
     echo "Configuring Chrome MCP server..."
@@ -195,7 +233,7 @@ CIEOF
 
   limactl stop "$CLAUDE_VM_TEMPLATE"
 
-  echo "Template ready. Run 'claude-vm' in any project directory."
+  echo "Template ready. Run 'agent-vm claude' or 'agent-vm opencode' in any project directory."
 }
 
 _claude_vm_start_proxy() {
@@ -227,9 +265,9 @@ CREDS'
 
 _claude_vm_setup_session_persistence() {
   local vm_name="$1"
-  local host_dir="$2"
+  local state_dir="$2"
   limactl shell "$vm_name" bash -c '
-    SESSION_DIR="'"$host_dir"'/.agent-vm/claude-sessions"
+    SESSION_DIR="'"$state_dir"'/claude-sessions"
     mkdir -p ~/.claude \
       "$SESSION_DIR/projects" \
       "$SESSION_DIR/file-history" \
@@ -287,8 +325,8 @@ _claude_vm_ensure_onboarding_config() {
 }
 
 _claude_vm_has_session_history() {
-  local host_dir="$1"
-  [ -s "${host_dir}/.agent-vm/claude-sessions/history.jsonl" ]
+  local state_dir="$1"
+  [ -s "${state_dir}/claude-sessions/history.jsonl" ]
 }
 
 _claude_vm_start_github_mcp() {
@@ -495,7 +533,118 @@ _claude_vm_security_check() {
   rm -f "$after_file" "${after_file}.git-config"
 }
 
-claude-vm() {
+# ── OpenCode helpers ──────────────────────────────────────────────────────────
+
+_opencode_vm_setup_config() {
+  local vm_name="$1"  # unused but kept for consistent API
+  local proxy_port="$2"
+  local state_dir="$3"
+
+  local config_dir="${state_dir}/opencode-config"
+  mkdir -p "$config_dir"
+
+  cat > "${config_dir}/opencode.json" << OCJSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "http://host.lima.internal:${proxy_port}/v1",
+        "apiKey": "dummy-key-auth-handled-by-proxy"
+      }
+    }
+  },
+  "permission": "allow",
+  "autoupdate": false,
+  "watcher": {
+    "ignore": ["node_modules/**", "dist/**", ".git/**", ".agent-vm/**"]
+  },
+  "mcp": {
+    "chrome-devtools": {
+      "type": "local",
+      "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"],
+      "enabled": true
+    }
+  }
+}
+OCJSON
+}
+
+_opencode_vm_setup_auth() {
+  local vm_name="$1"
+  # Write a dummy auth.json so OpenCode recognizes the Anthropic provider
+  # as configured.  The actual API key is set via provider.anthropic.options.apiKey
+  # in opencode.json, and real auth is handled by the host proxy.
+  limactl shell "$vm_name" bash -c '
+    mkdir -p ~/.local/share/opencode
+    cat > ~/.local/share/opencode/auth.json << '\''AUTH'\''
+{
+  "anthropic": {
+    "apiKey": "dummy-key-auth-handled-by-proxy"
+  }
+}
+AUTH
+  '
+}
+
+_opencode_vm_setup_session_persistence() {
+  local vm_name="$1"
+  local state_dir="$2"
+  limactl shell "$vm_name" bash -c '
+    SESSION_DIR="'"$state_dir"'/opencode-sessions"
+    mkdir -p "$SESSION_DIR" \
+      ~/.local/share/opencode
+    if [ -d ~/.local/share/opencode ] && [ ! -L ~/.local/share/opencode ]; then
+      cp -a ~/.local/share/opencode/. "$SESSION_DIR/" 2>/dev/null || true
+      rm -rf ~/.local/share/opencode
+    fi
+    ln -sfn "$SESSION_DIR" ~/.local/share/opencode
+  '
+}
+
+_opencode_vm_inject_github_mcp_opencode() {
+  local vm_name="$1"  # unused but kept for consistent API
+  local port="$2"
+  local state_dir="$3"
+
+  local config="${state_dir}/opencode-config/opencode.json"
+  if [ -f "$config" ] && command -v jq &>/dev/null; then
+    jq '.mcp.github = {"type":"remote","url":"http://host.lima.internal:'"${port}"'/mcp","enabled":true}' \
+      "$config" > "$config.tmp" && mv "$config.tmp" "$config"
+  fi
+}
+
+_opencode_vm_inject_git_proxy() {
+  local vm_name="$1"
+  local git_port="$2"
+  local owner="$3"
+  local repo="$4"
+  local host_dir="$5"
+  local proxy_base="http://host.lima.internal:${git_port}/${owner}/${repo}"
+
+  # Get git user identity from host
+  local git_name git_email
+  git_name=$(git config user.name 2>/dev/null || echo "")
+  git_email=$(git config user.email 2>/dev/null || echo "")
+
+  # Rewrite only this repo's URLs through the proxy
+  # (Claude's _claude_vm_inject_git_proxy already does this, but we call it
+  #  for the opencode-only path where claude's version might not be called)
+  limactl shell "$vm_name" bash -c "
+    git config --global url.\"${proxy_base}\".insteadOf \"git@github.com:${owner}/${repo}\"
+    git config --global --add url.\"${proxy_base}\".insteadOf \"https://github.com/${owner}/${repo}\"
+    ${git_name:+git config --global user.name \"$git_name\"}
+    ${git_email:+git config --global user.email \"$git_email\"}
+  "
+
+  # OpenCode reads CLAUDE.md by default (via OPENCODE_DISABLE_CLAUDE_CODE=false),
+  # so the git instructions written by _claude_vm_inject_git_proxy are already
+  # available to OpenCode. No separate AGENTS.md needed.
+}
+
+_agent_vm_run() {
+  local agent="$1"
+  shift
   local use_github=true
   local args=()
   while [[ $# -gt 0 ]]; do
@@ -504,11 +653,13 @@ claude-vm() {
       *) args+=("$1"); shift ;;
     esac
   done
-  local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
+  local vm_name="${agent}-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
   local host_dir="$(pwd)"
+  local state_dir
+  state_dir="$(_agent_vm_project_state_dir "$host_dir")"
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
-    echo "Error: Template VM not found. Run 'claude-vm-setup' first." >&2
+    echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
     return 1
   fi
 
@@ -543,7 +694,7 @@ claude-vm() {
   # Note: .git/config is a file (not a directory) so it cannot be a Lima mount;
   # it is protected via the pre/post-session security check instead.
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
@@ -551,15 +702,28 @@ claude-vm() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
-  _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
+  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
+
+  if [ "$agent" = "opencode" ]; then
+    _opencode_vm_setup_config "$vm_name" "$_claude_vm_proxy_port" "$state_dir"
+    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _opencode_vm_setup_auth "$vm_name"
+  fi
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
+    if [ "$agent" = "opencode" ]; then
+      _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
+    fi
   fi
   if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
       "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+    if [ "$agent" = "opencode" ]; then
+      _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
+        "$_claude_vm_github_owner" "$_claude_vm_github_repo" "$host_dir"
+    fi
   fi
 
   # Run project-specific runtime script if it exists
@@ -568,27 +732,35 @@ claude-vm() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
-  local claude_args=("${args[@]}")
-  if [ ${#claude_args[@]} -eq 0 ] && ! _claude_vm_has_session_history "$host_dir"; then
-    echo "First run detected; priming session to skip Claude greeting..."
+  if [ "$agent" = "opencode" ]; then
+    limactl shell --workdir "$host_dir" "$vm_name" \
+      env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
+      opencode "${args[@]}"
+  else
+    local claude_args=("${args[@]}")
+    if [ ${#claude_args[@]} -eq 0 ] && ! _claude_vm_has_session_history "$state_dir"; then
+      echo "First run detected; priming session to skip Claude greeting..."
+      limactl shell --workdir "$host_dir" "$vm_name" \
+        env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+        IS_SANDBOX=1 \
+        claude --dangerously-skip-permissions -p "Initialize session state. Reply with exactly: Ready." >/dev/null
+      claude_args=(--continue)
+    fi
+
     limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
       IS_SANDBOX=1 \
-      claude --dangerously-skip-permissions -p "Initialize session state. Reply with exactly: Ready." >/dev/null
-    claude_args=(--continue)
+      claude --dangerously-skip-permissions "${claude_args[@]}"
   fi
-
-  limactl shell --workdir "$host_dir" "$vm_name" \
-    env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
-    IS_SANDBOX=1 \
-    claude --dangerously-skip-permissions "${claude_args[@]}"
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_cleanup
   trap - EXIT INT TERM
 }
 
-claude-vm-shell() {
+_agent_vm_shell() {
+  local agent="${1:-}"
+  shift 2>/dev/null || true
   local use_github=true
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -596,11 +768,13 @@ claude-vm-shell() {
       *) shift ;;
     esac
   done
-  local vm_name="claude-debug-$$"
+  local vm_name="${agent:+${agent}-}debug-$$"
   local host_dir="$(pwd)"
+  local state_dir
+  state_dir="$(_agent_vm_project_state_dir "$host_dir")"
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
-    echo "Error: Template VM not found. Run 'claude-vm-setup' first." >&2
+    echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
     return 1
   fi
 
@@ -632,7 +806,7 @@ claude-vm-shell() {
 
   # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false}]" \
+    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
@@ -640,15 +814,28 @@ claude-vm-shell() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
-  _claude_vm_setup_session_persistence "$vm_name" "$host_dir"
+  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
+
+  if [ "$agent" = "opencode" ]; then
+    _opencode_vm_setup_config "$vm_name" "$_claude_vm_proxy_port" "$state_dir"
+    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _opencode_vm_setup_auth "$vm_name"
+  fi
 
   if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
     _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
+    if [ "$agent" = "opencode" ]; then
+      _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
+    fi
   fi
   if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
       "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+    if [ "$agent" = "opencode" ]; then
+      _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
+        "$_claude_vm_github_owner" "$_claude_vm_github_repo" "$host_dir"
+    fi
   fi
 
   # Run project-specific runtime script if it exists
@@ -656,7 +843,7 @@ claude-vm-shell() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
-  echo "VM: $vm_name | Dir: $host_dir"
+  echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
   echo "API proxy: http://host.lima.internal:${_claude_vm_proxy_port}"
   if [ -n "$_claude_vm_github_mcp_port" ]; then
     echo "GitHub MCP: http://host.lima.internal:${_claude_vm_github_mcp_port}/mcp"
@@ -664,12 +851,59 @@ claude-vm-shell() {
   if [ -n "$_claude_vm_git_proxy_port" ]; then
     echo "Git proxy:  http://host.lima.internal:${_claude_vm_git_proxy_port}"
   fi
+  if [ "$agent" = "opencode" ]; then
+    echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
+  fi
   echo "Type 'exit' to stop and delete the VM"
+  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}")
+  if [ "$agent" = "opencode" ]; then
+    shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
+  fi
   limactl shell --workdir "$host_dir" "$vm_name" \
-    env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+    env "${shell_env[@]}" \
     bash -l
   _claude_vm_security_check "$host_dir" "$security_snapshot"
 
   _claude_vm_shell_cleanup
   trap - EXIT INT TERM
+}
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+
+agent-vm() {
+  local subcmd="${1:-}"
+  if [ -z "$subcmd" ]; then
+    echo "Usage: agent-vm <command> [options]" >&2
+    echo "" >&2
+    echo "Commands:" >&2
+    echo "  setup              Create the VM template (run once)" >&2
+    echo "  claude [args]      Run Claude Code in a sandboxed VM" >&2
+    echo "  opencode [args]    Run OpenCode in a sandboxed VM" >&2
+    echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)" >&2
+    echo "" >&2
+    echo "Options:" >&2
+    echo "  --no-git           Skip GitHub integration" >&2
+    return 1
+  fi
+  shift
+
+  case "$subcmd" in
+    setup)
+      _agent_vm_setup "$@"
+      ;;
+    claude)
+      _agent_vm_run claude "$@"
+      ;;
+    opencode)
+      _agent_vm_run opencode "$@"
+      ;;
+    shell)
+      _agent_vm_shell "$@"
+      ;;
+    *)
+      echo "Error: Unknown command '$subcmd'" >&2
+      echo "Run 'agent-vm' for usage." >&2
+      return 1
+      ;;
+  esac
 }
