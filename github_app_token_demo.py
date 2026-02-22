@@ -287,7 +287,7 @@ def load_cached_token(cache_dir, client_id, owner, repo):
         verbose("Cached token expired, no refresh token")
         return None
 
-    verbose("Cached token expired, attempting refresh...")
+    print("Cached token expired, refreshing...", file=sys.stderr)
     try:
         resp = device_flow_request(
             "https://github.com/login/oauth/access_token",
@@ -298,18 +298,19 @@ def load_cached_token(cache_dir, client_id, owner, repo):
             },
         )
     except SystemExit:
-        verbose("Refresh failed, will re-authenticate")
+        print("Refresh failed, falling back to browser login", file=sys.stderr)
         return None
 
     if resp.get("error"):
-        verbose(f"Refresh error: {resp.get('error')}")
+        print(f"Refresh failed ({resp.get('error')}), falling back to browser login",
+              file=sys.stderr)
         return None
 
     token = resp.get("access_token")
     if not token:
         return None
 
-    verbose("Token refreshed successfully")
+    print("Token refreshed successfully", file=sys.stderr)
     save_cached_token(
         cache_dir, client_id, owner, repo,
         token,
@@ -373,10 +374,10 @@ def device_flow_request(url, params):
                     last_error = f"{e.code} {e.reason} (HTML error page saved to disk)"
                 else:
                     last_error = f"{e.code} {e.reason}"
-                print(f"OAuth error: {e.code} {e.reason} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+                print(f"  GitHub returned {e.code} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
                 continue
             # Non-5xx error — don't retry
-            print(f"OAuth error: {e.code} {e.reason}", file=sys.stderr)
+            print(f"GitHub OAuth error: {e.code} {e.reason}", file=sys.stderr)
             if _looks_like_html(error_body):
                 saved = _save_error_body(e.code, error_body, f"POST {url}")
                 print(f"Response body saved to: {saved}", file=sys.stderr)
@@ -385,10 +386,10 @@ def device_flow_request(url, params):
             sys.exit(1)
         except urllib.error.URLError as e:
             last_error = str(e.reason)
-            print(f"OAuth error: {last_error} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
+            print(f"  Connection error: {last_error} (attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying...)", file=sys.stderr)
             continue
 
-    print(f"OAuth error: {last_error} (all {MAX_RETRIES + 1} attempts failed)", file=sys.stderr)
+    print(f"GitHub OAuth failed: {last_error} (all {MAX_RETRIES + 1} attempts failed)", file=sys.stderr)
     sys.exit(1)
 
 
