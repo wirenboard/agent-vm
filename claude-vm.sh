@@ -254,6 +254,73 @@ _claude_vm_start_proxy() {
   echo "API proxy listening on port $_claude_vm_proxy_port"
 }
 
+_claude_vm_inject_clipboard_shim() {
+  local vm_name="$1"
+  local state_dir="$2"
+  limactl shell "$vm_name" bash -c '
+    mkdir -p ~/.local/bin
+    cat > ~/.local/bin/wl-paste << '\''SHIM'\''
+#!/bin/sh
+# Shim for clipboard image paste from host via shared mount.
+# Claude Code calls: wl-paste -l (list types), wl-paste --type image/png (read)
+CLIPBOARD_FILE="'"$state_dir"'/clipboard.png"
+for arg in "$@"; do
+  case "$arg" in
+    -l|--list-types)
+      if [ -f "$CLIPBOARD_FILE" ]; then
+        echo "image/png"
+        exit 0
+      else
+        exit 1
+      fi
+      ;;
+  esac
+done
+# Default: output the image data
+if [ -f "$CLIPBOARD_FILE" ]; then
+  exec cat "$CLIPBOARD_FILE"
+else
+  exit 1
+fi
+SHIM
+    chmod +x ~/.local/bin/wl-paste
+    cat > ~/.local/bin/xclip << '\''XSHIM'\''
+#!/bin/sh
+# Shim for clipboard image paste from host via shared mount.
+# Claude Code calls: xclip -selection clipboard -t TARGETS -o (list types)
+#                    xclip -selection clipboard -t image/png -o (read)
+CLIPBOARD_FILE="'"$state_dir"'/clipboard.png"
+has_targets=false
+has_output=false
+mime_type=""
+for arg in "$@"; do
+  case "$arg" in
+    TARGETS) has_targets=true ;;
+    -o) has_output=true ;;
+    image/*) mime_type="$arg" ;;
+  esac
+done
+if $has_targets && $has_output; then
+  if [ -f "$CLIPBOARD_FILE" ]; then
+    echo "image/png"
+    exit 0
+  else
+    exit 1
+  fi
+fi
+if $has_output; then
+  if [ -f "$CLIPBOARD_FILE" ]; then
+    exec cat "$CLIPBOARD_FILE"
+  else
+    exit 1
+  fi
+fi
+exit 1
+XSHIM
+    chmod +x ~/.local/bin/xclip
+  '
+}
+
 _claude_vm_write_dummy_credentials() {
   local vm_name="$1"
   # Write dummy credentials so Claude Code detects a Max subscription
@@ -697,6 +764,7 @@ _agent_vm_run() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
@@ -727,13 +795,17 @@ _agent_vm_run() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ "$agent" = "opencode" ]; then
-    limactl shell --workdir "$host_dir" "$vm_name" \
+    CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+      limactl shell --workdir "$host_dir" "$vm_name" \
       env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
       opencode "${args[@]}"
   else
     local claude_args=("${args[@]}")
-    limactl shell --workdir "$host_dir" "$vm_name" \
+    CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+      limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
       IS_SANDBOX=1 \
       claude --dangerously-skip-permissions "${claude_args[@]}"
@@ -813,6 +885,7 @@ _agent_vm_shell() {
   limactl start "$vm_name" &>/dev/null
 
   _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
@@ -858,7 +931,10 @@ _agent_vm_shell() {
   if [ "$agent" = "opencode" ]; then
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi
-  limactl shell --workdir "$host_dir" "$vm_name" \
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+    limactl shell --workdir "$host_dir" "$vm_name" \
     env "${shell_env[@]}" \
     bash -l
   _claude_vm_security_check "$host_dir" "$security_snapshot"
