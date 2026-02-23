@@ -167,6 +167,11 @@ def cmd_create_app():
     print("   - Under 'Where can this GitHub App be installed?':")
     print("     - Select 'Only on this account'")
     print()
+    print("   After creating the app, go to Optional features:")
+    print("     - User-to-server token expiration: Opt-out")
+    print("     (Expiring tokens break when multiple repos are used,")
+    print("      because each device flow revokes previous refresh tokens)")
+    print()
     print("3. Click 'Create GitHub App'")
     print()
     print("4. Note the Client ID (starts with Iv...)")
@@ -275,61 +280,28 @@ def load_cached_token(cache_dir, client_id, owner, repo):
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-    expires_at = data.get("expires_at", 0)
-    # 5 minute margin
-    if time.time() < expires_at - 300:
-        verbose(f"Using cached token (expires in {int(expires_at - time.time())}s)")
-        return data.get("access_token")
-
-    # Token expired — try refresh
-    refresh_token = data.get("refresh_token")
-    if not refresh_token:
-        verbose("Cached token expired, no refresh token")
-        return None
-
-    print("Cached token expired, refreshing...", file=sys.stderr)
-    try:
-        resp = device_flow_request(
-            "https://github.com/login/oauth/access_token",
-            {
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
-        )
-    except SystemExit:
-        print("Refresh failed, falling back to browser login", file=sys.stderr)
-        return None
-
-    if resp.get("error"):
-        print(f"Refresh failed ({resp.get('error')}), falling back to browser login",
-              file=sys.stderr)
-        return None
-
-    token = resp.get("access_token")
+    token = data.get("access_token")
     if not token:
         return None
 
-    print("Token refreshed successfully", file=sys.stderr)
-    save_cached_token(
-        cache_dir, client_id, owner, repo,
-        token,
-        resp.get("refresh_token", refresh_token),
-        resp.get("expires_in", 28800),
-    )
+    # Discard old-format cache files that had expiring tokens
+    if data.get("refresh_token") or data.get("expires_at"):
+        verbose("Discarding old cache with expiring token format")
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
+    verbose(f"Using cached token")
     return token
 
 
-def save_cached_token(cache_dir, client_id, owner, repo,
-                      access_token, refresh_token, expires_in):
+def save_cached_token(cache_dir, client_id, owner, repo, access_token):
     """Save token to cache file."""
     path = _cache_path(cache_dir, client_id, owner, repo)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at": time.time() + (int(expires_in) if expires_in != "never" else 86400),
-    }
+    data = {"access_token": access_token}
     with open(path, "w") as f:
         json.dump(data, f)
     # Restrict permissions — token file
@@ -477,19 +449,11 @@ def cmd_user_token(client_id, repository_id=None, token_only=False,
         # Success
         token = token_resp["access_token"]
         token_type = token_resp.get("token_type", "bearer")
-        expires = token_resp.get("expires_in", "never")
-        refresh = token_resp.get("refresh_token", "")
         verbose(f"Token type: {token_type}")
         verbose(f"Full token response keys: {list(token_resp.keys())}")
         break
 
     print("Authorization successful!", file=out)
-    print(file=out)
-
-    if expires != "never":
-        print(f"Token expires in: {expires}s", file=out)
-    if refresh:
-        print(f"Refresh token: {refresh}", file=out)
     print(file=out)
 
     print("Verifying token...", file=out)
@@ -500,7 +464,7 @@ def cmd_user_token(client_id, repository_id=None, token_only=False,
     # Cache the token
     if cache_dir:
         save_cached_token(cache_dir, client_id, TARGET_OWNER, TARGET_REPO,
-                          token, refresh, expires)
+                          token)
 
     if token_only:
         print(token)
