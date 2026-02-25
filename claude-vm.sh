@@ -44,6 +44,113 @@ _agent_vm_project_state_dir() {
   printf '%s\n' "$state_dir"
 }
 
+# ── USB passthrough helpers ───────────────────────────────────────────────────
+
+_agent_vm_usb_resolve() {
+  local device="$1"
+  # Already in VID:PID format
+  if [[ "$device" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+    printf '%s\n' "$device"
+    return 0
+  fi
+  # Device path like /dev/ttyACM0
+  if [[ "$device" =~ ^/dev/ ]]; then
+    local devname="${device#/dev/}"
+    local sysdir="/sys/class/tty/${devname}/device"
+    if [ ! -d "$sysdir" ]; then
+      # Try other device classes (hidraw, usb, etc.)
+      local class="${devname%%[0-9]*}"
+      sysdir="/sys/class/${class}/${devname}/device"
+    fi
+    if [ ! -d "$sysdir" ]; then
+      echo "Error: Cannot find sysfs entry for $device" >&2
+      return 1
+    fi
+    # Walk up to the USB device level (has idVendor)
+    # Resolve symlinks first so dirname walks the real device tree
+    local usbdir
+    usbdir="$(readlink -f "$sysdir")"
+    while [ -n "$usbdir" ] && [ "$usbdir" != "/" ] && [ ! -f "$usbdir/idVendor" ]; do
+      usbdir="$(dirname "$usbdir")"
+    done
+    if [ ! -f "$usbdir/idVendor" ]; then
+      echo "Error: Cannot find USB vendor/product ID for $device" >&2
+      return 1
+    fi
+    local vid pid
+    vid="$(cat "$usbdir/idVendor")"
+    pid="$(cat "$usbdir/idProduct")"
+    printf '%s:%s\n' "$vid" "$pid"
+    return 0
+  fi
+  echo "Error: Unrecognized device format '$device' (use /dev/ttyACM0 or 1a86:55d3)" >&2
+  return 1
+}
+
+_agent_vm_usb_find_sysfs() {
+  local vidpid="$1"
+  local vid="${vidpid%%:*}"
+  local pid="${vidpid##*:}"
+  local devpath
+  for devpath in /sys/bus/usb/devices/[0-9]*-[0-9]*; do
+    [ -f "$devpath/idVendor" ] || continue
+    [ "$(cat "$devpath/idVendor")" = "$vid" ] || continue
+    [ "$(cat "$devpath/idProduct")" = "$pid" ] || continue
+    printf '%s\n' "$(basename "$devpath")"
+    return 0
+  done
+  echo "Error: No USB device found matching $vidpid" >&2
+  return 1
+}
+
+_agent_vm_usb_unbind() {
+  local port="$1"
+  # Unbind each interface from its current driver
+  local intf
+  for intf in /sys/bus/usb/devices/${port}:*/driver; do
+    [ -d "$intf" ] || continue
+    local intf_name
+    intf_name="$(basename "$(dirname "$intf")")"
+    echo "  Unbinding $intf_name from $(basename "$(readlink "$intf")")"
+    sudo sh -c "echo '$intf_name' > '$intf/unbind'"
+  done
+  # chmod the USB device node so QEMU can access it without root
+  local busnum devnum devnode
+  busnum="$(cat "/sys/bus/usb/devices/${port}/busnum")"
+  devnum="$(cat "/sys/bus/usb/devices/${port}/devnum")"
+  devnode=$(printf '/dev/bus/usb/%03d/%03d' "$busnum" "$devnum")
+  echo "  Setting permissions on $devnode"
+  sudo chmod 0666 "$devnode"
+}
+
+_agent_vm_usb_rebind() {
+  local port="$1"
+  echo "Rebinding USB device $port..."
+  sudo sh -c "echo '$port' > /sys/bus/usb/drivers/usb/unbind" 2>/dev/null
+  sudo sh -c "echo '$port' > /sys/bus/usb/drivers/usb/bind" 2>/dev/null
+}
+
+_agent_vm_usb_qemu_args() {
+  # Create a wrapper script that injects USB passthrough args into QEMU
+  local wrapper
+  wrapper="$(mktemp /tmp/qemu-usb-wrapper.XXXXXX)"
+  local qemu_bin
+  qemu_bin="$(command -v qemu-system-x86_64)"
+  local extra_args="-device qemu-xhci,id=xhci,addr=0x15"
+  local vidpid
+  for vidpid in "$@"; do
+    local vid="${vidpid%%:*}"
+    local pid="${vidpid##*:}"
+    extra_args+=" -device usb-host,bus=xhci.0,vendorid=0x${vid},productid=0x${pid}"
+  done
+  cat > "$wrapper" << WRAPPER
+#!/bin/sh
+exec "$qemu_bin" "\$@" $extra_args
+WRAPPER
+  chmod +x "$wrapper"
+  printf '%s\n' "$wrapper"
+}
+
 _agent_vm_setup() {
   local minimal=false
   local disk=30
@@ -163,6 +270,22 @@ _agent_vm_setup() {
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable
     limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'sudo mkdir -p /opt/google/chrome && sudo ln -sf /usr/bin/chromium /opt/google/chrome/chrome'
   fi
+
+  # Install non-cloud kernel (cloud kernel lacks USB, serial, and other hardware drivers)
+  echo "Installing non-cloud kernel..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-amd64
+  limactl shell "$CLAUDE_VM_TEMPLATE" sudo bash -c '
+    GRUB_CFG="/boot/grub/grub.cfg"
+    SUBMENU_ID=$(grep -o "gnulinux-advanced-[a-f0-9-]*" "$GRUB_CFG" | head -1)
+    ENTRY_ID=$(grep "menuentry " "$GRUB_CFG" | grep -v cloud | grep -o "gnulinux-[0-9][^ '\''\"]*" | head -1)
+    if [ -n "$SUBMENU_ID" ] && [ -n "$ENTRY_ID" ]; then
+      sed -i "s/^GRUB_DEFAULT=.*/GRUB_DEFAULT=\"${SUBMENU_ID}>${ENTRY_ID}\"/" /etc/default/grub
+      update-grub
+      echo "GRUB default set to: ${SUBMENU_ID}>${ENTRY_ID}"
+    else
+      echo "Warning: Could not determine non-cloud kernel GRUB entry" >&2
+    fi
+  '
 
   # Install Claude Code
   echo "Installing Claude Code..."
@@ -708,10 +831,13 @@ _agent_vm_run() {
   local agent="$1"
   shift
   local use_github=true
+  local usb_devices=()
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
+      --usb) usb_devices+=("$2"); shift 2 ;;
+      --usb=*) usb_devices+=("${1#*=}"); shift ;;
       *) args+=("$1"); shift ;;
     esac
   done
@@ -719,6 +845,8 @@ _agent_vm_run() {
   local host_dir="$(pwd)"
   local state_dir
   state_dir="$(_agent_vm_project_state_dir "$host_dir")"
+  local _usb_sysfs_ports=()
+  local _usb_qemu_wrapper=""
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
     echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
@@ -743,6 +871,11 @@ _agent_vm_run() {
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
+    local port
+    for port in "${_usb_sysfs_ports[@]}"; do
+      _agent_vm_usb_rebind "$port"
+    done
+    [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
@@ -761,7 +894,26 @@ _agent_vm_run() {
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
-  limactl start "$vm_name" &>/dev/null
+  # USB passthrough: resolve devices, unbind host drivers, create QEMU wrapper
+  if [ ${#usb_devices[@]} -gt 0 ]; then
+    local _usb_vidpids=()
+    local dev vidpid port
+    for dev in "${usb_devices[@]}"; do
+      vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+      port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+      echo "USB: $dev → $vidpid (port $port)"
+      _agent_vm_usb_unbind "$port"
+      _usb_sysfs_ports+=("$port")
+      _usb_vidpids+=("$vidpid")
+    done
+    _usb_qemu_wrapper="$(_agent_vm_usb_qemu_args "${_usb_vidpids[@]}")"
+  fi
+
+  if [ -n "$_usb_qemu_wrapper" ]; then
+    QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+  else
+    limactl start "$vm_name" &>/dev/null
+  fi
 
   _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
@@ -833,9 +985,12 @@ _agent_vm_shell() {
       ;;
   esac
 
+  local usb_devices=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
+      --usb) usb_devices+=("$2"); shift 2 ;;
+      --usb=*) usb_devices+=("${1#*=}"); shift ;;
       *) shift ;;
     esac
   done
@@ -843,6 +998,8 @@ _agent_vm_shell() {
   local host_dir="$(pwd)"
   local state_dir
   state_dir="$(_agent_vm_project_state_dir "$host_dir")"
+  local _usb_sysfs_ports=()
+  local _usb_qemu_wrapper=""
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
     echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
@@ -867,6 +1024,11 @@ _agent_vm_shell() {
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
+    local port
+    for port in "${_usb_sysfs_ports[@]}"; do
+      _agent_vm_usb_rebind "$port"
+    done
+    [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
@@ -882,7 +1044,26 @@ _agent_vm_shell() {
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
-  limactl start "$vm_name" &>/dev/null
+  # USB passthrough: resolve devices, unbind host drivers, create QEMU wrapper
+  if [ ${#usb_devices[@]} -gt 0 ]; then
+    local _usb_vidpids=()
+    local dev vidpid port
+    for dev in "${usb_devices[@]}"; do
+      vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+      port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+      echo "USB: $dev → $vidpid (port $port)"
+      _agent_vm_usb_unbind "$port"
+      _usb_sysfs_ports+=("$port")
+      _usb_vidpids+=("$vidpid")
+    done
+    _usb_qemu_wrapper="$(_agent_vm_usb_qemu_args "${_usb_vidpids[@]}")"
+  fi
+
+  if [ -n "$_usb_qemu_wrapper" ]; then
+    QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+  else
+    limactl start "$vm_name" &>/dev/null
+  fi
 
   _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
@@ -958,6 +1139,7 @@ agent-vm() {
     echo "" >&2
     echo "Options:" >&2
     echo "  --no-git           Skip GitHub integration" >&2
+    echo "  --usb DEVICE       Pass USB device to VM (repeatable; /dev/ttyACM0 or 1a86:55d3)" >&2
     return 1
   fi
   shift
