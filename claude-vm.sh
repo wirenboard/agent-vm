@@ -514,6 +514,21 @@ _claude_vm_ensure_onboarding_config() {
   '
 }
 
+_claude_vm_parse_github_remote() {
+  # Parse owner/repo from a git remote URL. Prints "owner repo" or returns 1.
+  python3 -c "
+import re, sys
+url = sys.argv[1]
+for pat in [r'git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$',
+            r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$']:
+    m = re.match(pat, url)
+    if m:
+        print(m.group(1), m.group(2))
+        sys.exit(0)
+sys.exit(1)
+" "$1"
+}
+
 _claude_vm_start_github_mcp() {
   local host_dir="$1"
   local script_dir
@@ -529,23 +544,13 @@ _claude_vm_start_github_mcp() {
 
   # Parse owner/repo from remote URL
   local owner repo
-  read -r owner repo < <(python3 -c "
-import re, sys
-url = sys.argv[1]
-for pat in [r'git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$',
-            r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$']:
-    m = re.match(pat, url)
-    if m:
-        print(m.group(1), m.group(2))
-        sys.exit(0)
-sys.exit(1)
-" "$repo_url")
+  read -r owner repo < <(_claude_vm_parse_github_remote "$repo_url")
   if [ -z "$owner" ] || [ -z "$repo" ]; then
     echo "Warning: Cannot parse GitHub remote '$repo_url', skipping GitHub MCP" >&2
     return 1
   fi
 
-  # Get scoped user token via device flow
+  # Get scoped user token for main repo via device flow
   echo "Requesting GitHub token for $owner/$repo..."
   local token
   token=$(python3 "$script_dir/github_app_token_demo.py" \
@@ -557,9 +562,54 @@ sys.exit(1)
     return 1
   fi
 
-  # Start GitHub MCP proxy (injects token, enforces repo scope)
+  # Build repos JSON dict: {"owner/repo": "token", ...}
+  # Start with the main repo
+  local repos_json
+  repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
+    "$owner/$repo" "$token")
+
+  # Detect GitHub submodules from .gitmodules
+  if [ -f "$host_dir/.gitmodules" ]; then
+    local sub_urls
+    sub_urls=$(python3 -c "
+import configparser, sys
+p = configparser.ConfigParser()
+p.read(sys.argv[1])
+for s in p.sections():
+    url = p.get(s, 'url', fallback='')
+    if 'github.com' in url:
+        print(url)
+" "$host_dir/.gitmodules")
+    local sub_url sub_owner sub_repo sub_token
+    while IFS= read -r sub_url; do
+      [ -z "$sub_url" ] && continue
+      read -r sub_owner sub_repo < <(_claude_vm_parse_github_remote "$sub_url") || continue
+      [ -z "$sub_owner" ] || [ -z "$sub_repo" ] && continue
+      # Skip if same as main repo
+      [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
+
+      echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
+      sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
+        user-token --client-id Iv23liisR1WdpJmDUPLT \
+        --repo "$sub_url" --token-only \
+        --cache-dir "$HOME/.cache/claude-vm") || true
+      if [ -n "$sub_token" ]; then
+        repos_json=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d[sys.argv[2]] = sys.argv[3]
+print(json.dumps(d))
+" "$repos_json" "$sub_owner/$sub_repo" "$sub_token")
+        echo "  Got token for $sub_owner/$sub_repo"
+      else
+        echo "  Warning: no token for $sub_owner/$sub_repo (skipping credential injection)"
+      fi
+    done <<< "$sub_urls"
+  fi
+
+  # Start GitHub MCP proxy (injects per-repo tokens, enforces repo scope)
   echo "Starting GitHub MCP proxy..."
-  exec 4< <(GITHUB_MCP_TOKEN="$token" GITHUB_MCP_OWNER="$owner" GITHUB_MCP_REPO="$repo" \
+  exec 4< <(GITHUB_MCP_PROXY_REPOS="$repos_json" \
     GITHUB_MCP_PROXY_DEBUG="${GITHUB_MCP_PROXY_DEBUG:-0}" \
     python3 "$script_dir/github-mcp-proxy.py")
   _claude_vm_github_mcp_pid=$!
@@ -572,9 +622,9 @@ sys.exit(1)
   exec 4<&-
   echo "GitHub MCP proxy on port $_claude_vm_github_mcp_port (scope: $owner/$repo)"
 
-  # Start Git HTTP proxy (injects token, enforces repo scope)
+  # Start Git HTTP proxy (injects per-repo tokens for main + submodules)
   echo "Starting Git HTTP proxy..."
-  exec 5< <(GITHUB_MCP_TOKEN="$token" GITHUB_MCP_OWNER="$owner" GITHUB_MCP_REPO="$repo" \
+  exec 5< <(GITHUB_GIT_PROXY_REPOS="$repos_json" \
     python3 "$script_dir/github-git-proxy.py")
   _claude_vm_git_proxy_pid=$!
   if ! read -r -t 5 _claude_vm_git_proxy_port <&5; then
@@ -583,13 +633,12 @@ sys.exit(1)
     exec 5<&-
     # Non-fatal: MCP still works, just no git push
   else
-    echo "Git HTTP proxy on port $_claude_vm_git_proxy_port (scope: $owner/$repo)"
+    echo "Git HTTP proxy on port $_claude_vm_git_proxy_port"
   fi
   exec 5<&-
 
   # Export for use by other functions
-  _claude_vm_github_owner="$owner"
-  _claude_vm_github_repo="$repo"
+  _claude_vm_github_repos_json="$repos_json"
 }
 
 _claude_vm_inject_github_mcp() {
@@ -609,29 +658,54 @@ _claude_vm_inject_github_mcp() {
 _claude_vm_inject_git_proxy() {
   local vm_name="$1"
   local git_port="$2"
-  local owner="$3"
-  local repo="$4"
-  local proxy_base="http://host.lima.internal:${git_port}/${owner}/${repo}"
+  local repos_json="$3"  # JSON dict: {"owner/repo": "token", ...}
 
   # Get git user identity from host
   local git_name git_email
   git_name=$(git config user.name 2>/dev/null || echo "")
   git_email=$(git config user.email 2>/dev/null || echo "")
 
-  # Rewrite only this repo's URLs through the proxy.
+  # Set up git insteadOf for each repo in the JSON dict
   # git insteadOf is prefix-matched, so "git@github.com:owner/repo" matches
   # both "git@github.com:owner/repo.git" and "git@github.com:owner/repo".
+  local git_config_cmds
+  git_config_cmds=$(python3 -c "
+import json, sys
+repos = json.loads(sys.argv[1])
+port = sys.argv[2]
+for slug in repos:
+    owner, repo = slug.split('/', 1)
+    proxy_base = f'http://host.lima.internal:{port}/{owner}/{repo}'
+    print(f'git config --global url.{proxy_base}.insteadOf git@github.com:{owner}/{repo}')
+    print(f'git config --global --add url.{proxy_base}.insteadOf https://github.com/{owner}/{repo}')
+" "$repos_json" "$git_port")
+
   limactl shell "$vm_name" bash -c "
-    git config --global url.\"${proxy_base}\".insteadOf \"git@github.com:${owner}/${repo}\"
-    git config --global --add url.\"${proxy_base}\".insteadOf \"https://github.com/${owner}/${repo}\"
+    $git_config_cmds
     ${git_name:+git config --global user.name \"$git_name\"}
     ${git_email:+git config --global user.email \"$git_email\"}
   "
 
+  # Build list of repos for the CLAUDE.md instructions
+  local repo_list
+  repo_list=$(python3 -c "
+import json, sys
+repos = json.loads(sys.argv[1])
+slugs = list(repos.keys())
+if len(slugs) == 1:
+    print(f'Only {slugs[0]} has credentials configured. Other repos will require')
+    print('their own authentication.')
+else:
+    print('The following repositories have credentials configured:')
+    for s in slugs:
+        print(f'  - {s}')
+    print('Other repos will require their own authentication.')
+" "$repos_json")
+
   # Write Claude instructions about git access
   limactl shell "$vm_name" bash -c "
     mkdir -p \$HOME/.claude
-    cat >> \$HOME/.claude/CLAUDE.md << 'INSTRUCTIONS'
+    cat >> \$HOME/.claude/CLAUDE.md << INSTRUCTIONS
 
 # Git access
 
@@ -643,8 +717,7 @@ that injects credentials. You can use standard git commands:
     git push origin HEAD:my-branch
     git pull origin main
 
-Only ${owner}/${repo} has credentials configured. Other repos will require
-their own authentication.
+${repo_list}
 INSTRUCTIONS
   "
 }
@@ -802,22 +875,30 @@ _opencode_vm_inject_github_mcp_opencode() {
 _opencode_vm_inject_git_proxy() {
   local vm_name="$1"
   local git_port="$2"
-  local owner="$3"
-  local repo="$4"
-  local host_dir="$5"
-  local proxy_base="http://host.lima.internal:${git_port}/${owner}/${repo}"
+  local repos_json="$3"  # JSON dict: {"owner/repo": "token", ...}
 
   # Get git user identity from host
   local git_name git_email
   git_name=$(git config user.name 2>/dev/null || echo "")
   git_email=$(git config user.email 2>/dev/null || echo "")
 
-  # Rewrite only this repo's URLs through the proxy
+  # Set up git insteadOf for each repo in the JSON dict
   # (Claude's _claude_vm_inject_git_proxy already does this, but we call it
   #  for the opencode-only path where claude's version might not be called)
+  local git_config_cmds
+  git_config_cmds=$(python3 -c "
+import json, sys
+repos = json.loads(sys.argv[1])
+port = sys.argv[2]
+for slug in repos:
+    owner, repo = slug.split('/', 1)
+    proxy_base = f'http://host.lima.internal:{port}/{owner}/{repo}'
+    print(f'git config --global url.{proxy_base}.insteadOf git@github.com:{owner}/{repo}')
+    print(f'git config --global --add url.{proxy_base}.insteadOf https://github.com/{owner}/{repo}')
+" "$repos_json" "$git_port")
+
   limactl shell "$vm_name" bash -c "
-    git config --global url.\"${proxy_base}\".insteadOf \"git@github.com:${owner}/${repo}\"
-    git config --global --add url.\"${proxy_base}\".insteadOf \"https://github.com/${owner}/${repo}\"
+    $git_config_cmds
     ${git_name:+git config --global user.name \"$git_name\"}
     ${git_email:+git config --global user.email \"$git_email\"}
   "
@@ -932,12 +1013,12 @@ _agent_vm_run() {
       _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
     fi
   fi
-  if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
+  if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-      "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+      "$_claude_vm_github_repos_json"
     if [ "$agent" = "opencode" ]; then
       _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-        "$_claude_vm_github_owner" "$_claude_vm_github_repo" "$host_dir"
+        "$_claude_vm_github_repos_json"
     fi
   fi
 
@@ -1082,12 +1163,12 @@ _agent_vm_shell() {
       _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
     fi
   fi
-  if $use_github && [ -n "$_claude_vm_git_proxy_port" ]; then
+  if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-      "$_claude_vm_github_owner" "$_claude_vm_github_repo"
+      "$_claude_vm_github_repos_json"
     if [ "$agent" = "opencode" ]; then
       _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-        "$_claude_vm_github_owner" "$_claude_vm_github_repo" "$host_dir"
+        "$_claude_vm_github_repos_json"
     fi
   fi
 

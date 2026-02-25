@@ -8,7 +8,11 @@ MCP endpoint at api.githubcopilot.com/mcp/.
 
 The VM never sees the GitHub token.
 
-Usage:
+Usage (multi-repo, preferred):
+    GITHUB_MCP_PROXY_REPOS='{"wirenboard/agent-vm":"ghu_xxx","wirenboard/wb-utils":"ghu_yyy"}' \
+        python3 github-mcp-proxy.py
+
+Usage (single-repo, backward compat):
     GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=wirenboard GITHUB_MCP_REPO=agent-vm \
         python3 github-mcp-proxy.py
     # Prints the listening port to stdout, then serves until SIGTERM.
@@ -40,13 +44,41 @@ MAX_RETRIES = 3           # Total attempts = MAX_RETRIES + 1
 RETRY_DELAYS = [1, 2, 4]  # Seconds between retries (exponential backoff)
 ERROR_LOG_DIR = os.environ.get("GITHUB_MCP_PROXY_LOG_DIR", ".")
 
-TOKEN = os.environ.get("GITHUB_MCP_TOKEN", "")
-OWNER = os.environ.get("GITHUB_MCP_OWNER", "")
-REPO = os.environ.get("GITHUB_MCP_REPO", "")
 DEBUG = os.environ.get("GITHUB_MCP_PROXY_DEBUG", "0") == "1"
 
+# ── Multi-repo config ────────────────────────────────────────────────────────
+# Maps "owner/repo" -> token.  The first entry is the "default" repo used
+# when tool calls don't specify owner/repo.
+_REPO_TOKENS = {}   # {"owner/repo": "token", ...}
+_ALLOWED_REPOS = {} # {"owner/repo": {"owner": "...", "repo": "..."}, ...}
+_DEFAULT_TOKEN = ""
+_DEFAULT_OWNER = ""
+_DEFAULT_REPO = ""
+
+_repos_json = os.environ.get("GITHUB_MCP_PROXY_REPOS", "")
+if _repos_json:
+    _REPO_TOKENS = json.loads(_repos_json)
+else:
+    # Backward compat: single-repo env vars
+    _token = os.environ.get("GITHUB_MCP_TOKEN", "")
+    _owner = os.environ.get("GITHUB_MCP_OWNER", "")
+    _repo = os.environ.get("GITHUB_MCP_REPO", "")
+    if _token and _owner and _repo:
+        _REPO_TOKENS[f"{_owner}/{_repo}"] = _token
+
+if _REPO_TOKENS:
+    for slug, tok in _REPO_TOKENS.items():
+        o, r = slug.split("/", 1)
+        _ALLOWED_REPOS[slug] = {"owner": o, "repo": r}
+    first_slug = next(iter(_REPO_TOKENS))
+    _DEFAULT_TOKEN = _REPO_TOKENS[first_slug]
+    _DEFAULT_OWNER = _ALLOWED_REPOS[first_slug]["owner"]
+    _DEFAULT_REPO = _ALLOWED_REPOS[first_slug]["repo"]
+
+# ── Tool-filtering config ────────────────────────────────────────────────────
+
 # Comma-separated toolsets to expose via X-MCP-Toolsets header.
-# Default is limited to toolsets that make sense for a single-repo-scoped token.
+# Default is limited to toolsets that make sense for repo-scoped tokens.
 # Excluded by default: actions, code_security, dependabot, discussions, gists,
 # notifications, orgs, projects, secret_protection, security_advisories,
 # stargazers, users, copilot, copilot_spaces.
@@ -65,12 +97,6 @@ READONLY = os.environ.get("GITHUB_MCP_READONLY", "0") == "1"
 # Lockdown mode: hides public issue details from users without push access.
 # Enabled by default for security.
 LOCKDOWN = os.environ.get("GITHUB_MCP_LOCKDOWN", "1") != "0"
-
-# MCP tool argument fields that specify a repo target
-REPO_FIELDS = {
-    "owner": OWNER,
-    "repo": REPO,
-}
 
 # Tools that are safe without repo scoping (read-only user metadata)
 UNSCOPED_TOOLS = {"get_me"}
@@ -157,111 +183,142 @@ def _save_error_response(status, body_bytes, context=""):
     return path
 
 
+def _resolve_repo(owner, repo):
+    """Match owner/repo against allowed repos.  Returns (slug, token) or (None, error_msg)."""
+    if owner and repo:
+        slug = f"{owner}/{repo}"
+        if slug in _REPO_TOKENS:
+            return slug, _REPO_TOKENS[slug]
+        return None, f"repo {slug} is not in the allowed set: {', '.join(_REPO_TOKENS)}"
+    # Neither provided → use default
+    if not owner and not repo:
+        slug = f"{_DEFAULT_OWNER}/{_DEFAULT_REPO}"
+        return slug, _DEFAULT_TOKEN
+    # Partial match — try to find a unique repo
+    for slug, info in _ALLOWED_REPOS.items():
+        if (owner and info["owner"] == owner) or (repo and info["repo"] == repo):
+            return slug, _REPO_TOKENS[slug]
+    given = f"owner={owner}" if owner else f"repo={repo}"
+    return None, f"cannot resolve {given} to an allowed repo: {', '.join(_REPO_TOKENS)}"
+
+
 def _enforce_search_scope(tool, args):
     """For search tools, inject repo scope into the query string.
 
-    Returns (modified_args, error_message).
+    Returns (modified_args, token, error_message).
+    Uses the default token for search queries.
     """
-    if not OWNER or not REPO:
-        return args, None
+    if not _ALLOWED_REPOS:
+        return args, _DEFAULT_TOKEN, None
 
     query = args.get("query", "")
-    scope = f"repo:{OWNER}/{REPO}"
+    allowed_slugs = set(_ALLOWED_REPOS.keys())
 
-    # Reject repo: qualifiers that point to a different repo.
+    # Reject repo: qualifiers that point to a non-allowed repo.
     for match in re.finditer(r'\brepo:(\S+)', query):
-        if match.group(1) != f"{OWNER}/{REPO}":
+        if match.group(1) not in allowed_slugs:
             msg = (f"Repo scope violation: {tool} query contains "
-                   f"repo:{match.group(1)}, expected repo:{OWNER}/{REPO}")
+                   f"repo:{match.group(1)}, allowed: {', '.join(allowed_slugs)}")
             debug(f"  BLOCKED: {msg}")
-            return None, msg
+            return None, None, msg
 
     # Reject org: and user: qualifiers — these widen search beyond the
-    # scoped repo and could leak cross-repo data.
+    # scoped repos and could leak cross-repo data.
     for match in re.finditer(r'\b(org|user):(\S+)', query):
         qualifier, value = match.group(1), match.group(2)
         msg = (f"Repo scope violation: {tool} query contains "
                f"{qualifier}:{value} (not allowed, use repo: scope)")
         debug(f"  BLOCKED: {msg}")
-        return None, msg
+        return None, None, msg
 
-    # If no repo: qualifier present, inject one
-    if f"repo:{OWNER}/{REPO}" not in query:
+    # If no repo: qualifier present, inject scope for all allowed repos
+    if not re.search(r'\brepo:\S+', query):
+        repo_qualifiers = " ".join(f"repo:{s}" for s in allowed_slugs)
         args = dict(args)
-        args["query"] = f"{scope} {query}".strip()
+        args["query"] = f"{repo_qualifiers} {query}".strip()
         debug(f"  injected scope: {args['query']}")
 
-    return args, None
+    return args, _DEFAULT_TOKEN, None
 
 
 def enforce_repo_scope(body_bytes):
     """Parse MCP request body, enforce owner/repo in tool call arguments.
 
-    Returns (modified_body_bytes, error_message). error_message is None on success.
+    Returns (modified_body_bytes, token, error_message).
+    token is the Bearer token to use for the upstream request.
+    error_message is None on success.
     """
     if not body_bytes:
-        return body_bytes, None
+        return body_bytes, _DEFAULT_TOKEN, None
 
     try:
         req = json.loads(body_bytes)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return body_bytes, None
+        return body_bytes, _DEFAULT_TOKEN, None
 
     method = req.get("method")
     if method != "tools/call":
-        return body_bytes, None
+        return body_bytes, _DEFAULT_TOKEN, None
 
     params = req.get("params", {})
     tool = params.get("name", "unknown")
     args = params.get("arguments", {})
     if not isinstance(args, dict):
-        return body_bytes, None
+        return body_bytes, _DEFAULT_TOKEN, None
 
     # Block unknown tools (default-deny). New upstream tools won't
     # silently bypass scope checks.
     if tool not in KNOWN_TOOLS:
         msg = f"Repo scope violation: unknown tool {tool!r} is not allowed"
         debug(f"  BLOCKED: {msg}")
-        return None, msg
+        return None, None, msg
 
     # Allow safe tools that don't need repo scoping
     if tool in UNSCOPED_TOOLS:
         debug(f"  allowed unscoped tool: {tool}")
-        return body_bytes, None
+        return body_bytes, _DEFAULT_TOKEN, None
 
     # Block org-level tools and user/org search tools
     if tool in ORG_TOOLS or tool in BLOCKED_SEARCH_TOOLS:
         msg = f"Repo scope violation: {tool} is not allowed (not repo-scoped)"
         debug(f"  BLOCKED: {msg}")
-        return None, msg
+        return None, None, msg
 
     # For search tools, inject repo scope into the query
     if tool in SEARCH_TOOLS:
-        args, err = _enforce_search_scope(tool, args)
+        args, token, err = _enforce_search_scope(tool, args)
         if err:
-            return None, err
+            return None, None, err
         req["params"]["arguments"] = args
-        return json.dumps(req).encode(), None
+        return json.dumps(req).encode(), token, None
 
-    # For tools with owner/repo, enforce scoped values and inject if missing
+    # For tools with owner/repo, resolve against allowed repos
+    owner = args.get("owner", "")
+    repo = args.get("repo", "")
+    slug, token_or_err = _resolve_repo(owner, repo)
+
+    if slug is None:
+        msg = f"Repo scope violation: {tool} — {token_or_err}"
+        debug(f"  BLOCKED: {msg}")
+        return None, None, msg
+
+    # Inject owner/repo if missing
+    info = _ALLOWED_REPOS[slug]
     modified = False
-    for field, enforced_value in REPO_FIELDS.items():
-        if enforced_value:
-            if field in args:
-                if args[field] != enforced_value:
-                    msg = f"Repo scope violation: {tool} called with {field}={args[field]!r}, expected {enforced_value!r}"
-                    debug(f"  BLOCKED: {msg}")
-                    return None, msg
-            else:
-                args[field] = enforced_value
-                modified = True
-                debug(f"  injected {field}={enforced_value!r} for {tool}")
+    if "owner" not in args or not args["owner"]:
+        args["owner"] = info["owner"]
+        modified = True
+        debug(f"  injected owner={info['owner']!r} for {tool}")
+    if "repo" not in args or not args["repo"]:
+        args["repo"] = info["repo"]
+        modified = True
+        debug(f"  injected repo={info['repo']!r} for {tool}")
 
     if modified:
         req["params"]["arguments"] = args
-        return json.dumps(req).encode(), None
+        return json.dumps(req).encode(), token_or_err, None
 
-    return body_bytes, None
+    return body_bytes, token_or_err, None
 
 
 class GitHubMCPProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -276,9 +333,10 @@ class GitHubMCPProxyHandler(http.server.BaseHTTPRequestHandler):
 
         debug(f">>> {self.command} {self.path} ({content_length} bytes)")
 
-        # Enforce repo scope on tool calls
+        # Enforce repo scope on tool calls and select per-repo token
+        token = _DEFAULT_TOKEN
         if body and self.command == "POST":
-            body, err = enforce_repo_scope(body)
+            body, token, err = enforce_repo_scope(body)
             if err:
                 self.send_error_response(403, err)
                 return
@@ -293,7 +351,7 @@ class GitHubMCPProxyHandler(http.server.BaseHTTPRequestHandler):
                 continue
             headers[key] = value
 
-        headers["Authorization"] = f"Bearer {TOKEN}"
+        headers["Authorization"] = f"Bearer {token}"
         headers["Host"] = MCP_HOST
         if body:
             headers["Content-Length"] = str(len(body))
@@ -432,11 +490,8 @@ class QuietServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    if not TOKEN:
-        print("Error: GITHUB_MCP_TOKEN is required", file=sys.stderr)
-        sys.exit(1)
-    if not OWNER or not REPO:
-        print("Error: GITHUB_MCP_OWNER and GITHUB_MCP_REPO are required", file=sys.stderr)
+    if not _REPO_TOKENS:
+        print("Error: set GITHUB_MCP_PROXY_REPOS or GITHUB_MCP_TOKEN+GITHUB_MCP_OWNER+GITHUB_MCP_REPO", file=sys.stderr)
         sys.exit(1)
 
     server = QuietServer(("127.0.0.1", 0), GitHubMCPProxyHandler)
@@ -450,8 +505,9 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    repo_slugs = list(_REPO_TOKENS.keys())
     debug(f"Listening on port {port}, forwarding to {MCP_HOST}{MCP_PATH}")
-    debug(f"Repo scope: {OWNER}/{REPO}")
+    debug(f"Repo scope: {', '.join(repo_slugs)}")
     if TOOLSETS:
         debug(f"Toolsets: {TOOLSETS}")
     if TOOLS:

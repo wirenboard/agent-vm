@@ -2,20 +2,20 @@
 """
 Host-side Git HTTP proxy for Claude Code VMs.
 
-Accepts HTTP Git requests from the VM, injects the GitHub token for the
-configured repo only, and forwards to github.com over HTTPS.
+Accepts HTTP Git requests from the VM, injects the GitHub token for
+configured repos, and forwards to github.com over HTTPS.
 
-Requests targeting other repos are forwarded without credentials (they'll
-fail auth on GitHub's side rather than being blocked by the proxy).
+Requests targeting other repos are forwarded without credentials.
 
 The VM never sees the GitHub token.
 
-Usage:
+Usage (multi-repo, preferred):
+    GITHUB_GIT_PROXY_REPOS='{"wirenboard/agent-vm":"ghu_xxx","wirenboard/wb-utils":"ghu_yyy"}' \
+        python3 github-git-proxy.py
+
+Usage (single-repo, backward compat):
     GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=wirenboard GITHUB_MCP_REPO=agent-vm \
         python3 github-git-proxy.py
-    # Prints the listening port to stdout.
-    # Then in the VM:
-    #   git push http://host.lima.internal:PORT/wirenboard/agent-vm.git main
 
 Optional env vars:
     GITHUB_GIT_PROXY_DEBUG    Set to "1" for verbose logging
@@ -25,6 +25,7 @@ Optional env vars:
 import base64
 import http.client
 import http.server
+import json
 import os
 import signal
 import ssl
@@ -32,9 +33,6 @@ import sys
 import socketserver
 import time
 
-TOKEN = os.environ.get("GITHUB_TOKEN", os.environ.get("GITHUB_MCP_TOKEN", ""))
-OWNER = os.environ.get("GITHUB_MCP_OWNER", "")
-REPO = os.environ.get("GITHUB_MCP_REPO", "")
 DEBUG = os.environ.get("GITHUB_GIT_PROXY_DEBUG", "0") == "1"
 LOG_DIR = os.environ.get("GITHUB_GIT_PROXY_LOG_DIR", ".")
 
@@ -42,16 +40,33 @@ LOG_DIR = os.environ.get("GITHUB_GIT_PROXY_LOG_DIR", ".")
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 2, 4]
 
-# GitHub git HTTP uses Basic auth with x-access-token as username
-_BASIC_AUTH = "Basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+# Build per-repo auth: { "/owner/repo.git/": "Basic ...", "/owner/repo/": "Basic ...", ... }
+_REPO_AUTH = {}
 
-# Path prefixes that get credentials injected
-_AUTHED_PREFIXES = []
-if OWNER and REPO:
-    _AUTHED_PREFIXES = [
-        f"/{OWNER}/{REPO}.git/",
-        f"/{OWNER}/{REPO}/",
-    ]
+
+def _make_basic_auth(token):
+    return "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+
+def _add_repo_auth(owner, repo, token):
+    auth = _make_basic_auth(token)
+    _REPO_AUTH[f"/{owner}/{repo}.git/"] = auth
+    _REPO_AUTH[f"/{owner}/{repo}/"] = auth
+
+
+# Preferred: multi-repo JSON config
+_repos_json = os.environ.get("GITHUB_GIT_PROXY_REPOS", "")
+if _repos_json:
+    for slug, token in json.loads(_repos_json).items():
+        owner, repo = slug.split("/", 1)
+        _add_repo_auth(owner, repo, token)
+else:
+    # Backward compat: single-repo env vars
+    _TOKEN = os.environ.get("GITHUB_TOKEN", os.environ.get("GITHUB_MCP_TOKEN", ""))
+    _OWNER = os.environ.get("GITHUB_MCP_OWNER", "")
+    _REPO = os.environ.get("GITHUB_MCP_REPO", "")
+    if _TOKEN and _OWNER and _REPO:
+        _add_repo_auth(_OWNER, _REPO, _TOKEN)
 
 _log_file = None
 
@@ -105,19 +120,22 @@ class GitProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         debug(format % args)
 
-    def _is_scoped_repo(self):
-        """Return True if the request path matches the configured repo."""
-        if not _AUTHED_PREFIXES:
-            return False
+    def _match_repo_auth(self):
+        """Return the Basic auth header if the request path matches a configured repo, else None."""
+        if not _REPO_AUTH:
+            return None
         path = self.path.split("?")[0] + "/"
-        return any(path.startswith(p) for p in _AUTHED_PREFIXES)
+        for prefix, auth in _REPO_AUTH.items():
+            if path.startswith(prefix):
+                return auth
+        return None
 
     def proxy(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else None
 
-        inject_auth = self._is_scoped_repo()
-        debug(f">>> {self.command} {self.path} ({content_length} bytes, auth={'yes' if inject_auth else 'no'})")
+        matched_auth = self._match_repo_auth()
+        debug(f">>> {self.command} {self.path} ({content_length} bytes, auth={'yes' if matched_auth else 'no'})")
 
         # Build upstream headers
         headers = {}
@@ -126,8 +144,8 @@ class GitProxyHandler(http.server.BaseHTTPRequestHandler):
                 continue
             headers[key] = value
         headers["Host"] = "github.com"
-        if inject_auth:
-            headers["Authorization"] = _BASIC_AUTH
+        if matched_auth:
+            headers["Authorization"] = matched_auth
         if body:
             headers["Content-Length"] = str(len(body))
 
@@ -194,8 +212,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    if not TOKEN:
-        print("Error: GITHUB_TOKEN (or GITHUB_MCP_TOKEN) required", file=sys.stderr)
+    if not _REPO_AUTH:
+        print("Error: set GITHUB_GIT_PROXY_REPOS or GITHUB_TOKEN+GITHUB_MCP_OWNER+GITHUB_MCP_REPO", file=sys.stderr)
         sys.exit(1)
 
     _open_log()
@@ -207,11 +225,10 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
+    # Log configured repos (without tokens)
+    repo_slugs = [p.strip("/").removesuffix(".git") for p in _REPO_AUTH if p.endswith(".git/")]
     log(f"Listening on port {port}, forwarding to https://github.com")
-    if OWNER and REPO:
-        log(f"Token injected for: {OWNER}/{REPO}")
-    else:
-        log(f"WARNING: no repo scope configured, no auth injected")
+    log(f"Token injected for: {', '.join(repo_slugs)}")
     server.serve_forever()
 
 
