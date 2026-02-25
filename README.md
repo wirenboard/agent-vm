@@ -40,7 +40,7 @@ Options:
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--minimal` | Only install git, curl, jq, Claude Code, and OpenCode. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
-| `--disk GB` | VM disk size in GB | 20 |
+| `--disk GB` | VM disk size in GB | 30 |
 | `--memory GB` | VM memory in GB | 8 |
 
 ```bash

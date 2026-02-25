@@ -46,7 +46,7 @@ _agent_vm_project_state_dir() {
 
 _agent_vm_setup() {
   local minimal=false
-  local disk=20
+  local disk=30
   local memory=8
 
   while [[ $# -gt 0 ]]; do
@@ -58,7 +58,7 @@ _agent_vm_setup() {
         echo ""
         echo "Options:"
         echo "  --minimal      Only install git, curl, jq, Claude Code, and OpenCode"
-        echo "  --disk GB      VM disk size (default: 20)"
+        echo "  --disk GB      VM disk size (default: 30)"
         echo "  --memory GB    VM memory (default: 8)"
         echo "  --help         Show this help"
         return 0
