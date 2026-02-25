@@ -534,39 +534,29 @@ _claude_vm_start_github_mcp() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  # Detect repo from git remote
+  local repos_json='{}'
+  local owner="" repo=""
+
+  # Detect main repo from git remote
   local repo_url
   repo_url=$(git -C "$host_dir" remote get-url origin 2>/dev/null)
-  if [ -z "$repo_url" ]; then
-    echo "Warning: No git remote found, skipping GitHub MCP" >&2
-    return 1
+  if [ -n "$repo_url" ]; then
+    read -r owner repo < <(_claude_vm_parse_github_remote "$repo_url") || true
+    if [ -n "$owner" ] && [ -n "$repo" ]; then
+      echo "Requesting GitHub token for $owner/$repo..."
+      local token
+      token=$(python3 "$script_dir/github_app_token_demo.py" \
+        user-token --client-id Iv23liisR1WdpJmDUPLT \
+        --repo "$repo_url" --token-only \
+        --cache-dir "$HOME/.cache/claude-vm") || true
+      if [ -n "$token" ]; then
+        repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
+          "$owner/$repo" "$token")
+      else
+        echo "  Warning: no token for $owner/$repo"
+      fi
+    fi
   fi
-
-  # Parse owner/repo from remote URL
-  local owner repo
-  read -r owner repo < <(_claude_vm_parse_github_remote "$repo_url")
-  if [ -z "$owner" ] || [ -z "$repo" ]; then
-    echo "Warning: Cannot parse GitHub remote '$repo_url', skipping GitHub MCP" >&2
-    return 1
-  fi
-
-  # Get scoped user token for main repo via device flow
-  echo "Requesting GitHub token for $owner/$repo..."
-  local token
-  token=$(python3 "$script_dir/github_app_token_demo.py" \
-    user-token --client-id Iv23liisR1WdpJmDUPLT \
-    --repo "$repo_url" --token-only \
-    --cache-dir "$HOME/.cache/claude-vm")
-  if [ -z "$token" ]; then
-    echo "Warning: Failed to get GitHub token, skipping GitHub MCP" >&2
-    return 1
-  fi
-
-  # Build repos JSON dict: {"owner/repo": "token", ...}
-  # Start with the main repo
-  local repos_json
-  repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
-    "$owner/$repo" "$token")
 
   # Detect GitHub submodules from .gitmodules
   if [ -f "$host_dir/.gitmodules" ]; then
@@ -586,7 +576,7 @@ for s in p.sections():
       read -r sub_owner sub_repo < <(_claude_vm_parse_github_remote "$sub_url") || continue
       [ -z "$sub_owner" ] || [ -z "$sub_repo" ] && continue
       # Skip if same as main repo
-      [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
+      [ -n "$owner" ] && [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
 
       echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
       sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
@@ -607,6 +597,12 @@ print(json.dumps(d))
     done <<< "$sub_urls"
   fi
 
+  # If no repos were configured, skip proxies
+  if [ "$repos_json" = '{}' ]; then
+    echo "Warning: No GitHub repos found (no remote, no submodules), skipping GitHub MCP" >&2
+    return 1
+  fi
+
   # Start GitHub MCP proxy (injects per-repo tokens, enforces repo scope)
   echo "Starting GitHub MCP proxy..."
   exec 4< <(GITHUB_MCP_PROXY_REPOS="$repos_json" \
@@ -620,7 +616,9 @@ print(json.dumps(d))
     return 1
   fi
   exec 4<&-
-  echo "GitHub MCP proxy on port $_claude_vm_github_mcp_port (scope: $owner/$repo)"
+  local _scope_list
+  _scope_list=$(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1]).keys()))" "$repos_json")
+  echo "GitHub MCP proxy on port $_claude_vm_github_mcp_port (scope: $_scope_list)"
 
   # Start Git HTTP proxy (injects per-repo tokens for main + submodules)
   echo "Starting Git HTTP proxy..."
