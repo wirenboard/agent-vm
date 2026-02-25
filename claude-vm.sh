@@ -951,6 +951,9 @@ _agent_vm_run() {
     [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
+    # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
+    # breaks all future limactl commands)
+    [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
     local port
     for port in "${_usb_sysfs_ports[@]}"; do
@@ -1104,6 +1107,9 @@ _agent_vm_shell() {
     [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
+    # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
+    # breaks all future limactl commands)
+    [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
     rm -f "$security_snapshot" "${security_snapshot}.git-config"
     local port
     for port in "${_usb_sysfs_ports[@]}"; do
