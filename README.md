@@ -41,7 +41,7 @@ Options:
 |------|-------------|---------|
 | `--minimal` | Only install git, curl, jq, Claude Code, and OpenCode. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
 | `--disk GB` | VM disk size in GB | 30 |
-| `--memory GB` | VM memory in GB | 8 |
+| `--memory GB` | VM memory ceiling in GB | 16 (Linux), 4 (macOS) |
 
 ```bash
 agent-vm setup --minimal                  # Lightweight VM with only core CLIs
@@ -63,6 +63,7 @@ Any arguments are forwarded to the `claude` command:
 agent-vm claude -p "fix all lint errors"        # Run with a prompt
 agent-vm claude --resume                         # Resume previous session
 agent-vm claude -c "explain this codebase"       # Continue conversation
+agent-vm claude --memory 8                       # Start with 8G instead of default 2G
 ```
 
 ### Run OpenCode in a VM
@@ -91,6 +92,31 @@ agent-vm shell opencode       # Shell pre-configured for OpenCode
 ```
 
 Drops you into a bash shell inside a fresh VM instead of launching an agent. Useful for debugging or manual testing. When an agent is specified, the shell has that agent's configuration (env vars, MCP servers, etc.) pre-applied.
+
+### Dynamic memory (Linux)
+
+On Linux, VMs use a [virtio-balloon](https://www.linux-kvm.org/page/Projects/auto-ballooning) device to dynamically adjust memory. The VM is created with a 16G ceiling but starts with only 2G of usable RAM. As the guest needs more memory, the balloon daemon automatically deflates to give it more, up to the full 16G. When memory pressure drops, unused memory is reclaimed back to the host.
+
+This means you can run multiple VMs without each one reserving its full allocation upfront.
+
+```bash
+agent-vm claude --memory 5 --max-memory 10   # Start with 5G, grow up to 10G
+agent-vm claude --memory 8                   # Start with 8G, ceiling from template (16G)
+agent-vm memory                              # Show current memory of all running VMs
+agent-vm memory 12G                          # Manually set memory to 12G (auto-detect VM)
+agent-vm memory my-vm 8G                     # Set specific VM's memory
+```
+
+On macOS (Apple Silicon with VZ backend), QEMU is not used and balloon is not available. VMs use a fixed 4G memory allocation instead. You can still use `--memory` to set a different fixed size. The `agent-vm memory` subcommand (live adjustment) is Linux-only.
+
+### Common options
+
+| Flag | Applies to | Description |
+|------|-----------|-------------|
+| `--memory GB` | claude, opencode, shell | Initial memory (default: 2G with balloon, 4G without) |
+| `--max-memory GB` | claude, opencode, shell | Memory ceiling for balloon (default: from template) |
+| `--no-git` | claude, opencode, shell | Skip GitHub integration |
+| `--usb DEVICE` | claude, opencode, shell | Pass USB device to VM (repeatable) |
 
 ## Customization
 
@@ -248,7 +274,7 @@ GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
 ## How it works
 
 1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode, and stops it as a reusable template
-2. **`agent-vm claude [args]`** clones the template, mounts your working directory read-write, runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
+2. **`agent-vm claude [args]`** clones the template, mounts your working directory read-write, starts the balloon daemon (Linux), runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
 3. **`agent-vm opencode [args]`** same as above but launches OpenCode instead, with its own config and session persistence
 4. **`agent-vm shell [agent]`** same VM setup but drops into a bash shell for debugging
 5. On exit, the cloned VM is stopped and deleted. The template persists for reuse
@@ -266,6 +292,7 @@ Ports opened inside the VM (e.g. by Docker containers) are automatically forward
 | Browser | Chromium (headless), xvfb |
 | Containers | Docker Engine, Docker Compose |
 | AI | Claude Code, OpenCode, Chrome DevTools MCP server |
+| Memory | virtio-balloon auto-scaling (Linux only) |
 
 ## Why a VM?
 

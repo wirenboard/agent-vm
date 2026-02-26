@@ -130,19 +130,23 @@ _agent_vm_usb_rebind() {
   sudo sh -c "echo '$port' > /sys/bus/usb/drivers/usb/bind" 2>/dev/null
 }
 
-_agent_vm_usb_qemu_args() {
-  # Create a wrapper script that injects USB passthrough args into QEMU
+_agent_vm_qemu_wrapper() {
+  # Create a QEMU wrapper with virtio-balloon and optional USB passthrough.
+  # Usage: _agent_vm_qemu_wrapper [usb_vid:pid ...]
   local wrapper
-  wrapper="$(mktemp /tmp/qemu-usb-wrapper.XXXXXX)"
+  wrapper="$(mktemp /tmp/qemu-wrapper.XXXXXX)"
   local qemu_bin
   qemu_bin="$(command -v qemu-system-x86_64)"
-  local extra_args="-device qemu-xhci,id=xhci,addr=0x15"
-  local vidpid
-  for vidpid in "$@"; do
-    local vid="${vidpid%%:*}"
-    local pid="${vidpid##*:}"
-    extra_args+=" -device usb-host,bus=xhci.0,vendorid=0x${vid},productid=0x${pid}"
-  done
+  local extra_args="-device virtio-balloon-pci,id=balloon0,deflate-on-oom=on"
+  if [ $# -gt 0 ]; then
+    extra_args+=" -device qemu-xhci,id=xhci,addr=0x15"
+    local vidpid
+    for vidpid in "$@"; do
+      local vid="${vidpid%%:*}"
+      local pid="${vidpid##*:}"
+      extra_args+=" -device usb-host,bus=xhci.0,vendorid=0x${vid},productid=0x${pid}"
+    done
+  fi
   cat > "$wrapper" << WRAPPER
 #!/bin/sh
 exec "$qemu_bin" "\$@" $extra_args
@@ -154,7 +158,14 @@ WRAPPER
 _agent_vm_setup() {
   local minimal=false
   local disk=30
-  local memory=8
+  local _has_balloon=false
+  command -v qemu-system-x86_64 &>/dev/null && _has_balloon=true
+  local memory=""
+  if $_has_balloon; then
+    memory=16  # balloon ceiling: guest starts small, grows on demand
+  else
+    memory=4   # no balloon (macOS VZ): static allocation
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -166,7 +177,7 @@ _agent_vm_setup() {
         echo "Options:"
         echo "  --minimal      Only install git, curl, jq, Claude Code, and OpenCode"
         echo "  --disk GB      VM disk size (default: 30)"
-        echo "  --memory GB    VM memory (default: 8)"
+        echo "  --memory GB    VM memory (default: 16 on Linux with balloon, 4 on macOS)"
         echo "  --help         Show this help"
         return 0
         ;;
@@ -979,12 +990,18 @@ _agent_vm_run() {
   shift
   local use_github=true
   local usb_devices=()
+  local memory=""
+  local max_memory=""
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
       --usb) usb_devices+=("$2"); shift 2 ;;
       --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --memory) memory="$2"; shift 2 ;;
+      --memory=*) memory="${1#*=}"; shift ;;
+      --max-memory) max_memory="$2"; shift 2 ;;
+      --max-memory=*) max_memory="${1#*=}"; shift ;;
       *) args+=("$1"); shift ;;
     esac
   done
@@ -994,6 +1011,7 @@ _agent_vm_run() {
   state_dir="$(_agent_vm_project_state_dir "$host_dir")"
   local _usb_sysfs_ports=()
   local _usb_qemu_wrapper=""
+  local _balloon_daemon_pid=""
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
     echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
@@ -1012,6 +1030,7 @@ _agent_vm_run() {
 
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
+    [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
     [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
     [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
     [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
@@ -1044,9 +1063,9 @@ _agent_vm_run() {
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
-  # USB passthrough: resolve devices, unbind host drivers, create QEMU wrapper
+  # USB passthrough: resolve devices, unbind host drivers
+  local _usb_vidpids=()
   if [ ${#usb_devices[@]} -gt 0 ]; then
-    local _usb_vidpids=()
     local dev vidpid port
     for dev in "${usb_devices[@]}"; do
       vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1056,12 +1075,39 @@ _agent_vm_run() {
       _usb_sysfs_ports+=("$port")
       _usb_vidpids+=("$vidpid")
     done
-    _usb_qemu_wrapper="$(_agent_vm_usb_qemu_args "${_usb_vidpids[@]}")"
   fi
 
-  if [ -n "$_usb_qemu_wrapper" ]; then
+  # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
+  if command -v qemu-system-x86_64 &>/dev/null; then
+    # Override memory ceiling if --max-memory was specified
+    if [ -n "$max_memory" ]; then
+      limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
+    fi
+    if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
+    else
+      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
+    fi
     QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+
+    # Balloon: set initial target (default 2G) and start auto-balloon daemon
+    local _balloon_script
+    _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+    local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
+    local _balloon_target="${memory:-2}"
+    local _balloon_daemon_args=(--initial-target "${_balloon_target}G")
+    if [ -n "$max_memory" ]; then
+      _balloon_daemon_args+=(--max-memory "${max_memory}G")
+    fi
+    python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+    _balloon_daemon_pid=$!
   else
+    if [ -n "$max_memory" ]; then
+      echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+    fi
+    if [ -n "$memory" ]; then
+      limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+    fi
     limactl start "$vm_name" &>/dev/null
   fi
 
@@ -1147,11 +1193,17 @@ _agent_vm_shell() {
   esac
 
   local usb_devices=()
+  local memory=""
+  local max_memory=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
       --usb) usb_devices+=("$2"); shift 2 ;;
       --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --memory) memory="$2"; shift 2 ;;
+      --memory=*) memory="${1#*=}"; shift ;;
+      --max-memory) max_memory="$2"; shift 2 ;;
+      --max-memory=*) max_memory="${1#*=}"; shift ;;
       *) shift ;;
     esac
   done
@@ -1161,6 +1213,7 @@ _agent_vm_shell() {
   state_dir="$(_agent_vm_project_state_dir "$host_dir")"
   local _usb_sysfs_ports=()
   local _usb_qemu_wrapper=""
+  local _balloon_daemon_pid=""
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
     echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
@@ -1179,6 +1232,7 @@ _agent_vm_shell() {
 
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
+    [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
     [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
     [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
     [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
@@ -1208,9 +1262,9 @@ _agent_vm_shell() {
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
 
-  # USB passthrough: resolve devices, unbind host drivers, create QEMU wrapper
+  # USB passthrough: resolve devices, unbind host drivers
+  local _usb_vidpids=()
   if [ ${#usb_devices[@]} -gt 0 ]; then
-    local _usb_vidpids=()
     local dev vidpid port
     for dev in "${usb_devices[@]}"; do
       vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1220,12 +1274,39 @@ _agent_vm_shell() {
       _usb_sysfs_ports+=("$port")
       _usb_vidpids+=("$vidpid")
     done
-    _usb_qemu_wrapper="$(_agent_vm_usb_qemu_args "${_usb_vidpids[@]}")"
   fi
 
-  if [ -n "$_usb_qemu_wrapper" ]; then
+  # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
+  if command -v qemu-system-x86_64 &>/dev/null; then
+    # Override memory ceiling if --max-memory was specified
+    if [ -n "$max_memory" ]; then
+      limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
+    fi
+    if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
+    else
+      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
+    fi
     QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+
+    # Balloon: set initial target (default 2G) and start auto-balloon daemon
+    local _balloon_script
+    _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+    local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
+    local _balloon_target="${memory:-2}"
+    local _balloon_daemon_args=(--initial-target "${_balloon_target}G")
+    if [ -n "$max_memory" ]; then
+      _balloon_daemon_args+=(--max-memory "${max_memory}G")
+    fi
+    python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+    _balloon_daemon_pid=$!
   else
+    if [ -n "$max_memory" ]; then
+      echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+    fi
+    if [ -n "$memory" ]; then
+      limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+    fi
     limactl start "$vm_name" &>/dev/null
   fi
 
@@ -1289,23 +1370,105 @@ _agent_vm_shell() {
   trap - EXIT INT TERM
 }
 
+# ── Balloon memory control ────────────────────────────────────────────────────
+
+_agent_vm_memory() {
+  if ! command -v qemu-system-x86_64 &>/dev/null; then
+    echo "Error: 'agent-vm memory' requires QEMU (balloon not available on this platform)" >&2
+    return 1
+  fi
+
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if [ $# -eq 0 ]; then
+    # List running VMs with current balloon size
+    local vm found=false
+    while IFS= read -r vm; do
+      [ -z "$vm" ] && continue
+      [ "$vm" = "$CLAUDE_VM_TEMPLATE" ] && continue
+      local sock="$HOME/.lima/$vm/qmp.sock"
+      if [ -S "$sock" ]; then
+        local size
+        size=$(python3 "$script_dir/balloon-daemon.py" "$sock" get 2>/dev/null) || size="?"
+        echo "$vm: $size"
+        found=true
+      fi
+    done < <(limactl list -q --status Running 2>/dev/null)
+    if ! $found; then
+      echo "No running VMs found." >&2
+    fi
+    return
+  fi
+
+  local vm_name="" target=""
+  # If first arg looks like a size (e.g. 8G, 4096M), auto-detect the running VM
+  if [[ "$1" =~ ^[0-9]+[GMgm]?$ ]]; then
+    local vms=()
+    while IFS= read -r vm; do
+      [ -z "$vm" ] && continue
+      [ "$vm" = "$CLAUDE_VM_TEMPLATE" ] && continue
+      vms+=("$vm")
+    done < <(limactl list -q --status Running 2>/dev/null)
+    if [ ${#vms[@]} -eq 0 ]; then
+      echo "Error: no running VMs found" >&2
+      return 1
+    elif [ ${#vms[@]} -gt 1 ]; then
+      echo "Error: multiple VMs running, specify name:" >&2
+      printf '  %s\n' "${vms[@]}" >&2
+      return 1
+    fi
+    vm_name="${vms[0]}"
+    target="$1"
+  else
+    vm_name="$1"
+    target="${2:-}"
+  fi
+
+  local qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
+  if [ ! -S "$qmp_sock" ]; then
+    echo "Error: VM '$vm_name' not running (no QMP socket)" >&2
+    return 1
+  fi
+
+  if [ -z "$target" ]; then
+    python3 "$script_dir/balloon-daemon.py" "$qmp_sock" get
+  else
+    python3 "$script_dir/balloon-daemon.py" "$qmp_sock" set "$target"
+  fi
+}
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 agent-vm() {
   local subcmd="${1:-}"
-  if [ -z "$subcmd" ]; then
-    echo "Usage: agent-vm <command> [options]" >&2
-    echo "" >&2
-    echo "Commands:" >&2
-    echo "  setup              Create the VM template (run once)" >&2
-    echo "  claude [args]      Run Claude Code in a sandboxed VM" >&2
-    echo "  opencode [args]    Run OpenCode in a sandboxed VM" >&2
-    echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)" >&2
-    echo "" >&2
-    echo "Options:" >&2
-    echo "  --no-git           Skip GitHub integration" >&2
-    echo "  --usb DEVICE       Pass USB device to VM (repeatable; /dev/ttyACM0 or 1a86:55d3)" >&2
-    return 1
+  if [ -z "$subcmd" ] || [ "$subcmd" = "--help" ] || [ "$subcmd" = "-h" ]; then
+    echo "Usage: agent-vm <command> [options]"
+    echo ""
+    echo "Run AI coding agents inside sandboxed Lima VMs."
+    echo ""
+    echo "Commands:"
+    echo "  setup              Create the VM template (run once)"
+    echo "  claude [args]      Run Claude Code in a sandboxed VM"
+    echo "  opencode [args]    Run OpenCode in a sandboxed VM"
+    echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)"
+    echo "  memory [vm] [size] Query or adjust VM memory via balloon (e.g. 'memory 12G')"
+    echo ""
+    echo "Options (for claude, opencode, shell):"
+    echo "  --memory GB        Initial memory for the VM (default: 2G with balloon, 4G without)"
+    echo "  --max-memory GB    Memory ceiling (default: from template; balloon grows up to this)"
+    echo "  --no-git           Skip GitHub integration"
+    echo "  --usb DEVICE       Pass USB device to VM (repeatable; /dev/ttyACM0 or 1a86:55d3)"
+    echo ""
+    echo "Memory management:"
+    echo "  On Linux (QEMU), VMs use a virtio-balloon to start with 2G and auto-grow"
+    echo "  up to the ceiling as the guest needs more memory."
+    echo "  Example: agent-vm claude --memory 5 --max-memory 10"
+    echo "  On macOS (VZ), --memory sets a fixed allocation (default: 4G, no balloon)."
+    echo ""
+    echo "Run 'agent-vm <command> --help' for command-specific help."
+    [ -z "$subcmd" ] && return 1
+    return 0
   fi
   shift
 
@@ -1321,6 +1484,9 @@ agent-vm() {
       ;;
     shell)
       _agent_vm_shell "$@"
+      ;;
+    memory)
+      _agent_vm_memory "$@"
       ;;
     *)
       echo "Error: Unknown command '$subcmd'" >&2
