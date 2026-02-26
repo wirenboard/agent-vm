@@ -314,7 +314,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         header_keys_lower = {}  # lower -> actual key used in headers
         for key, value in self.headers.items():
             lower = key.lower()
-            if lower in ("x-api-key", "authorization", "host"):
+            if lower in ("x-api-key", "authorization", "host", "accept-encoding"):
                 continue
             if lower in header_keys_lower:
                 # Append duplicate header values (e.g. multiple anthropic-beta)
