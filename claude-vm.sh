@@ -239,7 +239,8 @@ _agent_vm_setup() {
       unzip zip \
       ca-certificates \
       qemu-user-static binfmt-support \
-      mosquitto-clients
+      mosquitto-clients \
+      gh
 
     # Install Docker from official repo (includes docker compose)
     echo "Installing Docker..."
@@ -730,7 +731,7 @@ else:
     print('Other repos will require their own authentication.')
 " "$repos_json")
 
-  # Write Claude instructions about git access
+  # Write Claude instructions about git and gh access
   limactl shell "$vm_name" bash -c "
     mkdir -p \$HOME/.claude
     cat >> \$HOME/.claude/CLAUDE.md << INSTRUCTIONS
@@ -745,9 +746,46 @@ that injects credentials. You can use standard git commands:
     git push origin HEAD:my-branch
     git pull origin main
 
+The \`gh\` CLI also works and is pre-authenticated. You can use it for
+pull requests, issues, and other GitHub operations:
+
+    gh pr list
+    gh pr create --title \"...\" --body \"...\"
+    gh issue list
+
 ${repo_list}
 INSTRUCTIONS
   "
+}
+
+_claude_vm_inject_gh_cli() {
+  local vm_name="$1"
+  local git_port="$2"
+
+  # Create a wrapper script that sets GH_HOST and HTTP_PROXY for gh,
+  # routing all gh API traffic through the git proxy
+  limactl shell "$vm_name" bash -c '
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/gh" << '\''WRAPPER'\''
+#!/bin/sh
+export GH_HOST=github.localhost
+export HTTP_PROXY="http://host.lima.internal:'"$git_port"'"
+exec /usr/bin/gh "$@"
+WRAPPER
+    chmod +x "$HOME/.local/bin/gh"
+  '
+
+  # Write a minimal gh hosts.yml with a dummy token so gh considers itself
+  # authenticated (the real token is injected by the proxy)
+  limactl shell "$vm_name" bash -c '
+    mkdir -p "$HOME/.config/gh"
+    cat > "$HOME/.config/gh/hosts.yml" << '\''HOSTS'\''
+github.localhost:
+    oauth_token: dummy-token-injected-by-proxy
+    user: x-access-token
+    git_protocol: https
+HOSTS
+  '
 }
 
 _claude_vm_security_snapshot() {
@@ -1047,6 +1085,7 @@ _agent_vm_run() {
   if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
       "$_claude_vm_github_repos_json"
+    _claude_vm_inject_gh_cli "$vm_name" "$_claude_vm_git_proxy_port"
     if [ "$agent" = "opencode" ]; then
       _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
         "$_claude_vm_github_repos_json"
@@ -1210,6 +1249,7 @@ _agent_vm_shell() {
   if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
     _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
       "$_claude_vm_github_repos_json"
+    _claude_vm_inject_gh_cli "$vm_name" "$_claude_vm_git_proxy_port"
     if [ "$agent" = "opencode" ]; then
       _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
         "$_claude_vm_github_repos_json"

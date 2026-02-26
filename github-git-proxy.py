@@ -32,6 +32,7 @@ import ssl
 import sys
 import socketserver
 import time
+from urllib.parse import urlparse
 
 DEBUG = os.environ.get("GITHUB_GIT_PROXY_DEBUG", "0") == "1"
 LOG_DIR = os.environ.get("GITHUB_GIT_PROXY_LOG_DIR", ".")
@@ -42,6 +43,8 @@ RETRY_DELAYS = [1, 2, 4]
 
 # Build per-repo auth: { "/owner/repo.git/": "Basic ...", "/owner/repo/": "Basic ...", ... }
 _REPO_AUTH = {}
+# Bearer token for API requests (populated from the first repo's token)
+_DEFAULT_BEARER = None
 
 
 def _make_basic_auth(token):
@@ -49,9 +52,12 @@ def _make_basic_auth(token):
 
 
 def _add_repo_auth(owner, repo, token):
+    global _DEFAULT_BEARER
     auth = _make_basic_auth(token)
     _REPO_AUTH[f"/{owner}/{repo}.git/"] = auth
     _REPO_AUTH[f"/{owner}/{repo}/"] = auth
+    if _DEFAULT_BEARER is None:
+        _DEFAULT_BEARER = token
 
 
 # Preferred: multi-repo JSON config
@@ -130,7 +136,102 @@ class GitProxyHandler(http.server.BaseHTTPRequestHandler):
                 return auth
         return None
 
+    def _is_api_request(self):
+        """Detect API requests from gh CLI via HTTP_PROXY.
+
+        When HTTP_PROXY is set, Go sends the full URL in the request line:
+          GET http://api.github.localhost/repos/... HTTP/1.1
+        The Host header will contain 'api.github.localhost' or similar.
+        Also support /api/ prefix for direct proxy access.
+        """
+        host = self.headers.get("Host", "")
+        return host.startswith("api.") or self.path.startswith("/api/")
+
+    def _proxy_api(self):
+        """Forward an API request to api.github.com with bearer auth."""
+        if not _DEFAULT_BEARER:
+            self.send_error(502, "No GitHub token configured for API requests")
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length else None
+
+        # Extract the path from a proxy-style full URL or a direct path.
+        # Full URL: http://api.github.localhost/repos/...  -> /repos/...
+        # Direct:   /api/v3/repos/...                      -> /repos/...
+        path = self.path
+        if path.startswith("http://") or path.startswith("https://"):
+            # Proxy-style: extract path portion
+            path = urlparse(path).path
+        # Strip /api/v3 prefix (GHE-style URLs that gh sometimes uses)
+        if path.startswith("/api/v3/"):
+            path = path[len("/api/v3"):]
+        elif path.startswith("/api/"):
+            path = path[len("/api"):]
+
+        debug(f">>> API {self.command} {path} ({content_length} bytes)")
+
+        # Build upstream headers
+        headers = {}
+        for key, value in self.headers.items():
+            if key.lower() in ("host", "authorization", "accept-encoding"):
+                continue
+            headers[key] = value
+        headers["Host"] = "api.github.com"
+        headers["Authorization"] = f"token {_DEFAULT_BEARER}"
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        ctx = ssl.create_default_context()
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+                log(f"  API retry {attempt}/{MAX_RETRIES} after {delay}s")
+                time.sleep(delay)
+
+            conn = None
+            try:
+                t0 = time.monotonic()
+                conn = http.client.HTTPSConnection("api.github.com", 443, context=ctx, timeout=300)
+                conn.request(self.command, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                latency_ms = (time.monotonic() - t0) * 1000
+            except Exception as e:
+                if conn:
+                    conn.close()
+                log(f"  API UPSTREAM ERROR (attempt {attempt + 1}): {e}")
+                last_error = str(e)
+                continue
+
+            resp_body = resp.read()
+            conn.close()
+            debug(f"<<< API {resp.status} ({latency_ms:.0f}ms, {len(resp_body)} bytes)")
+
+            if resp.status >= 500:
+                last_error = f"GitHub API returned HTTP {resp.status}"
+                log(f"  API got {resp.status} ({len(resp_body)} bytes), will retry")
+                continue
+
+            # Forward response
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                if key.lower() in ("transfer-encoding", "connection", "keep-alive"):
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+            return
+
+        log(f"  API all {MAX_RETRIES + 1} attempts failed: {last_error}")
+        self.send_error(502, f"GitHub API unavailable after {MAX_RETRIES + 1} attempts: {last_error}")
+
     def proxy(self):
+        # Route API requests before git path matching
+        if self._is_api_request():
+            return self._proxy_api()
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else None
 
@@ -204,6 +305,9 @@ class GitProxyHandler(http.server.BaseHTTPRequestHandler):
 
     do_GET = proxy
     do_POST = proxy
+    do_PATCH = proxy
+    do_PUT = proxy
+    do_DELETE = proxy
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
