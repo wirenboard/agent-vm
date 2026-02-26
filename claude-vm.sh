@@ -237,7 +237,9 @@ _agent_vm_setup() {
       python3 python3-pip python3-venv \
       ripgrep fd-find htop \
       unzip zip \
-      ca-certificates
+      ca-certificates \
+      qemu-user-static binfmt-support \
+      mosquitto-clients
 
     # Install Docker from official repo (includes docker compose)
     echo "Installing Docker..."
@@ -269,6 +271,18 @@ _agent_vm_setup() {
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable
     limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'sudo mkdir -p /opt/google/chrome && sudo ln -sf /usr/bin/chromium /opt/google/chrome/chrome'
+
+    # Install LSP servers for code intelligence
+    echo "Installing LSP servers..."
+    # C/C++: clangd
+    limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clangd
+    # Go: install Go toolchain and gopls
+    limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go
+    limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'GOBIN=$HOME/.local/bin go install golang.org/x/tools/gopls@latest'
+    # TypeScript/JavaScript: typescript-language-server
+    limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'sudo npm install -g typescript-language-server typescript'
+    # Python: pyright
+    limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'sudo npm install -g pyright'
   fi
 
   # Install non-cloud kernel (cloud kernel lacks USB, serial, and other hardware drivers)
@@ -296,6 +310,22 @@ _agent_vm_setup() {
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c '
     mkdir -p ~/.claude
     echo "{\"theme\":\"dark\",\"hasCompletedOnboarding\":true,\"skipDangerousModePermissionPrompt\":true,\"effortLevel\":\"high\"}" > ~/.claude/settings.json
+  '
+
+  # Pre-install official plugins marketplace and enable LSP plugins
+  echo "Installing Claude Code LSP plugins..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -c '
+    MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/claude-plugins-official"
+    mkdir -p "$HOME/.claude/plugins/marketplaces"
+    git clone --depth 1 https://github.com/anthropics/claude-plugins-official.git "$MARKETPLACE_DIR"
+    cat > "$HOME/.claude/plugins/known_marketplaces.json" << MKTJSON
+{"claude-plugins-official":{"source":{"source":"github","repo":"anthropics/claude-plugins-official"},"installLocation":"$MARKETPLACE_DIR","lastUpdated":"2026-01-01T00:00:00.000Z"}}
+MKTJSON
+    export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$PATH
+    claude plugin install clangd-lsp@claude-plugins-official --scope user
+    claude plugin install pyright-lsp@claude-plugins-official --scope user
+    claude plugin install typescript-lsp@claude-plugins-official --scope user
+    claude plugin install gopls-lsp@claude-plugins-official --scope user
   '
 
   # Install OpenCode
@@ -1029,6 +1059,15 @@ _agent_vm_run() {
     limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
+  # Update the agent tool to latest version before launching
+  if [ "$agent" = "opencode" ]; then
+    echo "Updating OpenCode..."
+    limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
+  else
+    echo "Updating Claude Code..."
+    limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+  fi
+
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ "$agent" = "opencode" ]; then
@@ -1042,6 +1081,7 @@ _agent_vm_run() {
       limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
       IS_SANDBOX=1 \
+      ENABLE_LSP_TOOL=1 \
       claude --dangerously-skip-permissions "${claude_args[@]}"
   fi
   _claude_vm_security_check "$host_dir" "$security_snapshot"
@@ -1193,7 +1233,7 @@ _agent_vm_shell() {
     echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   fi
   echo "Type 'exit' to stop and delete the VM"
-  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}")
+  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" ENABLE_LSP_TOOL=1)
   if [ "$agent" = "opencode" ]; then
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi
