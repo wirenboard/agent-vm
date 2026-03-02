@@ -131,15 +131,25 @@ _agent_vm_usb_rebind() {
 }
 
 _agent_vm_qemu_wrapper() {
-  # Create a QEMU wrapper with virtio-balloon and optional USB passthrough.
-  # Usage: _agent_vm_qemu_wrapper [usb_vid:pid ...]
+  # Create a QEMU wrapper with optional virtio-balloon and USB passthrough.
+  # Usage: _agent_vm_qemu_wrapper [--no-balloon] [usb_vid:pid ...]
+  local use_balloon=true
+  if [ "${1:-}" = "--no-balloon" ]; then
+    use_balloon=false
+    shift
+  fi
   local wrapper
   wrapper="$(mktemp /tmp/qemu-wrapper.XXXXXX)"
   local qemu_bin
   qemu_bin="$(command -v qemu-system-x86_64)"
-  local extra_args="-device virtio-balloon-pci,id=balloon0,deflate-on-oom=on"
+  local extra_args=""
+  if $use_balloon; then
+    # Pin balloon to a high PCI address so it doesn't shift the boot disk
+    # (the UEFI NVRAM from the template has hard-coded PCI paths for boot entries)
+    extra_args="-device virtio-balloon-pci,id=balloon0,deflate-on-oom=on,addr=0x18"
+  fi
   if [ $# -gt 0 ]; then
-    extra_args+=" -device qemu-xhci,id=xhci,addr=0x15"
+    extra_args+="${extra_args:+ }-device qemu-xhci,id=xhci,addr=0x15"
     local vidpid
     for vidpid in "$@"; do
       local vid="${vidpid%%:*}"
@@ -620,6 +630,15 @@ for s in p.sections():
       # Skip if same as main repo
       [ -n "$owner" ] && [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
 
+      # Skip token request for public repos (no auth needed for read-only access)
+      local http_code
+      http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+        "https://api.github.com/repos/$sub_owner/$sub_repo") || true
+      if [ "$http_code" = "200" ]; then
+        echo "  Submodule $sub_owner/$sub_repo is public, skipping token request"
+        continue
+      fi
+
       echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
       sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
         user-token --client-id Iv23liisR1WdpJmDUPLT \
@@ -1018,16 +1037,9 @@ _agent_vm_run() {
     return 1
   fi
 
-  _claude_vm_start_proxy "$host_dir" || return 1
-
-  if $use_github; then
-    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
-  fi
-
-  # Security: snapshot before session
-  local security_snapshot
-  security_snapshot="$(mktemp)"
-
+  # Set up cleanup trap before starting any background processes so Ctrl+C
+  # at any point (proxy start, clone, boot, etc.) cleans up everything.
+  local security_snapshot=""
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
@@ -1039,7 +1051,7 @@ _agent_vm_run() {
     # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
     # breaks all future limactl commands)
     [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
-    rm -f "$security_snapshot" "${security_snapshot}.git-config"
+    [ -n "$security_snapshot" ] && rm -f "$security_snapshot" "${security_snapshot}.git-config"
     local port
     for port in "${_usb_sysfs_ports[@]}"; do
       _agent_vm_usb_rebind "$port"
@@ -1048,6 +1060,14 @@ _agent_vm_run() {
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
+  _claude_vm_start_proxy "$host_dir" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+
+  if $use_github; then
+    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+  fi
+
+  # Security: snapshot before session
+  security_snapshot="$(mktemp)"
   _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
 
   # Ensure .git/hooks exists for read-only mount
@@ -1078,6 +1098,7 @@ _agent_vm_run() {
   fi
 
   # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
+  local _has_balloon=false
   if command -v qemu-system-x86_64 &>/dev/null; then
     # Override memory ceiling if --max-memory was specified
     if [ -n "$max_memory" ]; then
@@ -1088,19 +1109,34 @@ _agent_vm_run() {
     else
       _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
     fi
-    QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
-
-    # Balloon: set initial target (default 2G) and start auto-balloon daemon
-    local _balloon_script
-    _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
-    local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
-    local _balloon_target="${memory:-2}"
-    local _balloon_daemon_args=(--initial-target "${_balloon_target}G")
-    if [ -n "$max_memory" ]; then
-      _balloon_daemon_args+=(--max-memory "${max_memory}G")
+    if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
+      _has_balloon=true
+    else
+      # Balloon may have broken QEMU (e.g. PCI conflict); retry without it
+      echo "Warning: VM failed to start with balloon, retrying without..." >&2
+      limactl stop "$vm_name" &>/dev/null
+      rm -f "$_usb_qemu_wrapper"
+      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
+        QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+      else
+        _usb_qemu_wrapper=""
+        limactl start "$vm_name" &>/dev/null
+      fi
     fi
-    python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
-    _balloon_daemon_pid=$!
+
+    # Start balloon daemon only if balloon device is present
+    if $_has_balloon; then
+      local _balloon_script
+      _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+      local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
+      local _balloon_daemon_args=()
+      if [ -n "$max_memory" ]; then
+        _balloon_daemon_args+=(--max-memory "${max_memory}G")
+      fi
+      python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+      _balloon_daemon_pid=$!
+    fi
   else
     if [ -n "$max_memory" ]; then
       echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
@@ -1220,16 +1256,9 @@ _agent_vm_shell() {
     return 1
   fi
 
-  _claude_vm_start_proxy "$host_dir" || return 1
-
-  if $use_github; then
-    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
-  fi
-
-  # Security: snapshot before session
-  local security_snapshot
-  security_snapshot="$(mktemp)"
-
+  # Set up cleanup trap before starting any background processes so Ctrl+C
+  # at any point (proxy start, clone, boot, etc.) cleans up everything.
+  local security_snapshot=""
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
@@ -1241,7 +1270,7 @@ _agent_vm_shell() {
     # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
     # breaks all future limactl commands)
     [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
-    rm -f "$security_snapshot" "${security_snapshot}.git-config"
+    [ -n "$security_snapshot" ] && rm -f "$security_snapshot" "${security_snapshot}.git-config"
     local port
     for port in "${_usb_sysfs_ports[@]}"; do
       _agent_vm_usb_rebind "$port"
@@ -1250,6 +1279,14 @@ _agent_vm_shell() {
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
+  _claude_vm_start_proxy "$host_dir" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+
+  if $use_github; then
+    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+  fi
+
+  # Security: snapshot before session
+  security_snapshot="$(mktemp)"
   _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
 
   # Ensure .git/hooks exists for read-only mount
@@ -1277,6 +1314,7 @@ _agent_vm_shell() {
   fi
 
   # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
+  local _has_balloon=false
   if command -v qemu-system-x86_64 &>/dev/null; then
     # Override memory ceiling if --max-memory was specified
     if [ -n "$max_memory" ]; then
@@ -1287,19 +1325,34 @@ _agent_vm_shell() {
     else
       _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
     fi
-    QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
-
-    # Balloon: set initial target (default 2G) and start auto-balloon daemon
-    local _balloon_script
-    _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
-    local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
-    local _balloon_target="${memory:-2}"
-    local _balloon_daemon_args=(--initial-target "${_balloon_target}G")
-    if [ -n "$max_memory" ]; then
-      _balloon_daemon_args+=(--max-memory "${max_memory}G")
+    if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
+      _has_balloon=true
+    else
+      # Balloon may have broken QEMU (e.g. PCI conflict); retry without it
+      echo "Warning: VM failed to start with balloon, retrying without..." >&2
+      limactl stop "$vm_name" &>/dev/null
+      rm -f "$_usb_qemu_wrapper"
+      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
+        QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+      else
+        _usb_qemu_wrapper=""
+        limactl start "$vm_name" &>/dev/null
+      fi
     fi
-    python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
-    _balloon_daemon_pid=$!
+
+    # Start balloon daemon only if balloon device is present
+    if $_has_balloon; then
+      local _balloon_script
+      _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+      local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
+      local _balloon_daemon_args=()
+      if [ -n "$max_memory" ]; then
+        _balloon_daemon_args+=(--max-memory "${max_memory}G")
+      fi
+      python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+      _balloon_daemon_pid=$!
+    fi
   else
     if [ -n "$max_memory" ]; then
       echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2

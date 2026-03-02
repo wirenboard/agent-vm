@@ -150,8 +150,8 @@ def cmd_daemon(args):
     max_mem = parse_size(args.max_memory) if args.max_memory else None
     initial = parse_size(args.initial_target) if args.initial_target else None
     step = parse_size(args.step)
-    lo = args.low_watermark
-    hi = args.high_watermark
+    headroom = args.headroom / 100.0
+    min_free = parse_size(args.min_free)
     iv = args.interval
 
     def log(msg):
@@ -223,24 +223,31 @@ def cmd_daemon(args):
                 time.sleep(iv)
                 continue
 
+            # Base decisions on actual usage, not ceiling.
+            # avail = MemAvailable (excludes reclaimable cache).
+            # Use balloon target (cur), not MemTotal, since MemTotal is fixed
+            # at boot and includes balloon-claimed pages.
             cur = q.cmd("query-balloon").get("return", {}).get("actual", max_mem)
-            pct = avail / total * 100
-            log(f"{fmt(avail)} avail / {fmt(total)} total "
-                f"({pct:.0f}%), balloon={fmt(cur)}")
+            used = max(0, cur - avail)
+            desired = int(used * (1 + headroom))
+            desired = max(min_mem, min(max_mem, desired))
+
+            log(f"used={fmt(used)} avail={fmt(avail)} "
+                f"cur={fmt(cur)} desired={fmt(desired)}")
 
             new = cur
-            if pct < lo * 0.5 and cur < max_mem:
+            if avail < min_free and cur < max_mem:
                 # Critically low — fast deflate (give memory to guest)
                 new = min(cur + step * 2, max_mem)
                 log(f"  CRITICAL: {fmt(cur)} -> {fmt(new)}")
-            elif pct < lo and cur < max_mem:
-                # Below target — deflate
-                new = min(cur + step, max_mem)
-                log(f"  LOW: {fmt(cur)} -> {fmt(new)}")
-            elif pct > hi and cur > min_mem:
-                # Excess free memory — inflate (reclaim from guest)
-                new = max(cur - step, min_mem)
-                log(f"  EXCESS: {fmt(cur)} -> {fmt(new)}")
+            elif cur < desired - step:
+                # Guest needs more memory — grow gradually to avoid overshoot
+                new = min(cur + step, desired)
+                log(f"  GROW: {fmt(cur)} -> {fmt(new)}")
+            elif cur > desired + step:
+                # Excess — reclaim immediately (safe: guest has plenty free)
+                new = max(desired, min_mem)
+                log(f"  SHRINK: {fmt(cur)} -> {fmt(new)}")
 
             if new != cur:
                 q.cmd("balloon", value=new)
@@ -277,10 +284,10 @@ def main():
                      help="Minimum balloon size / floor (default: 1G)")
     pd.add_argument("--step", default="256M",
                      help="Adjustment step size (default: 256M)")
-    pd.add_argument("--low-watermark", type=float, default=15,
-                     help="Deflate (give memory) when guest free%% < this (default: 15)")
-    pd.add_argument("--high-watermark", type=float, default=40,
-                     help="Inflate (reclaim) when guest free%% > this (default: 40)")
+    pd.add_argument("--headroom", type=float, default=20,
+                     help="Keep this %% of used memory as free headroom (default: 20)")
+    pd.add_argument("--min-free", default="384M",
+                     help="Emergency deflate threshold (default: 384M)")
     pd.add_argument("--interval", type=int, default=5,
                      help="Stats polling interval in seconds (default: 5)")
     pd.add_argument("-v", "--verbose", action="store_true",
