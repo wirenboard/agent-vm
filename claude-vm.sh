@@ -323,6 +323,11 @@ _agent_vm_setup() {
     fi
   '
 
+  # Install mitmproxy (for transparent HTTPS interception)
+  echo "Installing mitmproxy..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'command -v pip3 >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip'
+  limactl shell "$CLAUDE_VM_TEMPLATE" sudo pip3 install --break-system-packages --ignore-installed bcrypt mitmproxy
+
   # Install Claude Code
   echo "Installing Claude Code..."
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://claude.ai/install.sh | bash"
@@ -411,22 +416,250 @@ CIEOF
   echo "Template ready. Run 'agent-vm claude' or 'agent-vm opencode' in any project directory."
 }
 
-_claude_vm_start_proxy() {
-  local host_dir="$1"
+_claude_vm_build_credential_rules() {
+  # Build CREDENTIAL_PROXY_RULES JSON from tokens.
+  # Args: anthropic_token github_repos_json
+  # github_repos_json: '{"owner/repo": "token", ...}' — per-repo tokens
+  local anthropic_token="$1"
+  local github_repos_json="$2"
+
+  python3 -c "
+import base64, json, sys
+rules = []
+anthropic_token = sys.argv[1]
+repos = json.loads(sys.argv[2]) if sys.argv[2] else {}
+if anthropic_token:
+    rules.append({
+        'domain': 'api.anthropic.com',
+        'headers': {
+            'Authorization': f'Bearer {anthropic_token}',
+            'anthropic-beta': 'oauth-2025-04-20'
+        }
+    })
+for slug, token in repos.items():
+    owner, repo = slug.split('/', 1)
+    basic = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+    # git clone/fetch: github.com/owner/repo.git/...
+    rules.append({
+        'domain': 'github.com',
+        'path_prefix': f'/{owner}/{repo}',
+        'headers': {'Authorization': f'Basic {basic}'}
+    })
+    # gh CLI / API: api.github.com/repos/owner/repo/...
+    rules.append({
+        'domain': 'api.github.com',
+        'path_prefix': f'/repos/{owner}/{repo}',
+        'headers': {'Authorization': f'token {token}'}
+    })
+# Domain-level fallback using first token (for /user, /search, etc.)
+if repos:
+    first_token = next(iter(repos.values()))
+    basic = base64.b64encode(f'x-access-token:{first_token}'.encode()).decode()
+    rules.append({
+        'domain': 'github.com',
+        'headers': {'Authorization': f'Basic {basic}'}
+    })
+    rules.append({
+        'domain': 'api.github.com',
+        'headers': {'Authorization': f'token {first_token}'}
+    })
+print(json.dumps(rules))
+" "$anthropic_token" "$github_repos_json"
+}
+
+_claude_vm_start_credential_proxy() {
+  local rules_json="$1"
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  echo "Starting API proxy..."
-  exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
-  _claude_vm_proxy_pid=$!
-  if ! read -r -t 5 _claude_vm_proxy_port <&3; then
-    echo "Error: API proxy failed to start." >&2
-    kill "$_claude_vm_proxy_pid" 2>/dev/null
+  # Generate per-instance secret for cross-VM isolation
+  _credential_proxy_secret=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+  echo "Starting credential proxy..."
+  exec 3< <(CREDENTIAL_PROXY_RULES="$rules_json" \
+    CREDENTIAL_PROXY_SECRET="$_credential_proxy_secret" \
+    CREDENTIAL_PROXY_DEBUG="${CREDENTIAL_PROXY_DEBUG:-0}" \
+    CREDENTIAL_PROXY_LOG_DIR="${CREDENTIAL_PROXY_LOG_DIR:-.}" \
+    python3 "$script_dir/credential-proxy.py")
+  _credential_proxy_pid=$!
+  if ! read -r -t 5 _credential_proxy_port <&3; then
+    echo "Error: Credential proxy failed to start." >&2
+    kill "$_credential_proxy_pid" 2>/dev/null
     exec 3<&-
     return 1
   fi
   exec 3<&-
-  echo "API proxy listening on port $_claude_vm_proxy_port"
+  echo "Credential proxy listening on port $_credential_proxy_port"
+}
+
+_claude_vm_setup_mitmproxy() {
+  local vm_name="$1"
+
+  # Generate mitmproxy CA cert and install in system trust store
+  limactl shell "$vm_name" bash -c '
+    # Generate CA if not already present
+    if [ ! -f ~/.mitmproxy/mitmproxy-ca-cert.pem ]; then
+      # Run mitmdump briefly to generate CA certs
+      timeout 2 mitmdump --listen-port 0 2>/dev/null || true
+    fi
+
+    # Install CA in system trust store
+    sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
+    sudo update-ca-certificates
+
+    # Configure git to use system CA bundle (includes mitmproxy CA)
+    git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+  '
+
+  # Set HTTPS_PROXY env var for all processes
+  limactl shell "$vm_name" bash -c '
+    echo "export HTTPS_PROXY=http://127.0.0.1:8080" >> ~/.bashrc
+    echo "export HTTP_PROXY=http://127.0.0.1:8080" >> ~/.bashrc
+    echo "export https_proxy=http://127.0.0.1:8080" >> ~/.bashrc
+    echo "export http_proxy=http://127.0.0.1:8080" >> ~/.bashrc
+    # Node.js respects these for fetch/http
+    echo "export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt" >> ~/.bashrc
+  '
+}
+
+_claude_vm_start_mitmproxy() {
+  local vm_name="$1"
+  local credential_proxy_port="$2"
+  local intercepted_domains="$3"  # pipe-separated: "api.anthropic.com|github.com|api.github.com"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # Copy addon script to VM
+  limactl shell "$vm_name" bash -c 'mkdir -p ~/.mitmproxy'
+  cat "$script_dir/mitmproxy-addon.py" | limactl shell "$vm_name" bash -c 'cat > ~/.mitmproxy/addon.py'
+
+  # Build ignore-hosts regex: negative lookahead for intercepted domains
+  # This means mitmproxy will only MITM the listed domains; everything else passes through
+  local ignore_regex
+  ignore_regex=$(python3 -c "
+import sys
+domains = sys.argv[1].split('|')
+# Escape dots for regex
+escaped = [d.replace('.', r'\.') for d in domains]
+# Build negative lookahead: ignore everything that is NOT one of our domains
+alts = '|'.join(f'{d}$' for d in escaped)
+print(f'^(?!{alts})')
+" "$intercepted_domains")
+
+  # Start mitmdump in background inside the VM
+  limactl shell "$vm_name" bash -c "
+    CREDENTIAL_PROXY_HOST=host.lima.internal \
+    CREDENTIAL_PROXY_PORT=$credential_proxy_port \
+    CREDENTIAL_PROXY_SECRET='$_credential_proxy_secret' \
+    nohup mitmdump \
+      --listen-port 8080 \
+      --set connection_strategy=lazy \
+      --ignore-hosts '$ignore_regex' \
+      -s ~/.mitmproxy/addon.py \
+      > /tmp/mitmproxy.log 2>&1 &
+    echo \$!
+  "
+
+  # Wait for mitmproxy to be ready
+  limactl shell "$vm_name" bash -c '
+    for i in $(seq 1 30); do
+      if curl -s --proxy http://127.0.0.1:8080 http://127.0.0.1:8080/p/200 >/dev/null 2>&1; then
+        exit 0
+      fi
+      # Also try just connecting to the port
+      if bash -c "echo >/dev/tcp/127.0.0.1/8080" 2>/dev/null; then
+        exit 0
+      fi
+      sleep 0.2
+    done
+    echo "Warning: mitmproxy may not be ready" >&2
+    exit 0
+  '
+  echo "mitmproxy started in VM"
+}
+
+_claude_vm_inject_git_credentials() {
+  local vm_name="$1"
+
+  # Get git user identity from host
+  local git_name git_email
+  git_name=$(git config user.name 2>/dev/null || echo "")
+  git_email=$(git config user.email 2>/dev/null || echo "")
+
+  # Set up git credential helper with a placeholder token.
+  # The real token is injected by the host credential proxy via mitmproxy.
+  limactl shell "$vm_name" bash -c "
+    git config --global credential.helper store
+    # Store a placeholder credential for github.com
+    # (git will send this, mitmproxy intercepts, host proxy overwrites with real token)
+    mkdir -p \$HOME
+    echo 'https://x-access-token:placeholder@github.com' > \$HOME/.git-credentials
+    chmod 600 \$HOME/.git-credentials
+    ${git_name:+git config --global user.name \"$git_name\"}
+    ${git_email:+git config --global user.email \"$git_email\"}
+  "
+}
+
+_claude_vm_inject_gh_credentials() {
+  local vm_name="$1"
+
+  # Write gh hosts.yml with a placeholder token.
+  # Real auth is injected by the host credential proxy via mitmproxy.
+  limactl shell "$vm_name" bash -c '
+    mkdir -p "$HOME/.config/gh"
+    cat > "$HOME/.config/gh/hosts.yml" << '\''HOSTS'\''
+github.com:
+    oauth_token: placeholder-token-injected-by-proxy
+    user: x-access-token
+    git_protocol: https
+HOSTS
+  '
+}
+
+_claude_vm_write_instructions() {
+  local vm_name="$1"
+  local repos_json="$2"  # JSON dict: {"owner/repo": "token", ...} or "{}"
+
+  local repo_list
+  repo_list=$(python3 -c "
+import json, sys
+repos = json.loads(sys.argv[1])
+slugs = list(repos.keys())
+if not slugs:
+    print('No GitHub repos have credentials configured.')
+elif len(slugs) == 1:
+    print(f'Only {slugs[0]} has credentials configured. Other repos will require')
+    print('their own authentication.')
+else:
+    print('The following repositories have credentials configured:')
+    for s in slugs:
+        print(f'  - {s}')
+    print('Other repos will require their own authentication.')
+" "$repos_json")
+
+  limactl shell "$vm_name" bash -c "
+    mkdir -p \$HOME/.claude
+    cat >> \$HOME/.claude/CLAUDE.md << INSTRUCTIONS
+
+# Git access
+
+Git push and pull to GitHub work out of the box for this repository.
+You can use standard git commands:
+
+    git push origin main
+    git push origin HEAD:my-branch
+    git pull origin main
+
+The \\\`gh\\\` CLI also works and is pre-authenticated. You can use it for
+pull requests, issues, and other GitHub operations:
+
+    gh pr list
+    gh pr create --title \"...\" --body \"...\"
+    gh issue list
+
+${repo_list}
+INSTRUCTIONS
+  "
 }
 
 _claude_vm_inject_clipboard_shim() {
@@ -581,13 +814,16 @@ sys.exit(1)
 " "$1"
 }
 
-_claude_vm_start_github_mcp() {
+_claude_vm_get_github_token() {
+  # Acquire a GitHub token for the project and its submodules.
+  # Sets _claude_vm_github_token (first repo's token) and _claude_vm_github_repos_json.
   local host_dir="$1"
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
   local repos_json='{}'
   local owner="" repo=""
+  _claude_vm_github_token=""
 
   # Detect main repo from git remote
   local repo_url
@@ -602,6 +838,7 @@ _claude_vm_start_github_mcp() {
         --repo "$repo_url" --token-only \
         --cache-dir "$HOME/.cache/claude-vm") || true
       if [ -n "$token" ]; then
+        _claude_vm_github_token="$token"
         repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
           "$owner/$repo" "$token")
       else
@@ -652,171 +889,28 @@ d[sys.argv[2]] = sys.argv[3]
 print(json.dumps(d))
 " "$repos_json" "$sub_owner/$sub_repo" "$sub_token")
         echo "  Got token for $sub_owner/$sub_repo"
+        # Use first available token if main repo didn't have one
+        [ -z "$_claude_vm_github_token" ] && _claude_vm_github_token="$sub_token"
       else
         echo "  Warning: no token for $sub_owner/$sub_repo (skipping credential injection)"
       fi
     done <<< "$sub_urls"
   fi
 
-  # If no repos were configured, skip proxies
+  # If no repos were configured, skip GitHub integration
   if [ "$repos_json" = '{}' ]; then
-    echo "Warning: No GitHub repos found (no remote, no submodules), skipping GitHub MCP" >&2
+    echo "Warning: No GitHub repos found (no remote, no submodules), skipping GitHub" >&2
+    _claude_vm_github_repos_json='{}'
     return 1
   fi
 
-  # Start GitHub MCP proxy (injects per-repo tokens, enforces repo scope)
-  echo "Starting GitHub MCP proxy..."
-  exec 4< <(GITHUB_MCP_PROXY_REPOS="$repos_json" \
-    GITHUB_MCP_PROXY_DEBUG="${GITHUB_MCP_PROXY_DEBUG:-0}" \
-    python3 "$script_dir/github-mcp-proxy.py")
-  _claude_vm_github_mcp_pid=$!
-  if ! read -r -t 5 _claude_vm_github_mcp_port <&4; then
-    echo "Warning: GitHub MCP proxy failed to start" >&2
-    kill "$_claude_vm_github_mcp_pid" 2>/dev/null
-    exec 4<&-
-    return 1
-  fi
-  exec 4<&-
   local _scope_list
   _scope_list=$(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1]).keys()))" "$repos_json")
-  echo "GitHub MCP proxy on port $_claude_vm_github_mcp_port (scope: $_scope_list)"
+  echo "GitHub token acquired (scope: $_scope_list)"
 
-  # Start Git HTTP proxy (injects per-repo tokens for main + submodules)
-  echo "Starting Git HTTP proxy..."
-  exec 5< <(GITHUB_GIT_PROXY_REPOS="$repos_json" \
-    python3 "$script_dir/github-git-proxy.py")
-  _claude_vm_git_proxy_pid=$!
-  if ! read -r -t 5 _claude_vm_git_proxy_port <&5; then
-    echo "Warning: Git HTTP proxy failed to start" >&2
-    kill "$_claude_vm_git_proxy_pid" 2>/dev/null
-    exec 5<&-
-    # Non-fatal: MCP still works, just no git push
-  else
-    echo "Git HTTP proxy on port $_claude_vm_git_proxy_port"
-  fi
-  exec 5<&-
-
-  # Export for use by other functions
   _claude_vm_github_repos_json="$repos_json"
 }
 
-_claude_vm_inject_github_mcp() {
-  local vm_name="$1"
-  local port="$2"
-  limactl shell "$vm_name" bash -c "
-    CONFIG=\$HOME/.claude.json
-    if [ -f \"\$CONFIG\" ]; then
-      jq '.mcpServers.github = {\"type\":\"http\",\"url\":\"http://host.lima.internal:${port}/mcp\"}' \
-        \"\$CONFIG\" > \"\$CONFIG.tmp\" && mv \"\$CONFIG.tmp\" \"\$CONFIG\"
-    else
-      echo '{\"mcpServers\":{\"github\":{\"type\":\"http\",\"url\":\"http://host.lima.internal:${port}/mcp\"}}}' > \"\$CONFIG\"
-    fi
-  "
-}
-
-_claude_vm_inject_git_proxy() {
-  local vm_name="$1"
-  local git_port="$2"
-  local repos_json="$3"  # JSON dict: {"owner/repo": "token", ...}
-
-  # Get git user identity from host
-  local git_name git_email
-  git_name=$(git config user.name 2>/dev/null || echo "")
-  git_email=$(git config user.email 2>/dev/null || echo "")
-
-  # Set up git insteadOf for each repo in the JSON dict
-  # git insteadOf is prefix-matched, so "git@github.com:owner/repo" matches
-  # both "git@github.com:owner/repo.git" and "git@github.com:owner/repo".
-  local git_config_cmds
-  git_config_cmds=$(python3 -c "
-import json, sys
-repos = json.loads(sys.argv[1])
-port = sys.argv[2]
-for slug in repos:
-    owner, repo = slug.split('/', 1)
-    proxy_base = f'http://host.lima.internal:{port}/{owner}/{repo}'
-    print(f'git config --global url.{proxy_base}.insteadOf git@github.com:{owner}/{repo}')
-    print(f'git config --global --add url.{proxy_base}.insteadOf https://github.com/{owner}/{repo}')
-" "$repos_json" "$git_port")
-
-  limactl shell "$vm_name" bash -c "
-    $git_config_cmds
-    ${git_name:+git config --global user.name \"$git_name\"}
-    ${git_email:+git config --global user.email \"$git_email\"}
-  "
-
-  # Build list of repos for the CLAUDE.md instructions
-  local repo_list
-  repo_list=$(python3 -c "
-import json, sys
-repos = json.loads(sys.argv[1])
-slugs = list(repos.keys())
-if len(slugs) == 1:
-    print(f'Only {slugs[0]} has credentials configured. Other repos will require')
-    print('their own authentication.')
-else:
-    print('The following repositories have credentials configured:')
-    for s in slugs:
-        print(f'  - {s}')
-    print('Other repos will require their own authentication.')
-" "$repos_json")
-
-  # Write Claude instructions about git and gh access
-  limactl shell "$vm_name" bash -c "
-    mkdir -p \$HOME/.claude
-    cat >> \$HOME/.claude/CLAUDE.md << INSTRUCTIONS
-
-# Git access
-
-Git push and pull to GitHub work out of the box for this repository.
-The remote URL is automatically rewritten to go through a host-side proxy
-that injects credentials. You can use standard git commands:
-
-    git push origin main
-    git push origin HEAD:my-branch
-    git pull origin main
-
-The \`gh\` CLI also works and is pre-authenticated. You can use it for
-pull requests, issues, and other GitHub operations:
-
-    gh pr list
-    gh pr create --title \"...\" --body \"...\"
-    gh issue list
-
-${repo_list}
-INSTRUCTIONS
-  "
-}
-
-_claude_vm_inject_gh_cli() {
-  local vm_name="$1"
-  local git_port="$2"
-
-  # Create a wrapper script that sets GH_HOST and HTTP_PROXY for gh,
-  # routing all gh API traffic through the git proxy
-  limactl shell "$vm_name" bash -c '
-    mkdir -p "$HOME/.local/bin"
-    cat > "$HOME/.local/bin/gh" << '\''WRAPPER'\''
-#!/bin/sh
-export GH_HOST=github.localhost
-export HTTP_PROXY="http://host.lima.internal:'"$git_port"'"
-exec /usr/bin/gh "$@"
-WRAPPER
-    chmod +x "$HOME/.local/bin/gh"
-  '
-
-  # Write a minimal gh hosts.yml with a dummy token so gh considers itself
-  # authenticated (the real token is injected by the proxy)
-  limactl shell "$vm_name" bash -c '
-    mkdir -p "$HOME/.config/gh"
-    cat > "$HOME/.config/gh/hosts.yml" << '\''HOSTS'\''
-github.localhost:
-    oauth_token: dummy-token-injected-by-proxy
-    user: x-access-token
-    git_protocol: https
-HOSTS
-  '
-}
 
 _claude_vm_security_snapshot() {
   local host_dir="$1"
@@ -891,19 +985,21 @@ _claude_vm_security_check() {
 
 _opencode_vm_setup_config() {
   local vm_name="$1"  # unused but kept for consistent API
-  local proxy_port="$2"
-  local state_dir="$3"
+  local state_dir="$2"
 
   local config_dir="${state_dir}/opencode-config"
   mkdir -p "$config_dir"
 
-  cat > "${config_dir}/opencode.json" << OCJSON
+  # Use real upstream URL — mitmproxy intercepts HTTPS and the host credential
+  # proxy injects the real API key. The dummy apiKey satisfies OpenCode's config
+  # validation but is overwritten by the proxy.
+  cat > "${config_dir}/opencode.json" << 'OCJSON'
 {
-  "\$schema": "https://opencode.ai/config.json",
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "anthropic": {
       "options": {
-        "baseURL": "http://host.lima.internal:${proxy_port}/v1",
+        "baseURL": "https://api.anthropic.com/v1",
         "apiKey": "dummy-key-auth-handled-by-proxy"
       }
     }
@@ -956,53 +1052,6 @@ _opencode_vm_setup_session_persistence() {
   '
 }
 
-_opencode_vm_inject_github_mcp_opencode() {
-  local vm_name="$1"  # unused but kept for consistent API
-  local port="$2"
-  local state_dir="$3"
-
-  local config="${state_dir}/opencode-config/opencode.json"
-  if [ -f "$config" ] && command -v jq &>/dev/null; then
-    jq '.mcp.github = {"type":"remote","url":"http://host.lima.internal:'"${port}"'/mcp","enabled":true}' \
-      "$config" > "$config.tmp" && mv "$config.tmp" "$config"
-  fi
-}
-
-_opencode_vm_inject_git_proxy() {
-  local vm_name="$1"
-  local git_port="$2"
-  local repos_json="$3"  # JSON dict: {"owner/repo": "token", ...}
-
-  # Get git user identity from host
-  local git_name git_email
-  git_name=$(git config user.name 2>/dev/null || echo "")
-  git_email=$(git config user.email 2>/dev/null || echo "")
-
-  # Set up git insteadOf for each repo in the JSON dict
-  # (Claude's _claude_vm_inject_git_proxy already does this, but we call it
-  #  for the opencode-only path where claude's version might not be called)
-  local git_config_cmds
-  git_config_cmds=$(python3 -c "
-import json, sys
-repos = json.loads(sys.argv[1])
-port = sys.argv[2]
-for slug in repos:
-    owner, repo = slug.split('/', 1)
-    proxy_base = f'http://host.lima.internal:{port}/{owner}/{repo}'
-    print(f'git config --global url.{proxy_base}.insteadOf git@github.com:{owner}/{repo}')
-    print(f'git config --global --add url.{proxy_base}.insteadOf https://github.com/{owner}/{repo}')
-" "$repos_json" "$git_port")
-
-  limactl shell "$vm_name" bash -c "
-    $git_config_cmds
-    ${git_name:+git config --global user.name \"$git_name\"}
-    ${git_email:+git config --global user.email \"$git_email\"}
-  "
-
-  # OpenCode reads CLAUDE.md by default (via OPENCODE_DISABLE_CLAUDE_CODE=false),
-  # so the git instructions written by _claude_vm_inject_git_proxy are already
-  # available to OpenCode. No separate AGENTS.md needed.
-}
 
 _agent_vm_run() {
   local agent="$1"
@@ -1043,9 +1092,7 @@ _agent_vm_run() {
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
-    [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
-    [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
-    [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
+    [ -n "$_credential_proxy_pid" ] && kill "$_credential_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
@@ -1060,11 +1107,20 @@ _agent_vm_run() {
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
-  _claude_vm_start_proxy "$host_dir" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+  # Get Anthropic token
+  local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
 
+  # Get GitHub token
+  _claude_vm_github_repos_json='{}'
+  _claude_vm_github_token=""
   if $use_github; then
-    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+    _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
   fi
+
+  # Build credential rules and start unified proxy
+  local _credential_rules
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
+  _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
 
   # Security: snapshot before session
   security_snapshot="$(mktemp)"
@@ -1152,26 +1208,30 @@ _agent_vm_run() {
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
-  if [ "$agent" = "opencode" ]; then
-    _opencode_vm_setup_config "$vm_name" "$_claude_vm_proxy_port" "$state_dir"
-    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
-    _opencode_vm_setup_auth "$vm_name"
+  # Set up mitmproxy (CA cert, system trust, proxy env vars)
+  echo "Setting up mitmproxy..."
+  _claude_vm_setup_mitmproxy "$vm_name"
+
+  # Build intercepted domains list from credential rules
+  local _intercepted_domains
+  _intercepted_domains=$(python3 -c "
+import json, sys
+rules = json.loads(sys.argv[1])
+print('|'.join(r['domain'] for r in rules))
+" "$_credential_rules")
+
+  _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+
+  if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
+    _claude_vm_inject_git_credentials "$vm_name"
+    _claude_vm_inject_gh_credentials "$vm_name"
+    _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
   fi
 
-  if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
-    _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
-    if [ "$agent" = "opencode" ]; then
-      _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
-    fi
-  fi
-  if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
-    _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-      "$_claude_vm_github_repos_json"
-    _claude_vm_inject_gh_cli "$vm_name" "$_claude_vm_git_proxy_port"
-    if [ "$agent" = "opencode" ]; then
-      _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-        "$_claude_vm_github_repos_json"
-    fi
+  if [ "$agent" = "opencode" ]; then
+    _opencode_vm_setup_config "$vm_name" "$state_dir"
+    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _opencode_vm_setup_auth "$vm_name"
   fi
 
   # Run project-specific runtime script if it exists
@@ -1200,8 +1260,7 @@ _agent_vm_run() {
     local claude_args=("${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
-      env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
-      IS_SANDBOX=1 \
+      env IS_SANDBOX=1 \
       ENABLE_LSP_TOOL=1 \
       claude --dangerously-skip-permissions "${claude_args[@]}"
   fi
@@ -1262,9 +1321,7 @@ _agent_vm_shell() {
   _claude_vm_shell_cleanup() {
     echo "Cleaning up VM..."
     [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
-    [ -n "$_claude_vm_proxy_pid" ] && kill "$_claude_vm_proxy_pid" 2>/dev/null
-    [ -n "$_claude_vm_github_mcp_pid" ] && kill "$_claude_vm_github_mcp_pid" 2>/dev/null
-    [ -n "$_claude_vm_git_proxy_pid" ] && kill "$_claude_vm_git_proxy_pid" 2>/dev/null
+    [ -n "$_credential_proxy_pid" ] && kill "$_credential_proxy_pid" 2>/dev/null
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
     # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
@@ -1279,11 +1336,20 @@ _agent_vm_shell() {
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
-  _claude_vm_start_proxy "$host_dir" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+  # Get Anthropic token
+  local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
 
+  # Get GitHub token
+  _claude_vm_github_repos_json='{}'
+  _claude_vm_github_token=""
   if $use_github; then
-    _claude_vm_start_github_mcp "$host_dir" || echo "Continuing without GitHub MCP..."
+    _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
   fi
+
+  # Build credential rules and start unified proxy
+  local _credential_rules
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
+  _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
 
   # Security: snapshot before session
   security_snapshot="$(mktemp)"
@@ -1368,26 +1434,30 @@ _agent_vm_shell() {
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
-  if [ "$agent" = "opencode" ]; then
-    _opencode_vm_setup_config "$vm_name" "$_claude_vm_proxy_port" "$state_dir"
-    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
-    _opencode_vm_setup_auth "$vm_name"
+  # Set up mitmproxy (CA cert, system trust, proxy env vars)
+  echo "Setting up mitmproxy..."
+  _claude_vm_setup_mitmproxy "$vm_name"
+
+  # Build intercepted domains list from credential rules
+  local _intercepted_domains
+  _intercepted_domains=$(python3 -c "
+import json, sys
+rules = json.loads(sys.argv[1])
+print('|'.join(r['domain'] for r in rules))
+" "$_credential_rules")
+
+  _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+
+  if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
+    _claude_vm_inject_git_credentials "$vm_name"
+    _claude_vm_inject_gh_credentials "$vm_name"
+    _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
   fi
 
-  if $use_github && [ -n "$_claude_vm_github_mcp_port" ]; then
-    _claude_vm_inject_github_mcp "$vm_name" "$_claude_vm_github_mcp_port"
-    if [ "$agent" = "opencode" ]; then
-      _opencode_vm_inject_github_mcp_opencode "$vm_name" "$_claude_vm_github_mcp_port" "$state_dir"
-    fi
-  fi
-  if $use_github && [ -n "$_claude_vm_git_proxy_port" ] && [ -n "$_claude_vm_github_repos_json" ]; then
-    _claude_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-      "$_claude_vm_github_repos_json"
-    _claude_vm_inject_gh_cli "$vm_name" "$_claude_vm_git_proxy_port"
-    if [ "$agent" = "opencode" ]; then
-      _opencode_vm_inject_git_proxy "$vm_name" "$_claude_vm_git_proxy_port" \
-        "$_claude_vm_github_repos_json"
-    fi
+  if [ "$agent" = "opencode" ]; then
+    _opencode_vm_setup_config "$vm_name" "$state_dir"
+    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _opencode_vm_setup_auth "$vm_name"
   fi
 
   # Run project-specific runtime script if it exists
@@ -1396,18 +1466,13 @@ _agent_vm_shell() {
   fi
 
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
-  echo "API proxy: http://host.lima.internal:${_claude_vm_proxy_port}"
-  if [ -n "$_claude_vm_github_mcp_port" ]; then
-    echo "GitHub MCP: http://host.lima.internal:${_claude_vm_github_mcp_port}/mcp"
-  fi
-  if [ -n "$_claude_vm_git_proxy_port" ]; then
-    echo "Git proxy:  http://host.lima.internal:${_claude_vm_git_proxy_port}"
-  fi
+  echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
+  echo "mitmproxy: http://127.0.0.1:8080 (inside VM)"
   if [ "$agent" = "opencode" ]; then
     echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   fi
   echo "Type 'exit' to stop and delete the VM"
-  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" ENABLE_LSP_TOOL=1)
+  local shell_env=(ENABLE_LSP_TOOL=1)
   if [ "$agent" = "opencode" ]; then
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi
