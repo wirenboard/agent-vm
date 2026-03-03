@@ -511,21 +511,24 @@ _claude_vm_setup_mitmproxy() {
     git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
   '
 
-  # Set HTTPS_PROXY env var for all processes
+  # Set HTTPS_PROXY env var for all processes via profile.d
+  # (not .bashrc — avoids polluting the shell after mitmproxy stops)
   limactl shell "$vm_name" bash -c '
-    echo "export HTTPS_PROXY=http://127.0.0.1:8080" >> ~/.bashrc
-    echo "export HTTP_PROXY=http://127.0.0.1:8080" >> ~/.bashrc
-    echo "export https_proxy=http://127.0.0.1:8080" >> ~/.bashrc
-    echo "export http_proxy=http://127.0.0.1:8080" >> ~/.bashrc
-    # Node.js respects these for fetch/http
-    echo "export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt" >> ~/.bashrc
+    sudo tee /etc/profile.d/credential-proxy.sh > /dev/null <<EOF
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export https_proxy=http://127.0.0.1:8080
+export http_proxy=http://127.0.0.1:8080
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+EOF
+    sudo chmod 644 /etc/profile.d/credential-proxy.sh
   '
 }
 
 _claude_vm_start_mitmproxy() {
   local vm_name="$1"
   local credential_proxy_port="$2"
-  local intercepted_domains="$3"  # pipe-separated: "api.anthropic.com|github.com|api.github.com"
+  local intercepted_domains="$3"  # comma-separated: "api.anthropic.com,github.com,api.github.com"
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -533,49 +536,42 @@ _claude_vm_start_mitmproxy() {
   limactl shell "$vm_name" bash -c 'mkdir -p ~/.mitmproxy'
   cat "$script_dir/mitmproxy-addon.py" | limactl shell "$vm_name" bash -c 'cat > ~/.mitmproxy/addon.py'
 
-  # Build ignore-hosts regex: negative lookahead for intercepted domains
-  # This means mitmproxy will only MITM the listed domains; everything else passes through
-  local ignore_regex
-  ignore_regex=$(python3 -c "
-import sys
-domains = sys.argv[1].split('|')
-# Escape dots for regex
-escaped = [d.replace('.', r'\.') for d in domains]
-# Build negative lookahead: ignore everything that is NOT one of our domains
-alts = '|'.join(f'{d}$' for d in escaped)
-print(f'^(?!{alts})')
-" "$intercepted_domains")
-
-  # Start mitmdump in background inside the VM
+  # Write a launcher script into the VM, then start it via systemd-run.
+  # Direct "nohup ... &" inside "limactl shell" doesn't survive the SSH session exit.
   limactl shell "$vm_name" bash -c "
-    CREDENTIAL_PROXY_HOST=host.lima.internal \
-    CREDENTIAL_PROXY_PORT=$credential_proxy_port \
-    CREDENTIAL_PROXY_SECRET='$_credential_proxy_secret' \
-    nohup mitmdump \
-      --listen-port 8080 \
-      --set connection_strategy=lazy \
-      --ignore-hosts '$ignore_regex' \
-      -s ~/.mitmproxy/addon.py \
-      > /tmp/mitmproxy.log 2>&1 &
-    echo \$!
+    cat > /tmp/start-mitmproxy.sh << 'LAUNCHER'
+#!/bin/bash
+exec mitmdump \
+  --listen-port 8080 \
+  --set connection_strategy=lazy \
+  -s ~/.mitmproxy/addon.py
+LAUNCHER
+    chmod +x /tmp/start-mitmproxy.sh
   "
 
-  # Wait for mitmproxy to be ready
+  # Start as a systemd user service so it survives the limactl shell session
+  limactl shell "$vm_name" bash -c "
+    systemd-run --user --unit=mitmproxy \
+      --setenv=CREDENTIAL_PROXY_HOST=host.lima.internal \
+      --setenv=CREDENTIAL_PROXY_PORT=$credential_proxy_port \
+      --setenv=CREDENTIAL_PROXY_SECRET='$_credential_proxy_secret' \
+      --setenv=CREDENTIAL_PROXY_DOMAINS='$intercepted_domains' \
+      /tmp/start-mitmproxy.sh
+  "
+
+  # Wait for mitmproxy to be ready (single session: launch + wait)
   limactl shell "$vm_name" bash -c '
     for i in $(seq 1 30); do
-      if curl -s --proxy http://127.0.0.1:8080 http://127.0.0.1:8080/p/200 >/dev/null 2>&1; then
-        exit 0
-      fi
-      # Also try just connecting to the port
       if bash -c "echo >/dev/tcp/127.0.0.1/8080" 2>/dev/null; then
+        echo "mitmproxy ready"
         exit 0
       fi
       sleep 0.2
     done
-    echo "Warning: mitmproxy may not be ready" >&2
-    exit 0
+    echo "ERROR: mitmproxy failed to start. Logs:" >&2
+    journalctl --user -u mitmproxy --no-pager -n 20 >&2
+    exit 1
   '
-  echo "mitmproxy started in VM"
 }
 
 _claude_vm_inject_git_credentials() {
@@ -595,6 +591,8 @@ _claude_vm_inject_git_credentials() {
     mkdir -p \$HOME
     echo 'https://x-access-token:placeholder@github.com' > \$HOME/.git-credentials
     chmod 600 \$HOME/.git-credentials
+    # Rewrite SSH URLs to HTTPS so all git traffic goes through mitmproxy
+    git config --global url.\"https://github.com/\".insteadOf \"git@github.com:\"
     ${git_name:+git config --global user.name \"$git_name\"}
     ${git_email:+git config --global user.email \"$git_email\"}
   "
@@ -603,10 +601,16 @@ _claude_vm_inject_git_credentials() {
 _claude_vm_inject_gh_credentials() {
   local vm_name="$1"
 
-  # Write gh hosts.yml with a placeholder token.
+  # Write gh config with placeholder token.
   # Real auth is injected by the host credential proxy via mitmproxy.
+  # config.yml must have version: "1" to prevent gh >=2.40 from attempting
+  # a multi-account migration that calls the GitHub API (which fails without proxy).
   limactl shell "$vm_name" bash -c '
     mkdir -p "$HOME/.config/gh"
+    cat > "$HOME/.config/gh/config.yml" << '\''CONFIG'\''
+version: "1"
+git_protocol: https
+CONFIG
     cat > "$HOME/.config/gh/hosts.yml" << '\''HOSTS'\''
 github.com:
     oauth_token: placeholder-token-injected-by-proxy
@@ -867,15 +871,9 @@ for s in p.sections():
       # Skip if same as main repo
       [ -n "$owner" ] && [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
 
-      # Skip token request for public repos (no auth needed for read-only access)
-      local http_code
-      http_code=$(curl -s -o /dev/null -w '%{http_code}' \
-        "https://api.github.com/repos/$sub_owner/$sub_repo") || true
-      if [ "$http_code" = "200" ]; then
-        echo "  Submodule $sub_owner/$sub_repo is public, skipping token request"
-        continue
-      fi
-
+      # Request a scoped token for this submodule. The device flow will succeed
+      # only if the user has the GitHub App installed on this repo (implying write access).
+      # If the app isn't installed or the user lacks access, the request fails gracefully.
       echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
       sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
         user-token --client-id Iv23liisR1WdpJmDUPLT \
@@ -1117,10 +1115,13 @@ _agent_vm_run() {
     _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
   fi
 
-  # Build credential rules and start unified proxy
+  # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
   _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
-  _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+  local _credential_proxy_port=""
+  if [ "$_credential_rules" != "[]" ]; then
+    _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+  fi
 
   # Security: snapshot before session
   security_snapshot="$(mktemp)"
@@ -1203,24 +1204,28 @@ _agent_vm_run() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  _claude_vm_write_dummy_credentials "$vm_name"
+  [ -n "$_anthropic_token" ] && _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
-  # Set up mitmproxy (CA cert, system trust, proxy env vars)
-  echo "Setting up mitmproxy..."
-  _claude_vm_setup_mitmproxy "$vm_name"
+  # Start proxy chain only if there are credential rules
+  if [ -n "$_credential_rules" ] && [ "$_credential_rules" != "[]" ]; then
+    # Set up mitmproxy (CA cert, system trust, proxy env vars)
+    echo "Setting up mitmproxy..."
+    _claude_vm_setup_mitmproxy "$vm_name"
 
-  # Build intercepted domains list from credential rules
-  local _intercepted_domains
-  _intercepted_domains=$(python3 -c "
+    # Build intercepted domains list from credential rules
+    local _intercepted_domains
+    _intercepted_domains=$(python3 -c "
 import json, sys
 rules = json.loads(sys.argv[1])
-print('|'.join(r['domain'] for r in rules))
+seen = dict.fromkeys(r['domain'] for r in rules)
+print(','.join(seen))
 " "$_credential_rules")
 
-  _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+    _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+  fi
 
   if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
     _claude_vm_inject_git_credentials "$vm_name"
@@ -1346,10 +1351,13 @@ _agent_vm_shell() {
     _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
   fi
 
-  # Build credential rules and start unified proxy
+  # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
   _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
-  _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+  local _credential_proxy_port=""
+  if [ "$_credential_rules" != "[]" ]; then
+    _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+  fi
 
   # Security: snapshot before session
   security_snapshot="$(mktemp)"
@@ -1429,24 +1437,28 @@ _agent_vm_shell() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  _claude_vm_write_dummy_credentials "$vm_name"
+  [ -n "$_anthropic_token" ] && _claude_vm_write_dummy_credentials "$vm_name"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
 
-  # Set up mitmproxy (CA cert, system trust, proxy env vars)
-  echo "Setting up mitmproxy..."
-  _claude_vm_setup_mitmproxy "$vm_name"
+  # Start proxy chain only if there are credential rules
+  if [ -n "$_credential_rules" ] && [ "$_credential_rules" != "[]" ]; then
+    # Set up mitmproxy (CA cert, system trust, proxy env vars)
+    echo "Setting up mitmproxy..."
+    _claude_vm_setup_mitmproxy "$vm_name"
 
-  # Build intercepted domains list from credential rules
-  local _intercepted_domains
-  _intercepted_domains=$(python3 -c "
+    # Build intercepted domains list from credential rules
+    local _intercepted_domains
+    _intercepted_domains=$(python3 -c "
 import json, sys
 rules = json.loads(sys.argv[1])
-print('|'.join(r['domain'] for r in rules))
+seen = dict.fromkeys(r['domain'] for r in rules)
+print(','.join(seen))
 " "$_credential_rules")
 
-  _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+    _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+  fi
 
   if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
     _claude_vm_inject_git_credentials "$vm_name"
@@ -1466,8 +1478,10 @@ print('|'.join(r['domain'] for r in rules))
   fi
 
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
-  echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
-  echo "mitmproxy: http://127.0.0.1:8080 (inside VM)"
+  if [ -n "$_credential_proxy_port" ]; then
+    echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
+    echo "mitmproxy: http://127.0.0.1:8080 (inside VM)"
+  fi
   if [ "$agent" = "opencode" ]; then
     echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   fi
