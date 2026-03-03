@@ -14,6 +14,10 @@
 
 CLAUDE_VM_TEMPLATE="claude-template"
 
+# Capture script directory at source time — BASH_SOURCE[0] is only reliable
+# at the top level in zsh; inside functions it may resolve to empty/cwd.
+AGENT_VM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 _agent_vm_state_root() {
   if [ -n "${AGENT_VM_STATE_DIR:-}" ]; then
     printf '%s\n' "$AGENT_VM_STATE_DIR"
@@ -413,7 +417,7 @@ CIEOF
 _claude_vm_start_proxy() {
   local host_dir="$1"
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir="$AGENT_VM_SCRIPT_DIR"
 
   echo "Starting API proxy..."
   exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
@@ -583,7 +587,7 @@ sys.exit(1)
 _claude_vm_start_github_mcp() {
   local host_dir="$1"
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir="$AGENT_VM_SCRIPT_DIR"
 
   local repos_json='{}'
   local owner="" repo=""
@@ -1127,7 +1131,7 @@ _agent_vm_run() {
     # Start balloon daemon only if balloon device is present
     if $_has_balloon; then
       local _balloon_script
-      _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+      _balloon_script="$AGENT_VM_SCRIPT_DIR/balloon-daemon.py"
       local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
       local _balloon_daemon_args=()
       if [ -n "$max_memory" ]; then
@@ -1189,7 +1193,7 @@ _agent_vm_run() {
   fi
 
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir="$AGENT_VM_SCRIPT_DIR"
   if [ "$agent" = "opencode" ]; then
     CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
@@ -1343,7 +1347,7 @@ _agent_vm_shell() {
     # Start balloon daemon only if balloon device is present
     if $_has_balloon; then
       local _balloon_script
-      _balloon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/balloon-daemon.py"
+      _balloon_script="$AGENT_VM_SCRIPT_DIR/balloon-daemon.py"
       local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
       local _balloon_daemon_args=()
       if [ -n "$max_memory" ]; then
@@ -1411,7 +1415,7 @@ _agent_vm_shell() {
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir="$AGENT_VM_SCRIPT_DIR"
   CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
     limactl shell --workdir "$host_dir" "$vm_name" \
     env "${shell_env[@]}" \
@@ -1431,7 +1435,7 @@ _agent_vm_memory() {
   fi
 
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir="$AGENT_VM_SCRIPT_DIR"
 
   if [ $# -eq 0 ]; then
     # List running VMs with current balloon size
