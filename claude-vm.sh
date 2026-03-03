@@ -16,7 +16,7 @@ CLAUDE_VM_TEMPLATE="claude-template"
 
 # Capture script directory at source time — BASH_SOURCE[0] is only reliable
 # at the top level in zsh; inside functions it may resolve to empty/cwd.
-AGENT_VM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 _agent_vm_state_root() {
   if [ -n "${AGENT_VM_STATE_DIR:-}" ]; then
@@ -416,11 +416,8 @@ CIEOF
 
 _claude_vm_start_proxy() {
   local host_dir="$1"
-  local script_dir
-  script_dir="$AGENT_VM_SCRIPT_DIR"
-
   echo "Starting API proxy..."
-  exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
+  exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$SCRIPT_DIR/claude-vm-proxy.py")
   _claude_vm_proxy_pid=$!
   if ! read -r -t 5 _claude_vm_proxy_port <&3; then
     echo "Error: API proxy failed to start." >&2
@@ -586,9 +583,6 @@ sys.exit(1)
 
 _claude_vm_start_github_mcp() {
   local host_dir="$1"
-  local script_dir
-  script_dir="$AGENT_VM_SCRIPT_DIR"
-
   local repos_json='{}'
   local owner="" repo=""
 
@@ -600,7 +594,7 @@ _claude_vm_start_github_mcp() {
     if [ -n "$owner" ] && [ -n "$repo" ]; then
       echo "Requesting GitHub token for $owner/$repo..."
       local token
-      token=$(python3 "$script_dir/github_app_token_demo.py" \
+      token=$(python3 "$SCRIPT_DIR/github_app_token_demo.py" \
         user-token --client-id Iv23liisR1WdpJmDUPLT \
         --repo "$repo_url" --token-only \
         --cache-dir "$HOME/.cache/claude-vm") || true
@@ -643,7 +637,7 @@ for s in p.sections():
       fi
 
       echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
-      sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
+      sub_token=$(python3 "$SCRIPT_DIR/github_app_token_demo.py" \
         user-token --client-id Iv23liisR1WdpJmDUPLT \
         --repo "$sub_url" --token-only \
         --cache-dir "$HOME/.cache/claude-vm") || true
@@ -671,7 +665,7 @@ print(json.dumps(d))
   echo "Starting GitHub MCP proxy..."
   exec 4< <(GITHUB_MCP_PROXY_REPOS="$repos_json" \
     GITHUB_MCP_PROXY_DEBUG="${GITHUB_MCP_PROXY_DEBUG:-0}" \
-    python3 "$script_dir/github-mcp-proxy.py")
+    python3 "$SCRIPT_DIR/github-mcp-proxy.py")
   _claude_vm_github_mcp_pid=$!
   if ! read -r -t 5 _claude_vm_github_mcp_port <&4; then
     echo "Warning: GitHub MCP proxy failed to start" >&2
@@ -687,7 +681,7 @@ print(json.dumps(d))
   # Start Git HTTP proxy (injects per-repo tokens for main + submodules)
   echo "Starting Git HTTP proxy..."
   exec 5< <(GITHUB_GIT_PROXY_REPOS="$repos_json" \
-    python3 "$script_dir/github-git-proxy.py")
+    python3 "$SCRIPT_DIR/github-git-proxy.py")
   _claude_vm_git_proxy_pid=$!
   if ! read -r -t 5 _claude_vm_git_proxy_port <&5; then
     echo "Warning: Git HTTP proxy failed to start" >&2
@@ -1131,7 +1125,7 @@ _agent_vm_run() {
     # Start balloon daemon only if balloon device is present
     if $_has_balloon; then
       local _balloon_script
-      _balloon_script="$AGENT_VM_SCRIPT_DIR/balloon-daemon.py"
+      _balloon_script="$SCRIPT_DIR/balloon-daemon.py"
       local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
       local _balloon_daemon_args=()
       if [ -n "$max_memory" ]; then
@@ -1192,16 +1186,14 @@ _agent_vm_run() {
     limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
   fi
 
-  local script_dir
-  script_dir="$AGENT_VM_SCRIPT_DIR"
   if [ "$agent" = "opencode" ]; then
-    CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
       env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
       opencode "${args[@]}"
   else
     local claude_args=("${args[@]}")
-    CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
       IS_SANDBOX=1 \
@@ -1347,7 +1339,7 @@ _agent_vm_shell() {
     # Start balloon daemon only if balloon device is present
     if $_has_balloon; then
       local _balloon_script
-      _balloon_script="$AGENT_VM_SCRIPT_DIR/balloon-daemon.py"
+      _balloon_script="$SCRIPT_DIR/balloon-daemon.py"
       local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
       local _balloon_daemon_args=()
       if [ -n "$max_memory" ]; then
@@ -1414,9 +1406,7 @@ _agent_vm_shell() {
   if [ "$agent" = "opencode" ]; then
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi
-  local script_dir
-  script_dir="$AGENT_VM_SCRIPT_DIR"
-  CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
+  CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
     limactl shell --workdir "$host_dir" "$vm_name" \
     env "${shell_env[@]}" \
     bash -l
@@ -1434,9 +1424,6 @@ _agent_vm_memory() {
     return 1
   fi
 
-  local script_dir
-  script_dir="$AGENT_VM_SCRIPT_DIR"
-
   if [ $# -eq 0 ]; then
     # List running VMs with current balloon size
     local vm found=false
@@ -1446,7 +1433,7 @@ _agent_vm_memory() {
       local sock="$HOME/.lima/$vm/qmp.sock"
       if [ -S "$sock" ]; then
         local size
-        size=$(python3 "$script_dir/balloon-daemon.py" "$sock" get 2>/dev/null) || size="?"
+        size=$(python3 "$SCRIPT_DIR/balloon-daemon.py" "$sock" get 2>/dev/null) || size="?"
         echo "$vm: $size"
         found=true
       fi
@@ -1488,9 +1475,9 @@ _agent_vm_memory() {
   fi
 
   if [ -z "$target" ]; then
-    python3 "$script_dir/balloon-daemon.py" "$qmp_sock" get
+    python3 "$SCRIPT_DIR/balloon-daemon.py" "$qmp_sock" get
   else
-    python3 "$script_dir/balloon-daemon.py" "$qmp_sock" set "$target"
+    python3 "$SCRIPT_DIR/balloon-daemon.py" "$qmp_sock" set "$target"
   fi
 }
 
