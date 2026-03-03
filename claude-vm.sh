@@ -818,6 +818,20 @@ sys.exit(1)
 " "$1"
 }
 
+_claude_vm_check_push_access() {
+  # Check if the user has push access to a GitHub repo via git push --dry-run.
+  # Works with both SSH and HTTPS host credentials. No API token needed.
+  # Returns 0 (true) if push access, 1 (false) if no push access or no local clone.
+  local host_dir="$1"
+  [ -z "$host_dir" ] && return 1
+
+  local push_output
+  push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD 2>&1) && return 0
+  # "non-fast-forward" or "up to date" = have push access (server rejected the ref, not the auth)
+  echo "$push_output" | grep -qiE 'non-fast-forward|up to date|Everything up-to-date' && return 0
+  return 1
+}
+
 _claude_vm_get_github_token() {
   # Acquire a GitHub token for the project and its submodules.
   # Sets _claude_vm_github_token (first repo's token) and _claude_vm_github_repos_json.
@@ -835,45 +849,57 @@ _claude_vm_get_github_token() {
   if [ -n "$repo_url" ]; then
     read -r owner repo < <(_claude_vm_parse_github_remote "$repo_url") || true
     if [ -n "$owner" ] && [ -n "$repo" ]; then
-      echo "Requesting GitHub token for $owner/$repo..."
-      local token
-      token=$(python3 "$script_dir/github_app_token_demo.py" \
-        user-token --client-id Iv23liisR1WdpJmDUPLT \
-        --repo "$repo_url" --token-only \
-        --cache-dir "$HOME/.cache/claude-vm") || true
-      if [ -n "$token" ]; then
-        _claude_vm_github_token="$token"
-        repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
-          "$owner/$repo" "$token")
+      # Check push access before starting device auth flow
+      if ! _claude_vm_check_push_access "$host_dir"; then
+        echo "  $owner/$repo: no write access, skipping token request"
       else
-        echo "  Warning: no token for $owner/$repo"
+        echo "Requesting GitHub token for $owner/$repo..."
+        local token
+        token=$(python3 "$script_dir/github_app_token_demo.py" \
+          user-token --client-id Iv23liisR1WdpJmDUPLT \
+          --repo "$repo_url" --token-only \
+          --cache-dir "$HOME/.cache/claude-vm") || true
+        if [ -n "$token" ]; then
+          _claude_vm_github_token="$token"
+          repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
+            "$owner/$repo" "$token")
+        else
+          echo "  Warning: no token for $owner/$repo"
+        fi
       fi
     fi
   fi
 
   # Detect GitHub submodules from .gitmodules
   if [ -f "$host_dir/.gitmodules" ]; then
-    local sub_urls
-    sub_urls=$(python3 -c "
+    local sub_entries
+    # Print "url<TAB>path" for each GitHub submodule
+    sub_entries=$(python3 -c "
 import configparser, sys
 p = configparser.ConfigParser()
 p.read(sys.argv[1])
 for s in p.sections():
     url = p.get(s, 'url', fallback='')
+    path = p.get(s, 'path', fallback='')
     if 'github.com' in url:
-        print(url)
+        print(f'{url}\t{path}')
 " "$host_dir/.gitmodules")
-    local sub_url sub_owner sub_repo sub_token
-    while IFS= read -r sub_url; do
+    local sub_url sub_path sub_owner sub_repo sub_token sub_dir
+    while IFS=$'\t' read -r sub_url sub_path; do
       [ -z "$sub_url" ] && continue
       read -r sub_owner sub_repo < <(_claude_vm_parse_github_remote "$sub_url") || continue
       [ -z "$sub_owner" ] || [ -z "$sub_repo" ] && continue
       # Skip if same as main repo
       [ -n "$owner" ] && [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
 
-      # Request a scoped token for this submodule. The device flow will succeed
-      # only if the user has the GitHub App installed on this repo (implying write access).
-      # If the app isn't installed or the user lacks access, the request fails gracefully.
+      # Check push access before requesting a scoped token
+      sub_dir=""
+      [ -n "$sub_path" ] && [ -d "$host_dir/$sub_path/.git" ] && sub_dir="$host_dir/$sub_path"
+      if ! _claude_vm_check_push_access "$sub_dir"; then
+        echo "  Submodule $sub_owner/$sub_repo: no write access, skipping token request"
+        continue
+      fi
+
       echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
       sub_token=$(python3 "$script_dir/github_app_token_demo.py" \
         user-token --client-id Iv23liisR1WdpJmDUPLT \
@@ -892,7 +918,7 @@ print(json.dumps(d))
       else
         echo "  Warning: no token for $sub_owner/$sub_repo (skipping credential injection)"
       fi
-    done <<< "$sub_urls"
+    done <<< "$sub_entries"
   fi
 
   # If no repos were configured, skip GitHub integration
