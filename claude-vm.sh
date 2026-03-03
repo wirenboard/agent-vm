@@ -250,7 +250,7 @@ _agent_vm_setup() {
   # sshfs is required for Lima's reverse-sshfs mounts; pre-installing it avoids
   # a slow apt-get update + install on every clone boot (~15s savings)
   limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git curl jq sshfs
+    git curl jq sshfs gh
 
   if ! $minimal; then
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -260,8 +260,7 @@ _agent_vm_setup() {
       unzip zip \
       ca-certificates \
       qemu-user-static binfmt-support \
-      mosquitto-clients \
-      gh
+      mosquitto-clients
 
     # Install Docker from official repo (includes docker compose)
     echo "Installing Docker..."
