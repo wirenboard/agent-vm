@@ -416,8 +416,14 @@ _claude_vm_start_proxy() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+  # Auto-detect local proxy (xray/v2ray/clash) for regions where direct access is blocked
+  local _proxy="${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
+  if [ -z "$_proxy" ] && ss -tlnH 2>/dev/null | grep -q '127.0.0.1:10808'; then
+    _proxy="http://127.0.0.1:10808"
+  fi
+
   echo "Starting API proxy..."
-  exec 3< <(CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
+  exec 3< <(HTTP_PROXY="$_proxy" CLAUDE_VM_PROXY_DEBUG="${CLAUDE_VM_PROXY_DEBUG:-0}" CLAUDE_VM_PROXY_LOG_DIR="$host_dir" python3 "$script_dir/claude-vm-proxy.py")
   _claude_vm_proxy_pid=$!
   if ! read -r -t 5 _claude_vm_proxy_port <&3; then
     echo "Error: API proxy failed to start." >&2
@@ -1201,6 +1207,7 @@ _agent_vm_run() {
     CLIPBOARD_DIR="$state_dir" python3 "$script_dir/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
       env ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" \
+      HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" no_proxy="*" \
       IS_SANDBOX=1 \
       ENABLE_LSP_TOOL=1 \
       claude --dangerously-skip-permissions "${claude_args[@]}"
@@ -1407,7 +1414,7 @@ _agent_vm_shell() {
     echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   fi
   echo "Type 'exit' to stop and delete the VM"
-  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" ENABLE_LSP_TOOL=1)
+  local shell_env=(ANTHROPIC_BASE_URL="http://host.lima.internal:${_claude_vm_proxy_port}" HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" no_proxy="*" ENABLE_LSP_TOOL=1)
   if [ "$agent" = "opencode" ]; then
     shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
   fi

@@ -25,6 +25,29 @@ import threading
 
 API_HOST = "api.anthropic.com"
 API_PORT = 443
+
+def _get_upstream_proxy():
+    """Return (host, port) for upstream HTTPS proxy from env, or None."""
+    from urllib.parse import urlparse
+    proxy_url = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                 or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"))
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    return (parsed.hostname, parsed.port or 8080)
+
+
+def _make_https_conn(host, port=443, timeout=30, context=None):
+    """Create HTTPSConnection, tunneling through upstream proxy if configured."""
+    if context is None:
+        context = ssl.create_default_context()
+    proxy = _get_upstream_proxy()
+    if proxy:
+        conn = http.client.HTTPSConnection(proxy[0], proxy[1], context=context, timeout=timeout)
+        conn.set_tunnel(host, port)
+    else:
+        conn = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
+    return conn
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 CREDENTIALS_DIR = os.path.expanduser("~/.claude")
 TOKEN_HOST = "platform.claude.com"
@@ -119,7 +142,7 @@ def _refresh_oauth_token(refresh_token):
 
     try:
         if _token_use_tls:
-            conn = http.client.HTTPSConnection(TOKEN_HOST, timeout=30)
+            conn = _make_https_conn(TOKEN_HOST, 443, timeout=30)
         else:
             conn = http.client.HTTPConnection(TOKEN_HOST, timeout=30)
         try:
@@ -356,7 +379,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         ctx = ssl.create_default_context()
         try:
             t0 = time.monotonic()
-            conn = http.client.HTTPSConnection(API_HOST, API_PORT, context=ctx, timeout=300)
+            conn = _make_https_conn(API_HOST, API_PORT, timeout=300, context=ctx)
             conn.request(self.command, self.path, body=body, headers=headers)
             upstream = conn.getresponse()
             latency_ms = (time.monotonic() - t0) * 1000
@@ -459,6 +482,13 @@ def main():
 
     server = QuietServer(("127.0.0.1", 0), ProxyHandler)
     port = server.server_address[1]
+
+    # Log upstream proxy info
+    proxy = _get_upstream_proxy()
+    if proxy:
+        print(f"Using upstream proxy: {proxy[0]}:{proxy[1]}", file=sys.stderr)
+    else:
+        print("No upstream proxy configured", file=sys.stderr)
 
     # Print port for parent process to capture, then flush
     print(port, flush=True)
