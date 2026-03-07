@@ -795,7 +795,9 @@ _claude_vm_print_config() {
     echo "Intercepted domains: $_intercepted_domains"
   fi
   if [ -n "$_oauth_token" ]; then
-    echo "CLAUDE_CODE_OAUTH_TOKEN=${_oauth_token:0:16}..."
+    local _truncated="${_oauth_token:0:16}"
+    [ ${#_oauth_token} -gt 16 ] && _truncated="${_truncated}..."
+    echo "VM env: CLAUDE_CODE_OAUTH_TOKEN=${_truncated}"
   fi
   if [ -n "${AI_HTTPS_PROXY:-}" ]; then
     echo "AI upstream proxy: $AI_HTTPS_PROXY"
