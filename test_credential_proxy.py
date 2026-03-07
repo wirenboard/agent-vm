@@ -17,6 +17,11 @@ import threading
 import unittest
 
 
+def _proxy_auth_header(secret):
+    """Build a Proxy-Authorization header value from a shared secret."""
+    return "Basic " + base64.b64encode(f"_:{secret}".encode()).decode()
+
+
 def _stop_proxy(proc):
     """Stop a credential proxy subprocess cleanly."""
     proc.send_signal(signal.SIGTERM)
@@ -339,12 +344,12 @@ class TestCredentialProxySecret(unittest.TestCase):
         cls.upstream_server.shutdown()
 
     def test_valid_secret_accepted(self):
-        """Request with correct X-Proxy-Token succeeds."""
+        """Request with correct Proxy-Authorization succeeds."""
         headers = {
             "X-Original-Host": "127.0.0.1",
             "X-Original-Port": str(self.upstream_port),
             "X-Original-Scheme": "http",
-            "X-Proxy-Token": self.secret,
+            "Proxy-Authorization": _proxy_auth_header(self.secret),
         }
         status, _, data = _proxy_request(self.proxy_port, "GET", "/test", headers)
         self.assertEqual(status, 200)
@@ -352,37 +357,37 @@ class TestCredentialProxySecret(unittest.TestCase):
         self.assertEqual(echo["headers"]["Authorization"], "Bearer secret-value")
 
     def test_missing_secret_rejected(self):
-        """Request without X-Proxy-Token returns 403."""
+        """Request without Proxy-Authorization returns 407."""
         headers = {
             "X-Original-Host": "127.0.0.1",
             "X-Original-Port": str(self.upstream_port),
             "X-Original-Scheme": "http",
         }
         status, _, data = _proxy_request(self.proxy_port, "GET", "/test", headers)
-        self.assertEqual(status, 403)
+        self.assertEqual(status, 407)
 
     def test_wrong_secret_rejected(self):
-        """Request with wrong X-Proxy-Token returns 403."""
+        """Request with wrong Proxy-Authorization returns 407."""
         headers = {
             "X-Original-Host": "127.0.0.1",
             "X-Original-Port": str(self.upstream_port),
             "X-Original-Scheme": "http",
-            "X-Proxy-Token": "wrong-secret",
+            "Proxy-Authorization": _proxy_auth_header("wrong-secret"),
         }
         status, _, data = _proxy_request(self.proxy_port, "GET", "/test", headers)
-        self.assertEqual(status, 403)
+        self.assertEqual(status, 407)
 
     def test_secret_not_forwarded_upstream(self):
-        """X-Proxy-Token is stripped before forwarding to upstream."""
+        """Proxy-Authorization is stripped before forwarding to upstream."""
         headers = {
             "X-Original-Host": "127.0.0.1",
             "X-Original-Port": str(self.upstream_port),
             "X-Original-Scheme": "http",
-            "X-Proxy-Token": self.secret,
+            "Proxy-Authorization": _proxy_auth_header(self.secret),
         }
         status, _, data = _proxy_request(self.proxy_port, "GET", "/test", headers)
         echo = json.loads(data)
-        self.assertNotIn("X-Proxy-Token", echo["headers"])
+        self.assertNotIn("Proxy-Authorization", echo["headers"])
 
 
 class TestCredentialProxyUnmatched(unittest.TestCase):
@@ -503,11 +508,11 @@ class TestBuildCredentialRules(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_single_repo(self):
-        """Single repo produces per-repo rules + fallback (4 github rules)."""
+        """Single repo produces anthropic + per-repo rules + fallback."""
         repos = json.dumps({"owner/repo": "ghu_test"})
         rules = self._build_rules("", repos)
-        # 2 per-repo (github.com + api.github.com) + 2 fallback = 4
-        self.assertEqual(len(rules), 4)
+        # 1 anthropic + 2 per-repo (github.com + api.github.com) + 2 fallback = 5
+        self.assertEqual(len(rules), 5)
         # Per-repo rules have path_prefix
         repo_rules = [r for r in rules if r.get("path_prefix")]
         self.assertEqual(len(repo_rules), 2)
@@ -516,8 +521,8 @@ class TestBuildCredentialRules(unittest.TestCase):
         """Multiple repos produce per-repo rules with different tokens."""
         repos = json.dumps({"org1/repo1": "token1", "org2/repo2": "token2"})
         rules = self._build_rules("", repos)
-        # 2 repos * 2 rules each + 2 fallback = 6
-        self.assertEqual(len(rules), 6)
+        # 1 anthropic + 2 repos * 2 rules each + 2 fallback = 7
+        self.assertEqual(len(rules), 7)
         # Check different path prefixes
         git_rules = [r for r in rules if r["domain"] == "github.com" and r.get("path_prefix")]
         prefixes = [r["path_prefix"] for r in git_rules]
@@ -552,7 +557,8 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["domain"], "api.anthropic.com")
         self.assertEqual(rules[0]["headers"]["Authorization"], "Bearer sk-ant-test")
-        self.assertEqual(rules[0]["headers"]["anthropic-beta"], "oauth-2025-04-20")
+        self.assertNotIn("anthropic-beta", rules[0]["headers"])
+        self.assertTrue(rules[0]["use_proxy"])
 
     def test_github_basic_auth_encoding(self):
         """GitHub token is base64-encoded as Basic auth for git."""
@@ -564,6 +570,7 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertTrue(auth.startswith("Basic "))
         decoded = base64.b64decode(auth.split(" ", 1)[1]).decode()
         self.assertEqual(decoded, "x-access-token:ghu_test")
+        self.assertFalse(github_rule.get("use_proxy", False))
 
     def test_github_api_token_auth(self):
         """api.github.com uses token auth."""
@@ -578,14 +585,18 @@ class TestBuildCredentialRules(unittest.TestCase):
         repos = json.dumps({"owner/repo": "ghu_test"})
         rules = self._build_rules("", repos)
         fallback = [r for r in rules if not r.get("path_prefix")]
-        self.assertEqual(len(fallback), 2)
+        # 1 anthropic + 2 github fallback = 3
+        self.assertEqual(len(fallback), 3)
         fallback_domains = {r["domain"] for r in fallback}
-        self.assertEqual(fallback_domains, {"github.com", "api.github.com"})
+        self.assertEqual(fallback_domains, {"api.anthropic.com", "github.com", "api.github.com"})
 
     def test_no_tokens(self):
-        """No tokens produce empty rules."""
+        """No tokens still produces Anthropic rule (for upstream proxy routing)."""
         rules = self._build_rules("", "")
-        self.assertEqual(len(rules), 0)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["domain"], "api.anthropic.com")
+        self.assertEqual(rules[0]["headers"], {})
+        self.assertTrue(rules[0]["use_proxy"])
 
 
 class TestCredentialProxyPathMatching(unittest.TestCase):
@@ -762,10 +773,10 @@ print("ALL_PASSED")
 
 
     def test_addon_injects_secret(self):
-        """Addon injects X-Proxy-Token when CREDENTIAL_PROXY_SECRET is set."""
+        """Addon injects Proxy-Authorization when CREDENTIAL_PROXY_SECRET is set."""
         result = subprocess.run(
             [sys.executable, "-c", """
-import os, types, sys
+import base64, os, types, sys
 
 mock_http = types.ModuleType("mitmproxy.http")
 class Headers(dict):
@@ -797,7 +808,8 @@ exec(compile(code, "mitmproxy-addon.py", "exec"), ns)
 flow = HTTPFlow()
 ns["request"](flow)
 
-assert flow.request.headers["X-Proxy-Token"] == "my-secret-token"
+expected = "Basic " + base64.b64encode(b"_:my-secret-token").decode()
+assert flow.request.headers["Proxy-Authorization"] == expected, flow.request.headers.get("Proxy-Authorization")
 print("ALL_PASSED")
 """],
             capture_output=True, text=True, timeout=5,
@@ -805,7 +817,7 @@ print("ALL_PASSED")
         self.assertIn("ALL_PASSED", result.stdout, f"stderr: {result.stderr}")
 
     def test_addon_no_secret_no_header(self):
-        """Addon does not inject X-Proxy-Token when secret is empty."""
+        """Addon does not inject Proxy-Authorization when secret is empty."""
         result = subprocess.run(
             [sys.executable, "-c", """
 import os, types, sys
@@ -840,7 +852,7 @@ exec(compile(code, "mitmproxy-addon.py", "exec"), ns)
 flow = HTTPFlow()
 ns["request"](flow)
 
-assert "X-Proxy-Token" not in flow.request.headers
+assert "Proxy-Authorization" not in flow.request.headers
 print("ALL_PASSED")
 """],
             capture_output=True, text=True, timeout=5,
@@ -893,6 +905,290 @@ print("ALL_PASSED")
             capture_output=True, text=True, timeout=5,
         )
         self.assertIn("ALL_PASSED", result.stdout, f"stderr: {result.stderr}")
+
+    def test_addon_blocks_blocked_domain(self):
+        """Addon returns 403 for blocked domains."""
+        result = subprocess.run(
+            [sys.executable, "-c", """
+import os, types, sys
+
+mock_http = types.ModuleType("mitmproxy.http")
+class Headers(dict):
+    pass
+class Request:
+    def __init__(self):
+        self.host = "datadoghq.com"
+        self.port = 443
+        self.scheme = "https"
+        self.headers = Headers()
+class Response:
+    @staticmethod
+    def make(status, body):
+        return {"status": status, "body": body}
+class HTTPFlow:
+    def __init__(self):
+        self.request = Request()
+        self.response = None
+mock_http.HTTPFlow = HTTPFlow
+mock_http.Response = Response
+sys.modules["mitmproxy"] = types.ModuleType("mitmproxy")
+sys.modules["mitmproxy.http"] = mock_http
+
+os.environ["CREDENTIAL_PROXY_HOST"] = "host.lima.internal"
+os.environ["CREDENTIAL_PROXY_PORT"] = "12345"
+os.environ["CREDENTIAL_PROXY_DOMAINS"] = "api.anthropic.com"
+os.environ["BLOCKED_DOMAINS"] = "datadoghq.com,telemetry.example.com"
+
+sys.path.insert(0, ".")
+with open("mitmproxy-addon.py") as f:
+    code = f.read()
+ns = {"__name__": "mitmproxy_addon"}
+exec(compile(code, "mitmproxy-addon.py", "exec"), ns)
+
+flow = HTTPFlow()
+ns["request"](flow)
+
+assert flow.response is not None, "blocked domain should get a response"
+assert flow.response["status"] == 403
+assert flow.request.host == "datadoghq.com", "host should not be rewritten"
+print("ALL_PASSED")
+"""],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertIn("ALL_PASSED", result.stdout, f"stderr: {result.stderr}")
+
+
+class TestCredentialProxyUpstreamProxy(unittest.TestCase):
+    """Tests that AI_HTTPS_PROXY routes upstream connections through a CONNECT proxy."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Start a mock CONNECT proxy that records the tunnel target
+        # and forwards to our echo server.
+        cls.upstream_server, cls.upstream_port = _start_mock_upstream(EchoHandler)
+        cls.connect_proxy_server, cls.connect_proxy_port = _start_connect_proxy(
+            cls.upstream_port)
+
+        cls.rules = [
+            {"domain": "tunneled.example.com", "headers": {"Authorization": "Bearer tunneled"},
+             "use_proxy": True},
+        ]
+        # Start credential proxy with AI_HTTPS_PROXY pointing at our mock CONNECT proxy
+        # We use X-Original-Scheme: http in tests to avoid real TLS, but the proxy
+        # code path for HTTPS+AI_HTTPS_PROXY uses set_tunnel which requires the target
+        # to actually do TLS. So we test via a subprocess that patches the connection.
+        cls.proxy_proc, cls.proxy_port = _start_credential_proxy(
+            cls.rules,
+            env_extra={
+                "AI_HTTPS_PROXY": f"http://proxyuser:proxypass@127.0.0.1:{cls.connect_proxy_port}",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        _stop_proxy(cls.proxy_proc)
+        cls.connect_proxy_server.shutdown()
+        cls.upstream_server.shutdown()
+
+    def test_https_routed_through_connect_proxy(self):
+        """HTTPS upstream requests go through the CONNECT proxy."""
+        # We can't do real TLS to our mock upstream, so we test the HTTP path
+        # (HTTPS_PROXY only applies to scheme=https). Instead, verify the proxy
+        # parsed correctly by hitting an HTTP upstream (bypasses HTTPS_PROXY)
+        # and separately test CONNECT proxy via a dedicated subprocess test.
+        headers = {
+            "X-Original-Host": "127.0.0.1",
+            "X-Original-Port": str(self.upstream_port),
+            "X-Original-Scheme": "http",
+        }
+        status, _, data = _proxy_request(self.proxy_port, "GET", "/test", headers)
+        self.assertEqual(status, 200)
+        # HTTP scheme should bypass the HTTPS_PROXY and go direct
+        echo = json.loads(data)
+        self.assertEqual(echo["path"], "/test")
+
+
+class _ConnectProxyHandler(http.server.BaseHTTPRequestHandler):
+    """Mock HTTP CONNECT proxy. Records tunnel targets and relays to upstream."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_CONNECT(self):
+        # Record that a CONNECT was requested
+        self.server.last_connect_target = self.path
+        self.server.last_proxy_auth = self.headers.get("Proxy-Authorization", "")
+
+        # Parse target host:port
+        host, _, port = self.path.partition(":")
+        port = int(port) if port else 443
+
+        # For testing, we just relay to our local echo server
+        import socket
+        try:
+            upstream_sock = socket.create_connection(("127.0.0.1", self.server.echo_port), timeout=5)
+        except Exception as e:
+            self.send_error(502, f"Cannot connect: {e}")
+            return
+
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+
+        # Relay bytes between client and upstream
+        client_sock = self.connection
+        client_sock.setblocking(False)
+        upstream_sock.setblocking(False)
+
+        import select
+        while True:
+            readable, _, _ = select.select([client_sock, upstream_sock], [], [], 5)
+            if not readable:
+                break
+            done = False
+            for sock in readable:
+                try:
+                    data = sock.recv(8192)
+                    if not data:
+                        done = True
+                        break
+                    if sock is client_sock:
+                        upstream_sock.sendall(data)
+                    else:
+                        client_sock.sendall(data)
+                except (BlockingIOError, ConnectionResetError, BrokenPipeError):
+                    done = True
+                    break
+            if done:
+                break
+        upstream_sock.close()
+
+
+def _start_connect_proxy(echo_port):
+    """Start a mock CONNECT proxy that relays to the given echo port."""
+    server = http.server.HTTPServer(("127.0.0.1", 0), _ConnectProxyHandler)
+    server.daemon_threads = True
+    server.echo_port = echo_port
+    server.last_connect_target = None
+    server.last_proxy_auth = None
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, server.server_address[1]
+
+
+class TestCredentialProxyConnectTunnel(unittest.TestCase):
+    """End-to-end test: credential proxy tunnels HTTPS through a CONNECT proxy."""
+
+    def test_connect_tunnel_with_auth(self):
+        """Credential proxy sends CONNECT with Proxy-Authorization to upstream proxy."""
+        upstream_server, upstream_port = _start_mock_upstream(EchoHandler)
+        connect_server, connect_port = _start_connect_proxy(upstream_port)
+
+        # Run a short-lived credential proxy subprocess that patches
+        # HTTPSConnection.connect to skip TLS (our mock doesn't do TLS).
+        result = subprocess.run(
+            [sys.executable, "-c", f"""
+import http.client, json, os, sys
+from unittest.mock import patch
+
+os.environ["CREDENTIAL_PROXY_RULES"] = json.dumps([
+    {{"domain": "target.example.com", "headers": {{"Authorization": "Bearer test"}},
+      "use_proxy": True}}
+])
+os.environ["AI_HTTPS_PROXY"] = "http://testuser:testpass@127.0.0.1:{connect_port}"
+os.environ.pop("CREDENTIAL_PROXY_SECRET", None)
+
+# Patch HTTPSConnection.connect to do TCP + CONNECT tunnel but skip TLS wrap.
+# HTTPConnection.connect() already handles both TCP and _tunnel().
+def _patched_connect(self):
+    http.client.HTTPConnection.connect(self)
+
+with patch.object(http.client.HTTPSConnection, 'connect', _patched_connect):
+    sys.path.insert(0, ".")
+    import importlib
+    spec = importlib.util.spec_from_file_location("credential_proxy", "credential-proxy.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    server = mod.QuietServer(("127.0.0.1", 0), mod.CredentialProxyHandler)
+    port = server.server_address[1]
+
+    import threading
+    t = threading.Thread(target=server.handle_request, daemon=True)
+    t.start()
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/test", headers={{
+        "X-Original-Host": "target.example.com",
+        "X-Original-Port": "{upstream_port}",
+        "X-Original-Scheme": "https",
+    }})
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+
+    echo = json.loads(body)
+    assert resp.status == 200, f"status={{resp.status}} body={{body}}"
+    assert echo["headers"]["Authorization"] == "Bearer test"
+    assert echo["headers"]["Host"] == "target.example.com"
+    print("TUNNEL_PASSED")
+"""],
+            capture_output=True, text=True, timeout=10,
+        )
+        upstream_server.shutdown()
+        connect_server.shutdown()
+
+        self.assertIn("TUNNEL_PASSED", result.stdout,
+                       f"stdout: {result.stdout}\nstderr: {result.stderr}")
+
+        # Verify the CONNECT proxy saw the right target and auth
+        self.assertEqual(connect_server.last_connect_target,
+                         f"target.example.com:{upstream_port}")
+        expected_auth = "Basic " + base64.b64encode(b"testuser:testpass").decode()
+        self.assertEqual(connect_server.last_proxy_auth, expected_auth)
+
+
+class TestCredentialProxyExtraCACerts(unittest.TestCase):
+    """Tests for SSL_CERT_FILE env var."""
+
+    def test_extra_ca_certs_loaded(self):
+        """Proxy starts successfully with SSL_CERT_FILE pointing to a valid PEM."""
+        import tempfile
+        # Create a dummy CA cert (self-signed) to verify it loads without error
+        result = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/dev/null",
+             "-out", "/dev/stdout", "-days", "1", "-nodes",
+             "-subj", "/CN=test-ca"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            self.skipTest("openssl not available")
+
+        with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as f:
+            f.write(result.stdout)
+            ca_path = f.name
+
+        try:
+            rules = [{"domain": "test.example", "headers": {}}]
+            proc, port = _start_credential_proxy(
+                rules, env_extra={"AI_SSL_CERT_FILE": ca_path})
+            # If we get here, the proxy started successfully with the extra CA
+            _stop_proxy(proc)
+        finally:
+            os.unlink(ca_path)
+
+    def test_invalid_ca_cert_fails(self):
+        """Proxy fails to start with invalid SSL_CERT_FILE path."""
+        env = os.environ.copy()
+        env["CREDENTIAL_PROXY_RULES"] = json.dumps([{"domain": "t", "headers": {}}])
+        env["AI_SSL_CERT_FILE"] = "/nonexistent/ca.pem"
+        proc = subprocess.Popen(
+            [sys.executable, "credential-proxy.py"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        proc.wait(timeout=5)
+        self.assertNotEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

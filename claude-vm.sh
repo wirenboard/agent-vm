@@ -428,14 +428,16 @@ import base64, json, sys
 rules = []
 anthropic_token = sys.argv[1]
 repos = json.loads(sys.argv[2]) if sys.argv[2] else {}
+# Always intercept api.anthropic.com (for upstream proxy routing via use_proxy).
+# Inject Authorization only if a token is provided.
+anthropic_headers = {}
 if anthropic_token:
-    rules.append({
-        'domain': 'api.anthropic.com',
-        'headers': {
-            'Authorization': f'Bearer {anthropic_token}',
-            'anthropic-beta': 'oauth-2025-04-20'
-        }
-    })
+    anthropic_headers['Authorization'] = f'Bearer {anthropic_token}'
+rules.append({
+    'domain': 'api.anthropic.com',
+    'headers': anthropic_headers,
+    'use_proxy': True,
+})
 for slug, token in repos.items():
     owner, repo = slug.split('/', 1)
     basic = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
@@ -556,6 +558,7 @@ LAUNCHER
       --setenv=CREDENTIAL_PROXY_PORT=$credential_proxy_port \
       --setenv=CREDENTIAL_PROXY_SECRET='$_credential_proxy_secret' \
       --setenv=CREDENTIAL_PROXY_DOMAINS='$intercepted_domains' \
+      --setenv=BLOCKED_DOMAINS='datadoghq.com' \
       /tmp/start-mitmproxy.sh
   "
 
@@ -733,13 +736,17 @@ XSHIM
   '
 }
 
-_claude_vm_write_dummy_credentials() {
+_claude_vm_write_oauth_token() {
   local vm_name="$1"
-  # Write dummy credentials so Claude Code detects a Max subscription
-  # (selects Opus model, etc.) — real auth is handled by the host proxy
-  limactl shell "$vm_name" bash -c 'mkdir -p ~/.claude && cat > ~/.claude/.credentials.json << '\''CREDS'\''
-{"claudeAiOauth":{"accessToken":"dummy","refreshToken":"dummy","expiresAt":9999999999999,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}
-CREDS'
+  local token="${2:-placeholder}"
+  # Set CLAUDE_CODE_OAUTH_TOKEN so Claude Code authenticates via the proxy.
+  # Real auth header is injected by the host credential proxy.
+  limactl shell "$vm_name" bash -c "
+    sudo tee /etc/profile.d/claude-oauth.sh > /dev/null <<EOF
+export CLAUDE_CODE_OAUTH_TOKEN=$token
+EOF
+    sudo chmod 644 /etc/profile.d/claude-oauth.sh
+  "
 }
 
 _claude_vm_setup_session_persistence() {
@@ -1230,7 +1237,7 @@ _agent_vm_run() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  [ -n "$_anthropic_token" ] && _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_write_oauth_token "$vm_name" "$_anthropic_token"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
@@ -1463,7 +1470,7 @@ _agent_vm_shell() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  [ -n "$_anthropic_token" ] && _claude_vm_write_dummy_credentials "$vm_name"
+  _claude_vm_write_oauth_token "$vm_name" "$_anthropic_token"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
   _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
   _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"

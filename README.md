@@ -148,7 +148,7 @@ VMs are ephemeral — each invocation creates a fresh clone and deletes it on ex
 
 1. A per-project state directory is created under `${XDG_STATE_HOME:-~/.local/state}/agent-vm/`
 2. Claude's session-related directories (`projects`, `file-history`, `todos`, `plans`) and `history.jsonl` are symlinked from `~/.claude/` to `<state-dir>/claude-sessions/`
-3. Ephemeral config (`.credentials.json`, `CLAUDE.md`) stays in-VM and is not persisted
+3. Ephemeral config (`CLAUDE.md`) stays in-VM and is not persisted
 4. `~/.claude.json` is persisted as `<state-dir>/claude-sessions/claude.json` to preserve onboarding/project state
 5. `hasCompletedOnboarding=true` is enforced before launch to prevent first-run greeting loops
 
@@ -171,105 +171,49 @@ OpenCode configuration is stored in `<state-dir>/opencode-config/opencode.json` 
 - GitHub MCP server (when available)
 - Autoupdates disabled
 
-## Claude API Proxy
+## Credential Proxy
 
-The host-side API proxy (`claude-vm-proxy.py`) keeps your Claude credentials out of the VM entirely. It reads OAuth tokens from the host's `~/.claude/.credentials.json` (or `ANTHROPIC_API_KEY` env var), injects them into requests, and forwards to `api.anthropic.com`. The VM only sees `ANTHROPIC_BASE_URL` pointing at the proxy.
+A two-layer proxy chain keeps all API credentials out of the VM:
 
-**OAuth token refresh:** When the OAuth access token is about to expire (within 5 minutes), the proxy automatically refreshes it using the standard OAuth `refresh_token` grant against `platform.claude.com`. The refreshed token is saved back to disk atomically (with file locking for concurrency safety). This uses only Python stdlib (`http.client`) — no external dependencies required.
+1. **mitmproxy** (inside VM, port 8080) — transparently intercepts HTTPS traffic to configured domains, redirects it to the host-side credential proxy. Requests to non-configured domains pass through unchanged. Requests to blocked domains (e.g. `datadoghq.com`) are rejected with 403.
+
+2. **credential-proxy.py** (on host) — receives redirected requests, injects real auth headers based on domain/path matching rules, and forwards to the real upstream. Supports per-repo GitHub tokens via path-prefix matching.
+
+The VM only ever sees placeholder tokens. Real credentials live in the host process's memory. A per-instance shared secret (via standard `Proxy-Authorization`) prevents cross-VM credential theft.
+
+### Configuration
 
 | Env var | Description | Default |
 |---------|-------------|---------|
-| `ANTHROPIC_API_KEY` | API key (takes priority over OAuth) | — |
-| `CLAUDE_VM_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
-| `CLAUDE_VM_PROXY_LOG_DIR` | Directory for log file | `.` |
+| `CLAUDE_VM_PROXY_ACCESS_TOKEN` | Anthropic API token to inject | — |
+| `AI_HTTPS_PROXY` | Upstream proxy for AI API traffic only (e.g. `http://user:pass@host:8082`) | — |
+| `AI_SSL_CERT_FILE` | Extra CA cert PEM for `AI_HTTPS_PROXY` | — |
+| `CREDENTIAL_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
+| `CREDENTIAL_PROXY_LOG_DIR` | Directory for log file | `.` |
+
+When `AI_HTTPS_PROXY` is set, only AI API requests (`api.anthropic.com`) are routed through it. GitHub and other traffic goes direct.
 
 ## GitHub Integration
 
 When you run `agent-vm claude` or `agent-vm opencode` inside a git repo with a GitHub remote, it automatically:
 
-1. Detects the repository from `git remote`
-2. Obtains a repo-scoped GitHub token via the device flow (browser-based OAuth)
-3. Starts two host-side proxies: one for the GitHub MCP Server, one for Git HTTP
-4. Configures the VM so both `git push`/`pull` and MCP tools work transparently
-5. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
+1. Detects the repository (and submodules) from `git remote`
+2. Checks push access via `git push --dry-run`
+3. Obtains repo-scoped GitHub tokens via the device flow (browser-based OAuth)
+4. Configures the credential proxy with per-repo path-prefix rules
+5. Rewrites SSH URLs to HTTPS so all git traffic goes through mitmproxy
+6. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
 
-No credentials are ever exposed to the VM. Both proxies inject the token on the host side and enforce repo scope.
+No credentials are ever exposed to the VM. The credential proxy injects tokens on the host side based on the request path (e.g. `/owner/repo` for git, `/repos/owner/repo` for the GitHub API).
 
 ### Token generation and scoping
 
 Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using the [device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow):
 
 1. **One-time setup**: Create a GitHub App with `contents: write` permission and install it on your org/account. The App's Client ID is configured in `claude-vm.sh`.
-2. **Per-session**: `github_app_token_demo.py` initiates the device flow — you approve in a browser, and a user access token is returned.
-3. **Repo scoping**: The `--repo` flag resolves the repository's numeric ID and passes it as `repository_id` during the OAuth token exchange. GitHub scopes the resulting token to that single repository at the API level.
-4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired, so you only need to re-authorize when the refresh token expires.
-
-### Git HTTP Proxy
-
-The Git HTTP proxy (`github-git-proxy.py`) lets the VM push and pull via standard git commands without SSH keys or tokens in the VM.
-
-**How it works:**
-
-1. The proxy runs on the host, listening on HTTP
-2. `claude-vm.sh` configures git's `url.<proxy>.insteadOf` in the VM's `~/.gitconfig` to rewrite the repo's SSH and HTTPS URLs through the proxy
-3. The proxy injects Basic auth (`x-access-token:TOKEN`) for requests matching the configured repo
-4. Requests for other repos are forwarded without credentials (they fail auth on GitHub's side)
-5. The host's git `user.name` and `user.email` are copied into the VM
-
-**Configuration:**
-
-| Env var | Description | Default |
-|---------|-------------|---------|
-| `GITHUB_MCP_TOKEN` | GitHub token (required) | — |
-| `GITHUB_MCP_OWNER` | Repository owner (required) | — |
-| `GITHUB_MCP_REPO` | Repository name (required) | — |
-| `GITHUB_GIT_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
-| `GITHUB_GIT_PROXY_LOG_DIR` | Directory for log file | `.` |
-
-### GitHub MCP Proxy
-
-The GitHub MCP proxy (`github-mcp-proxy.py`) gives the VM access to GitHub's [MCP Server](https://github.com/github/github-mcp-server) for issues, PRs, code search, and other API operations.
-
-**Defense-in-depth:**
-
-Even though the token is already scoped to one repository by GitHub, the proxy adds multiple enforcement layers:
-
-| Layer | Mechanism |
-|-------|-----------|
-| **Owner/repo check** | Tool arguments with `owner`/`repo` must match the configured repo. Missing values are auto-injected. |
-| **Search query scoping** | `repo:OWNER/REPO` is injected into search queries. `org:` and `user:` qualifiers are rejected. |
-| **Tool allowlist** | Unknown tools are blocked by default (default-deny). Non-repo-scoped tools (`search_users`, `get_teams`, etc.) are blocked. |
-| **Server-side filtering** | `X-MCP-Toolsets` header limits GitHub's server to `repos,issues,pull_requests,git,labels` by default. |
-| **Lockdown mode** | `X-MCP-Lockdown` is enabled by default, hiding issue details from users without push access. |
-| **Header protection** | VM cannot override `X-MCP-*` headers — the proxy strips them before injecting host-configured values. |
-
-**Configuration:**
-
-| Env var | Description | Default |
-|---------|-------------|---------|
-| `GITHUB_MCP_TOKEN` | GitHub token (required) | — |
-| `GITHUB_MCP_OWNER` | Repository owner (required) | — |
-| `GITHUB_MCP_REPO` | Repository name (required) | — |
-| `GITHUB_MCP_TOOLSETS` | Comma-separated [toolsets](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md) | `repos,issues,pull_requests,git,labels` |
-| `GITHUB_MCP_TOOLS` | Comma-separated tool names (fine-grained) | *(all in allowed toolsets)* |
-| `GITHUB_MCP_READONLY` | Set to `1` for read-only mode | `0` |
-| `GITHUB_MCP_LOCKDOWN` | Set to `0` to disable lockdown | `1` |
-| `GITHUB_MCP_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
-
-### Standalone usage
-
-Both proxies can be run independently of agent-vm:
-
-```bash
-# MCP proxy
-GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
-  python3 github-mcp-proxy.py
-
-# Git HTTP proxy
-GITHUB_MCP_TOKEN=ghu_... GITHUB_MCP_OWNER=myorg GITHUB_MCP_REPO=myrepo \
-  python3 github-git-proxy.py
-# Both print the listening port to stdout
-```
+2. **Per-session**: The device flow runs for each repo that has push access — you approve in a browser.
+3. **Multi-repo**: Each repo gets its own scoped token. The credential proxy uses path-prefix matching to inject the right token per request.
+4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired.
 
 ## How it works
 

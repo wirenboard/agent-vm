@@ -126,7 +126,7 @@
 Перед запуском device auth flow для каждого репозитория (основного и подмодулей) проверяется наличие write-доступа через `git push --dry-run --no-verify origin HEAD`. Работает с любым типом хост-аутентификации (SSH-ключи, HTTPS-токены). Успешный exit code или отказ "non-fast-forward" / "up to date" означают наличие push-доступа. Репозитории без write-доступа пропускаются — device auth flow не запускается.
 
 **Условный запуск:**
-- `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан → фиктивные `.credentials.json` не создаются, Claude Code не запускается
+- `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (proxy всё равно подменяет Authorization)
 - Нет ни одного токена (ни Anthropic, ни GitHub) → credential-proxy и mitmproxy не запускаются, ВМ работает без прокси
 
 ## 6. Решения об архитектуре
@@ -144,7 +144,7 @@
 
 ### ADR-2: Per-repo авторизация через path_prefix
 
-- `api.anthropic.com` → `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`
+- `api.anthropic.com` → `Authorization: Bearer`
 - `github.com/owner/repo` → `Authorization: Basic <base64(x-access-token:TOKEN_FOR_REPO)>` (git HTTP)
 - `api.github.com/repos/owner/repo` → `Authorization: token <TOKEN_FOR_REPO>` (gh CLI, API)
 - `github.com` (fallback) → первый доступный токен

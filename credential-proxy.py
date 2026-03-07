@@ -15,11 +15,17 @@ Usage:
 
 Optional env vars:
     CREDENTIAL_PROXY_SECRET    Shared secret; if set, requests must include
-                               X-Proxy-Token header with this value (403 otherwise)
+                               Proxy-Authorization header (407 otherwise)
     CREDENTIAL_PROXY_DEBUG     Set to "1" for verbose logging
     CREDENTIAL_PROXY_LOG_DIR   Directory for log file (default: current dir)
+    AI_HTTPS_PROXY             Upstream proxy for AI API connections only
+                               (e.g. http://user:pass@localhost:8082)
+                               Only used for rules with "use_proxy": true
+    AI_SSL_CERT_FILE           Path to additional CA certificate PEM file
+                               (for AI_HTTPS_PROXY's TLS)
 """
 
+import base64
 import http.client
 import http.server
 import json
@@ -30,6 +36,7 @@ import sys
 import socketserver
 import threading
 import time
+from urllib.parse import urlparse, unquote
 
 MAX_REQUEST_BODY = 32 * 1024 * 1024  # 32 MB
 UPSTREAM_TIMEOUT = 300  # seconds
@@ -38,7 +45,26 @@ INBOUND_TIMEOUT = 60   # seconds
 PROXY_SECRET = os.environ.get("CREDENTIAL_PROXY_SECRET", "")
 DEBUG = os.environ.get("CREDENTIAL_PROXY_DEBUG", "0") == "1"
 LOG_DIR = os.environ.get("CREDENTIAL_PROXY_LOG_DIR", ".")
+AI_SSL_CERT_FILE = os.environ.get("AI_SSL_CERT_FILE", "")
 _log_file = None
+
+# Upstream proxy for AI API connections (rules with "use_proxy": true)
+_ai_proxy = None
+_AI_HTTPS_PROXY = os.environ.get("AI_HTTPS_PROXY", "")
+if _AI_HTTPS_PROXY:
+    _p = urlparse(_AI_HTTPS_PROXY)
+    _ai_proxy = {"host": _p.hostname, "port": _p.port or 8080}
+    if _p.username:
+        _creds = base64.b64encode(
+            f"{unquote(_p.username)}:{unquote(_p.password or '')}".encode()
+        ).decode()
+        _ai_proxy["auth"] = f"Basic {_creds}"
+
+# SSL contexts: one for AI proxy connections, one for direct connections
+_ssl_ctx = ssl.create_default_context()
+_ai_ssl_ctx = ssl.create_default_context()
+if AI_SSL_CERT_FILE:
+    _ai_ssl_ctx.load_verify_locations(AI_SSL_CERT_FILE)
 
 
 def _get_log_file():
@@ -67,10 +93,12 @@ def redact(value, show=8):
 
 
 # Parse credential rules from env
-# Each rule: {"domain": "...", "headers": {...}, "path_prefix": "/optional/prefix"}
+# Each rule: {"domain": "...", "headers": {...}, "path_prefix": "/optional/prefix",
+#             "use_proxy": true}
 # Multiple rules per domain are supported; longest matching path_prefix wins.
 # Rules without path_prefix match any path on that domain (fallback).
-_RULES = {}  # domain -> [{"headers": {...}, "path_prefix": str|None}, ...]
+# Rules with "use_proxy": true route through AI_HTTPS_PROXY.
+_RULES = {}  # domain -> [{"headers": {...}, "path_prefix": str|None, "use_proxy": bool}, ...]
 _rules_json = os.environ.get("CREDENTIAL_PROXY_RULES", "[]")
 try:
     for rule in json.loads(_rules_json):
@@ -78,6 +106,7 @@ try:
         entry = {
             "headers": rule.get("headers", {}),
             "path_prefix": rule.get("path_prefix"),
+            "use_proxy": rule.get("use_proxy", False),
         }
         _RULES.setdefault(domain, []).append(entry)
     # Sort each domain's rules: longest path_prefix first, None last
@@ -108,12 +137,13 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_request(self):
-        # Verify shared secret (prevents cross-VM credential theft)
+        # Verify shared secret via standard proxy auth (prevents cross-VM credential theft)
         if PROXY_SECRET:
-            token = self.headers.get("X-Proxy-Token", "")
-            if token != PROXY_SECRET:
-                debug(f"REJECTED: invalid X-Proxy-Token from {self.client_address[0]}")
-                self.send_error_response(403, "Invalid proxy token")
+            proxy_auth = self.headers.get("Proxy-Authorization", "")
+            expected = "Basic " + base64.b64encode(f"_:{PROXY_SECRET}".encode()).decode()
+            if proxy_auth != expected:
+                debug(f"REJECTED: invalid Proxy-Authorization from {self.client_address[0]}")
+                self.send_error_response(407, "Proxy authentication required")
                 return
 
         # Extract original host from mitmproxy header
@@ -145,7 +175,7 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             lower = key.lower()
             if lower in ("host", "accept-encoding",
                          "x-original-host", "x-original-port", "x-original-scheme",
-                         "x-proxy-token"):
+                         "proxy-authorization"):
                 continue
             if lower in header_keys_lower:
                 actual_key = header_keys_lower[lower]
@@ -184,14 +214,22 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     debug(f"  > {key}: {value}")
 
-        # Connect to upstream over HTTPS
-        upstream_port = original_port if original_port != 443 else 443
-        ctx = ssl.create_default_context()
+        # Connect to upstream (route through AI proxy if rule says so)
+        upstream_port = original_port
+        use_proxy = rule and rule.get("use_proxy") and _ai_proxy
         try:
             t0 = time.monotonic()
-            if original_scheme == "https":
+            if original_scheme == "https" and use_proxy:
                 conn = http.client.HTTPSConnection(
-                    original_host, upstream_port, context=ctx, timeout=UPSTREAM_TIMEOUT)
+                    _ai_proxy["host"], _ai_proxy["port"],
+                    context=_ai_ssl_ctx, timeout=UPSTREAM_TIMEOUT)
+                tunnel_headers = {}
+                if "auth" in _ai_proxy:
+                    tunnel_headers["Proxy-Authorization"] = _ai_proxy["auth"]
+                conn.set_tunnel(original_host, upstream_port, headers=tunnel_headers)
+            elif original_scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    original_host, upstream_port, context=_ssl_ctx, timeout=UPSTREAM_TIMEOUT)
             else:
                 conn = http.client.HTTPConnection(
                     original_host, upstream_port, timeout=UPSTREAM_TIMEOUT)
@@ -308,6 +346,10 @@ def main():
             rule_summary.append(f"{domain}{prefix or ''}")
     debug(f"Listening on port {port}")
     debug(f"Credential rules for: {', '.join(rule_summary)}")
+    if _ai_proxy:
+        debug(f"AI upstream proxy: {_ai_proxy['host']}:{_ai_proxy['port']}")
+    if AI_SSL_CERT_FILE:
+        debug(f"AI SSL cert: {AI_SSL_CERT_FILE}")
     server.serve_forever()
 
 
