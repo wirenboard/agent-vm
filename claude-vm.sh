@@ -736,9 +736,81 @@ XSHIM
   '
 }
 
+_claude_vm_post_boot_setup() {
+  # Shared post-boot setup for both claude-vm and claude-vm-shell.
+  # Uses variables from the calling function's scope:
+  #   vm_name, host_dir, state_dir, agent, use_github,
+  #   _anthropic_token, _credential_rules, _credential_proxy_port,
+  #   _credential_proxy_secret, _claude_vm_github_repos_json
+  # Sets: _oauth_token, _intercepted_domains
+
+  # Write oauth token if we have one, or a placeholder if AI_HTTPS_PROXY is set
+  # (Claude Code needs a token to route requests through the proxy chain)
+  _oauth_token="${_anthropic_token:-${AI_HTTPS_PROXY:+placeholder}}"
+  _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
+  _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
+  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
+  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
+
+  # Start proxy chain only if there are credential rules
+  _intercepted_domains=""
+  if [ -n "$_credential_rules" ] && [ "$_credential_rules" != "[]" ]; then
+    echo "Setting up mitmproxy..."
+    _claude_vm_setup_mitmproxy "$vm_name"
+
+    _intercepted_domains=$(python3 -c "
+import json, sys
+rules = json.loads(sys.argv[1])
+seen = dict.fromkeys(r['domain'] for r in rules)
+print(','.join(seen))
+" "$_credential_rules")
+
+    _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
+  fi
+
+  if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
+    _claude_vm_inject_git_credentials "$vm_name"
+    _claude_vm_inject_gh_credentials "$vm_name"
+    _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
+  fi
+
+  if [ "$agent" = "opencode" ]; then
+    _opencode_vm_setup_config "$vm_name" "$state_dir"
+    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _opencode_vm_setup_auth "$vm_name"
+  fi
+
+  # Run project-specific runtime script if it exists
+  if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
+    echo "Running project runtime setup..."
+    limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
+  fi
+}
+
+_claude_vm_print_config() {
+  # Print proxy/credential configuration summary.
+  # Uses variables from the calling function's scope.
+  if [ -n "$_credential_proxy_port" ]; then
+    echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
+    echo "Intercepted domains: $_intercepted_domains"
+  fi
+  if [ -n "$_oauth_token" ]; then
+    echo "CLAUDE_CODE_OAUTH_TOKEN=${_oauth_token:0:16}..."
+  fi
+  if [ -n "${AI_HTTPS_PROXY:-}" ]; then
+    echo "AI upstream proxy: $AI_HTTPS_PROXY"
+  fi
+  if [ -n "${AI_SSL_CERT_FILE:-}" ]; then
+    echo "AI SSL cert file: $AI_SSL_CERT_FILE"
+  fi
+}
+
 _claude_vm_write_oauth_token() {
   local vm_name="$1"
-  local token="${2:-placeholder}"
+  local token="$2"
+  if [ -z "$token" ]; then
+    return
+  fi
   # Set CLAUDE_CODE_OAUTH_TOKEN so Claude Code authenticates via the proxy.
   # Real auth header is injected by the host credential proxy.
   limactl shell "$vm_name" bash -c "
@@ -1237,46 +1309,8 @@ _agent_vm_run() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  _claude_vm_write_oauth_token "$vm_name" "$_anthropic_token"
-  _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
-  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
-  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
-
-  # Start proxy chain only if there are credential rules
-  if [ -n "$_credential_rules" ] && [ "$_credential_rules" != "[]" ]; then
-    # Set up mitmproxy (CA cert, system trust, proxy env vars)
-    echo "Setting up mitmproxy..."
-    _claude_vm_setup_mitmproxy "$vm_name"
-
-    # Build intercepted domains list from credential rules
-    local _intercepted_domains
-    _intercepted_domains=$(python3 -c "
-import json, sys
-rules = json.loads(sys.argv[1])
-seen = dict.fromkeys(r['domain'] for r in rules)
-print(','.join(seen))
-" "$_credential_rules")
-
-    _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
-  fi
-
-  if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
-    _claude_vm_inject_git_credentials "$vm_name"
-    _claude_vm_inject_gh_credentials "$vm_name"
-    _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
-  fi
-
-  if [ "$agent" = "opencode" ]; then
-    _opencode_vm_setup_config "$vm_name" "$state_dir"
-    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
-    _opencode_vm_setup_auth "$vm_name"
-  fi
-
-  # Run project-specific runtime script if it exists
-  if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
-    echo "Running project runtime setup..."
-    limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
-  fi
+  _claude_vm_post_boot_setup
+  _claude_vm_print_config
 
   # Update the agent tool to latest version before launching
   if [ "$agent" = "opencode" ]; then
@@ -1470,51 +1504,10 @@ _agent_vm_shell() {
     limactl start "$vm_name" &>/dev/null
   fi
 
-  _claude_vm_write_oauth_token "$vm_name" "$_anthropic_token"
-  _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
-  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
-  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
-
-  # Start proxy chain only if there are credential rules
-  if [ -n "$_credential_rules" ] && [ "$_credential_rules" != "[]" ]; then
-    # Set up mitmproxy (CA cert, system trust, proxy env vars)
-    echo "Setting up mitmproxy..."
-    _claude_vm_setup_mitmproxy "$vm_name"
-
-    # Build intercepted domains list from credential rules
-    local _intercepted_domains
-    _intercepted_domains=$(python3 -c "
-import json, sys
-rules = json.loads(sys.argv[1])
-seen = dict.fromkeys(r['domain'] for r in rules)
-print(','.join(seen))
-" "$_credential_rules")
-
-    _claude_vm_start_mitmproxy "$vm_name" "$_credential_proxy_port" "$_intercepted_domains"
-  fi
-
-  if $use_github && [ "$_claude_vm_github_repos_json" != '{}' ]; then
-    _claude_vm_inject_git_credentials "$vm_name"
-    _claude_vm_inject_gh_credentials "$vm_name"
-    _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
-  fi
-
-  if [ "$agent" = "opencode" ]; then
-    _opencode_vm_setup_config "$vm_name" "$state_dir"
-    _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
-    _opencode_vm_setup_auth "$vm_name"
-  fi
-
-  # Run project-specific runtime script if it exists
-  if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
-    limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
-  fi
+  _claude_vm_post_boot_setup
 
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
-  if [ -n "$_credential_proxy_port" ]; then
-    echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
-    echo "mitmproxy: http://127.0.0.1:8080 (inside VM)"
-  fi
+  _claude_vm_print_config
   if [ "$agent" = "opencode" ]; then
     echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   fi
