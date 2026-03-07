@@ -71,7 +71,7 @@
 **Конфигурация** (`CREDENTIAL_PROXY_RULES` env):
 ```json
 [
-  {"domain": "api.anthropic.com", "headers": {"Authorization": "Bearer sk-..."}},
+  {"domain": "api.anthropic.com", "headers": {"Authorization": "Bearer sk-..."}, "use_proxy": true},
   {"domain": "github.com", "path_prefix": "/org1/repo1", "headers": {"Authorization": "Basic <base64-token1>"}},
   {"domain": "github.com", "path_prefix": "/org2/repo2", "headers": {"Authorization": "Basic <base64-token2>"}},
   {"domain": "github.com", "headers": {"Authorization": "Basic <base64-fallback>"}},
@@ -83,16 +83,19 @@
 
 Опциональное поле `path_prefix` позволяет разные токены для разных репозиториев.
 Правила сортируются по длине префикса (longest match first), правила без префикса — fallback.
+Поле `use_proxy` маршрутизирует запрос через `AI_HTTPS_PROXY` (upstream proxy для AI API).
 
 **Поток обработки запроса:**
 1. Получить HTTP-запрос от mitmproxy
-2. Проверить `X-Proxy-Token` (если `CREDENTIAL_PROXY_SECRET` задан) → 403 при несовпадении
+2. Проверить `Proxy-Authorization: Basic` (если `CREDENTIAL_PROXY_SECRET` задан) → 403 при несовпадении
 3. Извлечь `X-Original-Host`, `X-Original-Port`, `X-Original-Scheme`
 4. Сопоставить домен + путь с правилами (longest path_prefix first)
 5. Перезаписать заголовки авторизации (удаляя существующие)
-6. Убрать `Accept-Encoding`, `X-Proxy-Token` из upstream-запроса
+6. Убрать `Accept-Encoding`, `Proxy-Authorization` из upstream-запроса
 7. Переслать на upstream по HTTPS
 8. Вернуть ответ (с re-chunking для стриминга)
+
+**Upstream proxy:** Правила с `"use_proxy": true` маршрутизируются через `AI_HTTPS_PROXY` (HTTP CONNECT tunnel). `AI_SSL_CERT_FILE` добавляет CA-сертификат для TLS-соединения с upstream proxy. Остальные правила (GitHub) идут напрямую.
 
 **Лимиты:** 32 МБ тело запроса, 300с таймаут upstream, 60с таймаут входящих.
 
@@ -103,7 +106,8 @@
 **Принцип работы:**
 - Фильтрация по `CREDENTIAL_PROXY_DOMAINS` (comma-separated) — только перечисленные домены перенаправляются на credential-proxy
 - Остальной трафик (pypi, npm, Docker Hub) проходит через mitmproxy без изменений к реальным upstream
-- Для перехваченных запросов: добавить `X-Original-*` и `X-Proxy-Token` заголовки, перенаправить на хост-прокси по HTTP
+- Для перехваченных запросов: добавить `X-Original-*` и `Proxy-Authorization: Basic` заголовки, перенаправить на хост-прокси по HTTP
+- Запросы к заблокированным доменам (`BLOCKED_DOMAINS`) отклоняются с 403
 
 **Запуск:** через `systemd-run --user` для выживания после завершения SSH-сессии `limactl shell`.
 
@@ -114,7 +118,7 @@
 2. Собрать `CREDENTIAL_PROXY_RULES` JSON (пропускается, если нет токенов)
 3. Запустить `credential-proxy.py` на хосте → получить порт (пропускается, если правила пусты)
 4. Клонировать и загрузить ВМ
-5. Записать фиктивные учётные данные Claude (только если `CLAUDE_VM_PROXY_ACCESS_TOKEN` задан)
+5. Записать `CLAUDE_CODE_OAUTH_TOKEN` env var (реальный токен или placeholder, если задан `AI_HTTPS_PROXY`)
 6. Сгенерировать CA-сертификат mitmproxy, установить в доверенные
 7. Установить прокси env vars через `/etc/profile.d/credential-proxy.sh`
 8. Запустить mitmdump с аддоном через `systemd-run --user`
@@ -126,8 +130,10 @@
 Перед запуском device auth flow для каждого репозитория (основного и подмодулей) проверяется наличие write-доступа через `git push --dry-run --no-verify origin HEAD`. Работает с любым типом хост-аутентификации (SSH-ключи, HTTPS-токены). Успешный exit code или отказ "non-fast-forward" / "up to date" означают наличие push-доступа. Репозитории без write-доступа пропускаются — device auth flow не запускается.
 
 **Условный запуск:**
-- `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (proxy всё равно подменяет Authorization)
-- Нет ни одного токена (ни Anthropic, ни GitHub) → credential-proxy и mitmproxy не запускаются, ВМ работает без прокси
+- `CLAUDE_VM_PROXY_ACCESS_TOKEN` задан → `CLAUDE_CODE_OAUTH_TOKEN=<token>` (proxy подменяет Authorization)
+- `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан, но `AI_HTTPS_PROXY` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (трафик маршрутизируется через upstream proxy)
+- Ни `CLAUDE_VM_PROXY_ACCESS_TOKEN`, ни `AI_HTTPS_PROXY` не заданы → `CLAUDE_CODE_OAUTH_TOKEN` не создаётся
+- Нет ни одного токена (ни Anthropic, ни GitHub) и нет `AI_HTTPS_PROXY` → credential-proxy и mitmproxy не запускаются, ВМ работает без прокси
 
 ## 6. Решения об архитектуре
 
@@ -184,7 +190,7 @@
 - credential-proxy через `CREDENTIAL_PROXY_SECRET` env var
 - mitmproxy через `CREDENTIAL_PROXY_SECRET` env var
 
-Аддон добавляет `X-Proxy-Token` к каждому запросу. Прокси проверяет его перед инъекцией — несовпадение → 403. Заголовок удаляется перед пересылкой upstream.
+Аддон добавляет `Proxy-Authorization: Basic <secret>` к каждому запросу. Прокси проверяет его перед инъекцией — несовпадение → 403. Заголовок удаляется перед пересылкой upstream.
 
 **Альтернатива:** Привязка к IP/порту — ненадёжна (ВМ делят сетевой стек хоста через Lima). Секрет проще и надёжнее.
 
@@ -200,17 +206,19 @@
 
 ## 8. Тестирование
 
-42 автоматических теста (`test_credential_proxy.py`):
+47 автоматических тестов (`test_credential_proxy.py`):
 
 - **TestCredentialProxy** (11) — инъекция заголовков, HTTP-методы, пути, дубликаты
 - **TestCredentialProxyErrors** (4) — 400/413/502 ошибки
-- **TestCredentialProxySecret** (4) — проверка секрета, 403 при несовпадении, strip перед upstream
+- **TestCredentialProxySecret** (4) — Proxy-Authorization проверка, 403 при несовпадении, strip перед upstream
 - **TestCredentialProxyUnmatched** (1) — домены без правил
 - **TestCredentialProxyStreaming** (1) — chunked-ответы
 - **TestCredentialProxyPathMatching** (4) — per-repo маршрутизация по path_prefix
-- **TestCredentialProxyPathMatching** (4) — per-repo маршрутизация по path_prefix
 - **TestCredentialProxyStartup** (3) — запуск, некорректный JSON, SIGTERM
-- **TestBuildCredentialRules** (9) — генерация per-repo правил из токенов
-- **TestMitmproxyAddon** (4) — перезапись flow, секрет
+- **TestCredentialProxyUpstreamProxy** (1) — per-rule маршрутизация через AI_HTTPS_PROXY
+- **TestCredentialProxyConnectTunnel** (1) — CONNECT-туннель с авторизацией upstream proxy
+- **TestCredentialProxyExtraCACerts** (2) — загрузка дополнительных CA-сертификатов
+- **TestBuildCredentialRules** (9) — генерация per-repo правил из токенов (включая always-emit api.anthropic.com)
+- **TestMitmproxyAddon** (6) — перезапись flow, секрет, блокировка доменов
 
-Запуск: `python3 -m unittest test_credential_proxy -v`
+Запуск: `python3 -m pytest test_credential_proxy.py -v`
