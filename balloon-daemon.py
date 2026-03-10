@@ -4,10 +4,57 @@ balloon-daemon.py — QEMU virtio-balloon controller.
 
 Connects to a QEMU QMP socket and manages the virtio-balloon device.
 
-Modes:
-  get              Query current balloon size
-  set <size>       Set balloon target (e.g., 8G, 4096M)
-  daemon [opts]    Monitor guest memory pressure and auto-adjust balloon
+Usage:
+  balloon-daemon.py <socket> get
+  balloon-daemon.py <socket> set <size>
+  balloon-daemon.py <socket> daemon [options]
+
+Arguments:
+  socket             Path to the QMP Unix socket (e.g. ~/.lima/vm/qmp.sock)
+
+Commands:
+  get                Query and print the current balloon size.
+  set <size>         Set the balloon to a fixed target size (e.g. 8G, 4096M).
+  daemon [options]   Continuously monitor guest memory pressure and auto-adjust
+                     the balloon to reclaim unused memory from the host while
+                     keeping enough headroom for the guest.
+
+Daemon options:
+  --max-memory SIZE  Upper bound / ceiling for the balloon. The guest will never
+                     be given more than this. Default: auto-detected from the
+                     current balloon size at startup (i.e. QEMU -m value).
+  --min-memory SIZE  Lower bound / floor. The guest will always have at least
+                     this much memory. Default: 1G.
+  --initial-target SIZE
+                     Set balloon to this size before entering the monitor loop.
+                     Useful for pre-inflating the balloon at boot. Default: none.
+  --headroom PCT     Keep at least this percentage of *used* memory as free
+                     headroom.  E.g. 40 means desired = used * 1.4.
+                     Default: 40.
+  --min-free SIZE    Minimum free memory to maintain. The balloon target will
+                     always be at least used + min-free, regardless of headroom
+                     percentage. Also serves as the emergency deflate threshold:
+                     if available memory drops below this, the balloon grows
+                     aggressively (2x step). Default: 1G.
+  --step SIZE        Base step size for emergency deflation. Normal adjustments
+                     jump directly to the desired target. Default: 256M.
+  --interval SECS    How often to poll guest memory stats and re-evaluate the
+                     balloon target, in seconds. Default: 5.
+  -v, --verbose      Log balloon decisions to stderr.
+
+Algorithm:
+  On each cycle the daemon computes:
+    used    = cur - avail        (actual app memory usage, excludes cache/balloon)
+    desired = max(used * (1 + headroom%), used + min_free)
+    desired = clamp(desired, min_memory, max_memory)
+
+  Then:
+    - If avail < min_free: emergency GROW by 2x step (guest critically low)
+    - If cur < desired - step: GROW — jump balloon to desired immediately
+    - If cur > desired + step: SHRINK — jump balloon to desired immediately
+  Both grow and shrink are fast (single-step jump to target).
+
+Sizes can be specified as: 8G, 8GiB, 8GB, 4096M, 4096MiB, 4096MB, or raw bytes.
 """
 
 import argparse
@@ -171,9 +218,14 @@ def cmd_daemon(args):
     q = _qmp_poll(args.socket, retries=30)
     log(f"Connected to {args.socket}")
 
-    # Determine max memory from current balloon (before any inflation)
+    # Determine max memory from QEMU's configured RAM (not balloon, which may
+    # have been shrunk by a previous daemon run)
     if max_mem is None:
-        max_mem = q.cmd("query-balloon").get("return", {}).get("actual", 0)
+        max_mem = (q.cmd("query-memory-size-summary")
+                   .get("return", {}).get("base-memory", 0))
+        if not max_mem:
+            # Fallback: use current balloon size
+            max_mem = q.cmd("query-balloon").get("return", {}).get("actual", 0)
         if not max_mem:
             print("Error: cannot determine VM memory size", file=sys.stderr)
             sys.exit(1)
@@ -212,12 +264,12 @@ def cmd_daemon(args):
             # Re-enable stats polling (gets reset on reconnect)
             q.cmd("qom-set", path=bp, property="guest-stats-polling-interval", value=iv)
 
-            stats = (q.cmd("qom-get", path=bp, property="guest-stats")
-                     .get("return", {}).get("stats", {}))
+            guest_stats = q.cmd("qom-get", path=bp, property="guest-stats").get("return", {})
+            stats = guest_stats.get("stats", {})
             avail = stats.get("stat-available-memory", -1)
             total = stats.get("stat-total-memory", -1)
 
-            if avail <= 0 or total <= 0:
+            if total <= 0 or avail < 0:
                 log("Waiting for guest stats...")
                 q.close()
                 time.sleep(iv)
@@ -229,7 +281,7 @@ def cmd_daemon(args):
             # at boot and includes balloon-claimed pages.
             cur = q.cmd("query-balloon").get("return", {}).get("actual", max_mem)
             used = max(0, cur - avail)
-            desired = int(used * (1 + headroom))
+            desired = max(int(used * (1 + headroom)), used + min_free)
             desired = max(min_mem, min(max_mem, desired))
 
             log(f"used={fmt(used)} avail={fmt(avail)} "
@@ -237,15 +289,16 @@ def cmd_daemon(args):
 
             new = cur
             if avail < min_free and cur < max_mem:
-                # Critically low — fast deflate (give memory to guest)
-                new = min(cur + step * 2, max_mem)
+                # Critically low — jump to desired (at minimum +2*step)
+                new = max(desired, cur + step * 2)
+                new = min(new, max_mem)
                 log(f"  CRITICAL: {fmt(cur)} -> {fmt(new)}")
             elif cur < desired - step:
-                # Guest needs more memory — grow gradually to avoid overshoot
-                new = min(cur + step, desired)
+                # Guest needs more memory — jump to desired immediately
+                new = min(desired, max_mem)
                 log(f"  GROW: {fmt(cur)} -> {fmt(new)}")
             elif cur > desired + step:
-                # Excess — reclaim immediately (safe: guest has plenty free)
+                # Excess — reclaim immediately
                 new = max(desired, min_mem)
                 log(f"  SHRINK: {fmt(cur)} -> {fmt(new)}")
 
@@ -284,10 +337,10 @@ def main():
                      help="Minimum balloon size / floor (default: 1G)")
     pd.add_argument("--step", default="256M",
                      help="Adjustment step size (default: 256M)")
-    pd.add_argument("--headroom", type=float, default=20,
-                     help="Keep this %% of used memory as free headroom (default: 20)")
-    pd.add_argument("--min-free", default="384M",
-                     help="Emergency deflate threshold (default: 384M)")
+    pd.add_argument("--headroom", type=float, default=40,
+                     help="Keep this %% of used memory as free headroom (default: 40)")
+    pd.add_argument("--min-free", default="1G",
+                     help="Emergency deflate threshold (default: 1G)")
     pd.add_argument("--interval", type=int, default=5,
                      help="Stats polling interval in seconds (default: 5)")
     pd.add_argument("-v", "--verbose", action="store_true",
