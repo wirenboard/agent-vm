@@ -57,13 +57,14 @@ agent-vm claude
 
 Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
 
-Any arguments are forwarded to the `claude` command:
+The default model is `opus`. You can override it by passing `--model`:
 
 ```bash
 agent-vm claude -p "fix all lint errors"        # Run with a prompt
 agent-vm claude --resume                         # Resume previous session
 agent-vm claude -c "explain this codebase"       # Continue conversation
 agent-vm claude --memory 8                       # Start with 8G instead of default 2G
+agent-vm claude --model sonnet                   # Use Sonnet instead of Opus
 ```
 
 ### Run OpenCode in a VM
