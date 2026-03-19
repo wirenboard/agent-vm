@@ -907,7 +907,7 @@ _claude_vm_check_push_access() {
   local push_output
   push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD 2>&1) && return 0
   # "non-fast-forward" or "up to date" = have push access (server rejected the ref, not the auth)
-  echo "$push_output" | grep -qiE 'non-fast-forward|up to date|Everything up-to-date' && return 0
+  echo "$push_output" | grep -qiE 'non-fast-forward|up to date|Everything up-to-date|fetch first|\[rejected\]' && return 0
   return 1
 }
 
@@ -1324,7 +1324,7 @@ _agent_vm_run() {
       env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
       opencode "${args[@]}"
   else
-    local claude_args=("${args[@]}")
+    local claude_args=("--model" "opus" "${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
       env IS_SANDBOX=1 \
