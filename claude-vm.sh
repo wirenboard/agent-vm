@@ -970,7 +970,7 @@ for s in p.sections():
 
       # Check push access before requesting a scoped token
       sub_dir=""
-      [ -n "$sub_path" ] && [ -d "$host_dir/$sub_path/.git" ] && sub_dir="$host_dir/$sub_path"
+      [ -n "$sub_path" ] && [ -e "$host_dir/$sub_path/.git" ] && sub_dir="$host_dir/$sub_path"
       if ! _claude_vm_check_push_access "$sub_dir"; then
         echo "  Submodule $sub_owner/$sub_repo: no write access, skipping token request"
         continue
