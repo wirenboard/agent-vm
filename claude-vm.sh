@@ -1324,7 +1324,7 @@ _agent_vm_run() {
       env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
       opencode "${args[@]}"
   else
-    local claude_args=("--model" "opus" "${args[@]}")
+    local claude_args=("--model" "opus[1m]" "${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
       env IS_SANDBOX=1 \

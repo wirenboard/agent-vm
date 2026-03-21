@@ -57,7 +57,7 @@ agent-vm claude
 
 Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
 
-The default model is `opus`. You can override it by passing `--model`:
+The default model is `opus[1m]` (Opus with 1M context window). You can override it by passing `--model`:
 
 ```bash
 agent-vm claude -p "fix all lint errors"        # Run with a prompt
