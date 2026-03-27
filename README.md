@@ -117,6 +117,7 @@ On macOS (Apple Silicon with VZ backend), QEMU is not used and balloon is not av
 | `--memory GB` | claude, opencode, shell | Initial memory (default: 2G with balloon, 4G without) |
 | `--max-memory GB` | claude, opencode, shell | Memory ceiling for balloon (default: from template) |
 | `--no-git` | claude, opencode, shell | Skip GitHub integration |
+| `--mount DIR` | claude, opencode, shell | Mount extra host directory into VM (repeatable) |
 | `--usb DEVICE` | claude, opencode, shell | Pass USB device to VM (repeatable) |
 
 ## Customization

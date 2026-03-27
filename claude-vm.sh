@@ -1158,6 +1158,7 @@ _agent_vm_run() {
   shift
   local use_github=true
   local usb_devices=()
+  local extra_mounts=()
   local memory=""
   local max_memory=""
   local args=()
@@ -1166,6 +1167,8 @@ _agent_vm_run() {
       --no-git) use_github=false; shift ;;
       --usb) usb_devices+=("$2"); shift 2 ;;
       --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --mount) extra_mounts+=("$2"); shift 2 ;;
+      --mount=*) extra_mounts+=("${1#*=}"); shift ;;
       --memory) memory="$2"; shift 2 ;;
       --memory=*) memory="${1#*=}"; shift ;;
       --max-memory) max_memory="$2"; shift 2 ;;
@@ -1232,12 +1235,19 @@ _agent_vm_run() {
   # Ensure .git/hooks exists for read-only mount
   mkdir -p "${host_dir}/.git/hooks"
 
+  # Build mounts JSON array
+  local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
+  local _m
+  for _m in "${extra_mounts[@]}"; do
+    _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
+  done
+
   echo "Starting VM '$vm_name'..."
   # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
   # Note: .git/config is a file (not a directory) so it cannot be a Lima mount;
   # it is protected via the pre/post-session security check instead.
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}]" \
+    --set ".mounts=[${_mounts_json}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
@@ -1355,6 +1365,7 @@ _agent_vm_shell() {
   esac
 
   local usb_devices=()
+  local extra_mounts=()
   local memory=""
   local max_memory=""
   while [[ $# -gt 0 ]]; do
@@ -1362,6 +1373,8 @@ _agent_vm_shell() {
       --no-git) use_github=false; shift ;;
       --usb) usb_devices+=("$2"); shift 2 ;;
       --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --mount) extra_mounts+=("$2"); shift 2 ;;
+      --mount=*) extra_mounts+=("${1#*=}"); shift ;;
       --memory) memory="$2"; shift 2 ;;
       --memory=*) memory="${1#*=}"; shift ;;
       --max-memory) max_memory="$2"; shift 2 ;;
@@ -1428,9 +1441,16 @@ _agent_vm_shell() {
   # Ensure .git/hooks exists for read-only mount
   mkdir -p "${host_dir}/.git/hooks"
 
+  # Build mounts JSON array
+  local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
+  local _m
+  for _m in "${extra_mounts[@]}"; do
+    _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
+  done
+
   # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}]" \
+    --set ".mounts=[${_mounts_json}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
     --tty=false &>/dev/null
