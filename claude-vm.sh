@@ -927,7 +927,7 @@ _claude_vm_post_boot_setup() {
   _oauth_token=""
   _codex_home=""
 
-  if [ "$agent" = "claude" ] || [ "$agent" = "opencode" ]; then
+  if [ "$agent" = "claude" ] || [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
     # Write oauth token if we have one, or a placeholder if AI_HTTPS_PROXY is set
     # (Claude Code needs a token to route requests through the proxy chain)
     _oauth_token="${_anthropic_token:-${AI_HTTPS_PROXY:+placeholder}}"
@@ -936,7 +936,7 @@ _claude_vm_post_boot_setup() {
     _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
   fi
 
-  if [ "$agent" = "codex" ]; then
+  if [ "$agent" = "codex" ] || [ -z "$agent" ]; then
     _codex_vm_setup_home "$vm_name" "$state_dir" "${_codex_placeholder_auth_json:-}"
     _codex_vm_write_api_key "$vm_name" "${_openai_token:-}"
     _codex_home="${state_dir}/codex-home"
@@ -964,7 +964,7 @@ print(','.join(seen))
     _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
   fi
 
-  if [ "$agent" = "opencode" ]; then
+  if [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
     _opencode_vm_setup_config "$vm_name" "$state_dir"
     _opencode_vm_setup_session_persistence "$vm_name" "$state_dir"
     _opencode_vm_setup_auth "$vm_name"
@@ -989,10 +989,10 @@ _claude_vm_print_config() {
     [ ${#_oauth_token} -gt 16 ] && _truncated="${_truncated}..."
     echo "VM env: CLAUDE_CODE_OAUTH_TOKEN=${_truncated}"
   fi
-  if [ "$agent" = "codex" ] && [ -n "${_openai_token:-}" ]; then
+  if [ -n "${_openai_token:-}" ]; then
     echo "VM env: OPENAI_API_KEY=dummy-key-auth-handled-by-proxy"
   fi
-  if [ "$agent" = "codex" ] && [ -n "${_codex_proxy_token:-}" ] && [ -n "${_codex_placeholder_auth_json:-}" ]; then
+  if [ -n "${_codex_proxy_token:-}" ] && [ -n "${_codex_placeholder_auth_json:-}" ]; then
     echo "VM auth: ~/.codex/auth.json placeholders backed by host Codex auth"
   fi
   if [ -n "${_codex_home:-}" ]; then
@@ -1702,7 +1702,7 @@ _agent_vm_shell() {
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
-  if [ "$agent" = "codex" ] && [ -z "$_openai_token" ]; then
+  if [ -z "$_openai_token" ]; then
     if _codex_vm_prepare_host_auth; then
       echo "Using host Codex ChatGPT auth via credential proxy."
     else
@@ -1820,15 +1820,25 @@ _agent_vm_shell() {
 
   _claude_vm_post_boot_setup
 
+  # Update all agents so they're ready to launch manually
+  echo "Updating Claude Code..."
+  limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+  echo "Updating OpenCode..."
+  limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
+  echo "Updating Codex..."
+  limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
   _claude_vm_print_config
-  if [ "$agent" = "opencode" ]; then
-    echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
-  fi
+  echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
   echo "Type 'exit' to stop and delete the VM"
-  local shell_env=(ENABLE_LSP_TOOL=1)
-  if [ "$agent" = "opencode" ]; then
-    shell_env+=(OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json")
+  local shell_env=(
+    ENABLE_LSP_TOOL=1
+    IS_SANDBOX=1
+    OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json"
+  )
+  if [ -n "$_openai_token" ]; then
+    shell_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
   fi
   CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
     limactl shell --workdir "$host_dir" "$vm_name" \
