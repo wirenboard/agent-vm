@@ -830,6 +830,10 @@ plan_type = (
     auth_claims.get("chatgpt_plan_type")
     or (access_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")
 )
+email = (
+    id_claims.get("email")
+    or (id_claims.get("https://api.openai.com/profile") or {}).get("email")
+)
 exp = access_claims.get("exp")
 if not account_id or not isinstance(exp, int):
     sys.exit(1)
@@ -838,6 +842,7 @@ print(json.dumps({
     "access_token": tokens["access_token"],
     "account_id": account_id,
     "plan_type": plan_type,
+    "email": email,
     "access_exp": exp,
     "last_refresh": auth.get("last_refresh"),
 }))
@@ -859,6 +864,7 @@ def encode(payload):
 
 account_id = host["account_id"]
 plan_type = host.get("plan_type")
+email = host.get("email")
 exp = int(host["access_exp"])
 iat = max(0, exp - 3600)
 
@@ -872,6 +878,8 @@ id_payload = {
         "chatgpt_plan_type": plan_type,
     },
 }
+if email:
+    id_payload["email"] = email
 access_payload = {
     "iss": "https://auth.openai.com",
     "aud": ["https://api.openai.com/v1"],
