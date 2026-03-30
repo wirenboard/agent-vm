@@ -823,6 +823,46 @@ class TestCodexHostAuthHelpers(unittest.TestCase):
             "acct-123",
         )
 
+    def test_build_opencode_oauth_auth_json(self):
+        """OpenCode host-auth helper emits native OAuth credentials."""
+        host_auth = json.dumps({
+            "access_token": "access-token-real",
+            "account_id": "acct-123",
+            "plan_type": "plus",
+            "access_exp": 1234567890,
+            "last_refresh": "2026-03-30T12:20:21Z",
+        })
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"source claude-vm.sh 2>/dev/null && _opencode_vm_build_oauth_auth_json '{host_auth}'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(
+            parsed,
+            {
+                "type": "oauth",
+                "refresh": "placeholder-refresh-token-injected-by-proxy",
+                "access": parsed["access"],
+                "expires": 1234567890000,
+                "accountId": "acct-123",
+            },
+        )
+        self.assertNotEqual(parsed["access"], "access-token-real")
+        payload = parsed["access"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        self.assertEqual(claims["exp"], 1234567890)
+        self.assertEqual(
+            claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+            "acct-123",
+        )
+
 
 class TestCredentialProxyPathMatching(unittest.TestCase):
     """Tests path-prefix-based credential matching for multi-repo support."""

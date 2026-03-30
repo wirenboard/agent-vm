@@ -922,6 +922,63 @@ _codex_vm_prepare_host_auth() {
   _codex_placeholder_auth_json="$(_codex_vm_build_placeholder_auth_json "$host_auth_json")" || return 1
 }
 
+_opencode_vm_build_oauth_auth_json() {
+  local host_auth_json="$1"
+  python3 -c '
+import base64, json, sys
+
+host = json.loads(sys.argv[1])
+
+def encode(payload):
+    header = {"alg": "RS256", "typ": "JWT"}
+    h = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
+    p = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"{h}.{p}.placeholder"
+
+account_id = host["account_id"]
+plan_type = host.get("plan_type")
+email = host.get("email")
+exp = int(host["access_exp"])
+iat = max(0, exp - 3600)
+
+access_payload = {
+    "iss": "https://auth.openai.com",
+    "aud": ["https://api.openai.com/v1"],
+    "iat": iat,
+    "nbf": iat,
+    "exp": exp,
+    "scp": ["openid", "profile", "email", "offline_access"],
+    "https://api.openai.com/auth": {
+        "chatgpt_account_id": account_id,
+        "chatgpt_plan_type": plan_type,
+    },
+}
+if email:
+    access_payload["email"] = email
+
+print(json.dumps({
+    "type": "oauth",
+    "refresh": "placeholder-refresh-token-injected-by-proxy",
+    "access": encode(access_payload),
+    "expires": exp * 1000,
+    "accountId": account_id,
+}))
+' "$host_auth_json"
+}
+
+_opencode_vm_prepare_host_auth() {
+  local host_auth_json
+  if ! host_auth_json="$(_codex_vm_read_valid_host_auth)"; then
+    return 1
+  fi
+  if ! _codex_vm_refresh_host_auth; then
+    return 1
+  fi
+  host_auth_json="$(_codex_vm_read_valid_host_auth)" || return 1
+  _opencode_host_auth_json="$host_auth_json"
+  _opencode_openai_auth_json="$(_opencode_vm_build_oauth_auth_json "$host_auth_json")" || return 1
+}
+
 _claude_vm_post_boot_setup() {
   # Shared post-boot setup for both claude-vm and claude-vm-shell.
   # Uses variables from the calling function's scope:
@@ -1347,18 +1404,8 @@ _opencode_vm_setup_config() {
   local config_dir="${state_dir}/opencode-config"
   mkdir -p "$config_dir"
 
-  # Use real upstream URL — mitmproxy intercepts HTTPS and the host credential
-  # proxy injects the real API key. The dummy apiKey satisfies OpenCode's config
-  # validation but is overwritten by the proxy.
-  # Add OpenAI provider when codex/openai auth is available on the host.
-  local _has_openai=""
-  if [ -n "${_codex_proxy_token:-}" ] || [ -n "${_openai_token:-}" ]; then
-    _has_openai=1
-  fi
-
   python3 -c "
-import json, sys
-has_openai = bool(sys.argv[1])
+import json
 config = {
     '\$schema': 'https://opencode.ai/config.json',
     'provider': {
@@ -1382,41 +1429,47 @@ config = {
         }
     }
 }
-if has_openai:
-    config['provider']['openai'] = {
-        'options': {
-            'apiKey': 'dummy-key-auth-handled-by-proxy'
-        }
-    }
 print(json.dumps(config, indent=2))
-" "$_has_openai" > "${config_dir}/opencode.json"
+" > "${config_dir}/opencode.json"
 }
 
 _opencode_vm_setup_auth() {
   local vm_name="$1"
-  # Write a dummy auth.json so OpenCode recognizes configured providers.
-  # The actual API keys are set in opencode.json and real auth is handled
-  # by the host proxy.  Include OpenAI when codex/openai auth is available.
-  local _has_openai=""
-  if [ -n "${_codex_proxy_token:-}" ] || [ -n "${_openai_token:-}" ]; then
-    _has_openai=1
+  # Write a valid OpenCode auth.json. For OpenAI, prefer native OAuth auth when
+  # host Codex ChatGPT auth is available; otherwise fall back to the proxy-based
+  # API-key flow.
+  local _anthropic_auth_json=""
+  local _openai_api_auth_json=""
+  local _openai_oauth_auth_json="${_opencode_openai_auth_json:-}"
+  if [ -n "${_anthropic_token:-}" ]; then
+    _anthropic_auth_json='{"type":"api","key":"dummy-key-auth-handled-by-proxy"}'
+  fi
+  if [ -z "$_openai_oauth_auth_json" ] && { [ -n "${_openai_token:-}" ] || [ -n "${_codex_proxy_token:-}" ]; }; then
+    _openai_api_auth_json='{"type":"api","key":"dummy-key-auth-handled-by-proxy"}'
   fi
 
   local auth_json
   auth_json=$(python3 -c "
 import json, sys
-has_openai = bool(sys.argv[1])
-auth = {'anthropic': {'apiKey': 'dummy-key-auth-handled-by-proxy'}}
-if has_openai:
-    auth['openai'] = {'apiKey': 'dummy-key-auth-handled-by-proxy'}
+anthropic = sys.argv[1]
+openai_api = sys.argv[2]
+openai_oauth = sys.argv[3]
+auth = {}
+if anthropic:
+    auth['anthropic'] = json.loads(anthropic)
+if openai_oauth:
+    auth['openai'] = json.loads(openai_oauth)
+elif openai_api:
+    auth['openai'] = json.loads(openai_api)
 print(json.dumps(auth, indent=2))
-" "$_has_openai")
+" "$_anthropic_auth_json" "$_openai_api_auth_json" "$_openai_oauth_auth_json")
 
   limactl shell "$vm_name" bash -c '
     mkdir -p ~/.local/share/opencode
     cat > ~/.local/share/opencode/auth.json << '\''AUTH'\''
 '"$auth_json"'
 AUTH
+    chmod 600 ~/.local/share/opencode/auth.json
   '
 }
 
@@ -1499,6 +1552,8 @@ _agent_vm_run() {
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
+  local _opencode_host_auth_json=""
+  local _opencode_openai_auth_json=""
   if [ "$agent" = "codex" ] && [ -z "$_openai_token" ]; then
     if _codex_vm_prepare_host_auth; then
       echo "Using host Codex ChatGPT auth via credential proxy."
@@ -1506,6 +1561,13 @@ _agent_vm_run() {
       _codex_proxy_token=""
       _codex_placeholder_auth_json=""
       echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+    fi
+  elif [ "$agent" = "opencode" ] && [ -z "$_openai_token" ]; then
+    if _opencode_vm_prepare_host_auth; then
+      echo "Using host Codex ChatGPT auth via native OpenCode OAuth."
+    else
+      _opencode_openai_auth_json=""
+      echo "Host Codex auth not available or invalid; OpenCode will use its configured non-ChatGPT providers."
     fi
   fi
 
@@ -1736,13 +1798,38 @@ _agent_vm_shell() {
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
+  local _opencode_host_auth_json=""
+  local _opencode_openai_auth_json=""
   if [ -z "$_openai_token" ]; then
-    if _codex_vm_prepare_host_auth; then
-      echo "Using host Codex ChatGPT auth via credential proxy."
+    if [ "$agent" = "opencode" ]; then
+      if _opencode_vm_prepare_host_auth; then
+        echo "Using host Codex ChatGPT auth via native OpenCode OAuth."
+      else
+        _opencode_openai_auth_json=""
+        echo "Host Codex auth not available or invalid; OpenCode will use its configured non-ChatGPT providers."
+      fi
+    elif [ -z "$agent" ]; then
+      if _codex_vm_prepare_host_auth; then
+        echo "Using host Codex ChatGPT auth via credential proxy."
+      else
+        _codex_proxy_token=""
+        _codex_placeholder_auth_json=""
+        echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+      fi
+      if _opencode_vm_prepare_host_auth; then
+        echo "Using host Codex ChatGPT auth via native OpenCode OAuth."
+      else
+        _opencode_openai_auth_json=""
+        echo "Host Codex auth not available or invalid; OpenCode will use its configured non-ChatGPT providers."
+      fi
     else
-      _codex_proxy_token=""
-      _codex_placeholder_auth_json=""
-      echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+      if _codex_vm_prepare_host_auth; then
+        echo "Using host Codex ChatGPT auth via credential proxy."
+      else
+        _codex_proxy_token=""
+        _codex_placeholder_auth_json=""
+        echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+      fi
     fi
   fi
 

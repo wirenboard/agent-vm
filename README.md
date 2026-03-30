@@ -76,6 +76,13 @@ agent-vm opencode
 
 Runs [OpenCode](https://opencode.ai/) inside a sandboxed VM instead of Claude Code. Uses the same VM template, proxies, and security model. OpenCode is configured to use the Anthropic provider through the host proxy with all permissions auto-approved (the VM is the sandbox).
 
+When launching OpenCode, `agent-vm` prefers native OpenCode OAuth for OpenAI when host-side Codex ChatGPT auth is available and `OPENAI_API_KEY` is not set:
+
+1. It checks the host's Codex auth state and runs a minimal host `codex exec` to verify the login still works and to refresh tokens if needed.
+2. If that succeeds, it writes a placeholder OpenCode `openai` OAuth credential into `~/.local/share/opencode/auth.json` inside the VM and routes the real bearer token through the host credential proxy.
+3. This keeps the real OpenAI tokens out of the VM, but the OpenCode ChatGPT session only works until that host bearer token expires.
+4. If host-side Codex auth is unavailable or invalid, OpenCode falls back to its other configured providers unless you provide `OPENAI_API_KEY`.
+
 Any arguments are forwarded to the `opencode` command:
 
 ```bash
@@ -199,6 +206,8 @@ OpenCode configuration is stored in `<state-dir>/opencode-config/opencode.json` 
 - All permissions set to `"allow"` (the VM is the sandbox)
 - GitHub MCP server (when available)
 - Autoupdates disabled
+
+OpenCode authentication state is stored in `<state-dir>/opencode-sessions/auth.json`. When host-side Codex ChatGPT auth is available, `agent-vm opencode` writes a placeholder OAuth credential for the `openai` provider there; the real bearer token stays on the host and is injected by the credential proxy.
 
 ### Codex sessions and configuration
 
