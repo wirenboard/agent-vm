@@ -1350,46 +1350,72 @@ _opencode_vm_setup_config() {
   # Use real upstream URL — mitmproxy intercepts HTTPS and the host credential
   # proxy injects the real API key. The dummy apiKey satisfies OpenCode's config
   # validation but is overwritten by the proxy.
-  cat > "${config_dir}/opencode.json" << 'OCJSON'
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "anthropic": {
-      "options": {
-        "baseURL": "https://api.anthropic.com/v1",
-        "apiKey": "dummy-key-auth-handled-by-proxy"
-      }
+  # Add OpenAI provider when codex/openai auth is available on the host.
+  local _has_openai=""
+  if [ -n "${_codex_proxy_token:-}" ] || [ -n "${_openai_token:-}" ]; then
+    _has_openai=1
+  fi
+
+  python3 -c "
+import json, sys
+has_openai = bool(sys.argv[1])
+config = {
+    '\$schema': 'https://opencode.ai/config.json',
+    'provider': {
+        'anthropic': {
+            'options': {
+                'baseURL': 'https://api.anthropic.com/v1',
+                'apiKey': 'dummy-key-auth-handled-by-proxy'
+            }
+        }
+    },
+    'permission': 'allow',
+    'autoupdate': False,
+    'watcher': {
+        'ignore': ['node_modules/**', 'dist/**', '.git/**', '.agent-vm/**']
+    },
+    'mcp': {
+        'chrome-devtools': {
+            'type': 'local',
+            'command': ['npx', '-y', 'chrome-devtools-mcp@latest', '--headless=true', '--isolated=true'],
+            'enabled': True
+        }
     }
-  },
-  "permission": "allow",
-  "autoupdate": false,
-  "watcher": {
-    "ignore": ["node_modules/**", "dist/**", ".git/**", ".agent-vm/**"]
-  },
-  "mcp": {
-    "chrome-devtools": {
-      "type": "local",
-      "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"],
-      "enabled": true
-    }
-  }
 }
-OCJSON
+if has_openai:
+    config['provider']['openai'] = {
+        'options': {
+            'apiKey': 'dummy-key-auth-handled-by-proxy'
+        }
+    }
+print(json.dumps(config, indent=2))
+" "$_has_openai" > "${config_dir}/opencode.json"
 }
 
 _opencode_vm_setup_auth() {
   local vm_name="$1"
-  # Write a dummy auth.json so OpenCode recognizes the Anthropic provider
-  # as configured.  The actual API key is set via provider.anthropic.options.apiKey
-  # in opencode.json, and real auth is handled by the host proxy.
+  # Write a dummy auth.json so OpenCode recognizes configured providers.
+  # The actual API keys are set in opencode.json and real auth is handled
+  # by the host proxy.  Include OpenAI when codex/openai auth is available.
+  local _has_openai=""
+  if [ -n "${_codex_proxy_token:-}" ] || [ -n "${_openai_token:-}" ]; then
+    _has_openai=1
+  fi
+
+  local auth_json
+  auth_json=$(python3 -c "
+import json, sys
+has_openai = bool(sys.argv[1])
+auth = {'anthropic': {'apiKey': 'dummy-key-auth-handled-by-proxy'}}
+if has_openai:
+    auth['openai'] = {'apiKey': 'dummy-key-auth-handled-by-proxy'}
+print(json.dumps(auth, indent=2))
+" "$_has_openai")
+
   limactl shell "$vm_name" bash -c '
     mkdir -p ~/.local/share/opencode
     cat > ~/.local/share/opencode/auth.json << '\''AUTH'\''
-{
-  "anthropic": {
-    "apiKey": "dummy-key-auth-handled-by-proxy"
-  }
-}
+'"$auth_json"'
 AUTH
   '
 }
