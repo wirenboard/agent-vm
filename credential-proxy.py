@@ -30,7 +30,9 @@ import http.client
 import http.server
 import json
 import os
+import select
 import signal
+import socket
 import ssl
 import sys
 import socketserver
@@ -41,6 +43,7 @@ from urllib.parse import urlparse, unquote
 MAX_REQUEST_BODY = 32 * 1024 * 1024  # 32 MB
 UPSTREAM_TIMEOUT = 300  # seconds
 INBOUND_TIMEOUT = 60   # seconds
+WEBSOCKET_IDLE_TIMEOUT = 300  # seconds
 
 PROXY_SECRET = os.environ.get("CREDENTIAL_PROXY_SECRET", "")
 DEBUG = os.environ.get("CREDENTIAL_PROXY_DEBUG", "0") == "1"
@@ -130,6 +133,161 @@ def _match_rule(domain, path):
     return None
 
 
+def _build_upstream_headers(request_headers, original_host, rule):
+    """Copy inbound headers, remove proxy metadata, and apply injected headers."""
+    headers = {}
+    header_keys_lower = {}
+    for key, value in request_headers.items():
+        lower = key.lower()
+        if lower in (
+            "host", "accept-encoding",
+            "x-original-host", "x-original-port", "x-original-scheme",
+            "proxy-authorization",
+        ):
+            continue
+        if lower in header_keys_lower:
+            actual_key = header_keys_lower[lower]
+            headers[actual_key] = f"{headers[actual_key]},{value}"
+        else:
+            headers[key] = value
+            header_keys_lower[lower] = key
+
+    headers["Host"] = original_host
+
+    if rule:
+        for header_name, header_value in rule["headers"].items():
+            to_remove = []
+            for existing_key in headers:
+                if existing_key.lower() == header_name.lower():
+                    to_remove.append(existing_key)
+            for key in to_remove:
+                del headers[key]
+                header_keys_lower.pop(key.lower(), None)
+            headers[header_name] = header_value
+            header_keys_lower[header_name.lower()] = header_name
+            debug(f"  injected {header_name}: {redact(header_value)}")
+
+    if DEBUG:
+        for key, value in headers.items():
+            lower = key.lower()
+            if lower in ("authorization", "x-api-key"):
+                debug(f"  > {key}: {redact(value)}")
+            else:
+                debug(f"  > {key}: {value}")
+
+    return headers
+
+
+def _open_upstream_connection(original_host, original_port, original_scheme, use_proxy):
+    """Open an upstream HTTP(S) connection for non-upgrade requests."""
+    if original_scheme == "https" and use_proxy:
+        conn = http.client.HTTPSConnection(
+            _ai_proxy["host"], _ai_proxy["port"], context=_ai_ssl_ctx, timeout=UPSTREAM_TIMEOUT
+        )
+        tunnel_headers = {}
+        if "auth" in _ai_proxy:
+            tunnel_headers["Proxy-Authorization"] = _ai_proxy["auth"]
+        conn.set_tunnel(original_host, original_port, headers=tunnel_headers)
+        return conn
+    if original_scheme == "https":
+        return http.client.HTTPSConnection(
+            original_host, original_port, context=_ssl_ctx, timeout=UPSTREAM_TIMEOUT
+        )
+    return http.client.HTTPConnection(original_host, original_port, timeout=UPSTREAM_TIMEOUT)
+
+
+def _open_upstream_socket(original_host, original_port, original_scheme, use_proxy):
+    """Open a raw socket suitable for WebSocket upgrade forwarding."""
+    if use_proxy:
+        sock = socket.create_connection((_ai_proxy["host"], _ai_proxy["port"]), timeout=UPSTREAM_TIMEOUT)
+        sock.settimeout(UPSTREAM_TIMEOUT)
+        connect_lines = [f"CONNECT {original_host}:{original_port} HTTP/1.1"]
+        connect_lines.append(f"Host: {original_host}:{original_port}")
+        if "auth" in _ai_proxy:
+            connect_lines.append(f"Proxy-Authorization: {_ai_proxy['auth']}")
+        connect_lines.append("")
+        connect_lines.append("")
+        sock.sendall("\r\n".join(connect_lines).encode())
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("proxy closed CONNECT response")
+            response += chunk
+            if len(response) > 65536:
+                raise OSError("CONNECT response too large")
+        header_block, remainder = response.split(b"\r\n\r\n", 1)
+        status_line = header_block.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+        try:
+            status_code = int(status_line.split(" ", 2)[1])
+        except (IndexError, ValueError) as exc:
+            raise OSError(f"invalid CONNECT response: {status_line}") from exc
+        if status_code != 200:
+            raise OSError(f"CONNECT failed: {status_line}")
+        if remainder:
+            raise OSError("unexpected buffered data after CONNECT")
+        if original_scheme == "https":
+            server_hostname = original_host
+            ctx = _ai_ssl_ctx
+            sock = ctx.wrap_socket(sock, server_hostname=server_hostname)
+        return sock
+
+    sock = socket.create_connection((original_host, original_port), timeout=UPSTREAM_TIMEOUT)
+    sock.settimeout(UPSTREAM_TIMEOUT)
+    if original_scheme == "https":
+        sock = _ssl_ctx.wrap_socket(sock, server_hostname=original_host)
+    return sock
+
+
+def _read_http_response(sock):
+    """Read an HTTP response head and return status/header info plus buffered body bytes."""
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise OSError("upstream closed before sending response headers")
+        response += chunk
+        if len(response) > 65536:
+            raise OSError("response headers too large")
+    header_block, remainder = response.split(b"\r\n\r\n", 1)
+    lines = header_block.decode("iso-8859-1").split("\r\n")
+    status_line = lines[0]
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2:
+        raise OSError(f"invalid upstream status line: {status_line}")
+    status_code = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else ""
+    headers = []
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers.append((key.strip(), value.lstrip()))
+    return status_code, reason, headers, remainder
+
+
+def _tunnel_bidirectional(client_sock, upstream_sock, initial_upstream_data=b""):
+    sockets = [client_sock, upstream_sock]
+    if initial_upstream_data:
+        client_sock.sendall(initial_upstream_data)
+    while sockets:
+        readable, _, exceptional = select.select(sockets, [], sockets, WEBSOCKET_IDLE_TIMEOUT)
+        if exceptional:
+            break
+        if not readable:
+            debug("  websocket tunnel idle timeout")
+            break
+        for current in readable:
+            peer = upstream_sock if current is client_sock else client_sock
+            try:
+                data = current.recv(65536)
+            except (socket.timeout, ssl.SSLWantReadError):
+                continue
+            if not data:
+                return
+            peer.sendall(data)
+
+
 class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -168,71 +326,65 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
 
         debug(f">>> {self.command} {self.path} (host={original_host}, {content_length} bytes)")
 
-        # Build upstream headers: copy all, strip proxy metadata and accept-encoding
-        headers = {}
-        header_keys_lower = {}
-        for key, value in self.headers.items():
-            lower = key.lower()
-            if lower in ("host", "accept-encoding",
-                         "x-original-host", "x-original-port", "x-original-scheme",
-                         "proxy-authorization"):
-                continue
-            if lower in header_keys_lower:
-                actual_key = header_keys_lower[lower]
-                headers[actual_key] = f"{headers[actual_key]},{value}"
-            else:
-                headers[key] = value
-                header_keys_lower[lower] = key
-
-        headers["Host"] = original_host
-
         # Apply credential rules for this domain (+ optional path prefix)
         rule = _match_rule(original_host, self.path)
-        if rule:
-            for header_name, header_value in rule["headers"].items():
-                # Remove existing header with same name (case-insensitive)
-                to_remove = []
-                for existing_key in headers:
-                    if existing_key.lower() == header_name.lower():
-                        to_remove.append(existing_key)
-                for k in to_remove:
-                    del headers[k]
-                    lower = k.lower()
-                    if lower in header_keys_lower:
-                        del header_keys_lower[lower]
-                headers[header_name] = header_value
-                header_keys_lower[header_name.lower()] = header_name
-                debug(f"  injected {header_name}: {redact(header_value)}")
-        else:
+        if not rule:
             debug(f"  no credential rule for {original_host}, forwarding as-is")
-
-        if DEBUG:
-            for key, value in headers.items():
-                lower = key.lower()
-                if lower in ("authorization", "x-api-key"):
-                    debug(f"  > {key}: {redact(value)}")
-                else:
-                    debug(f"  > {key}: {value}")
+        headers = _build_upstream_headers(self.headers, original_host, rule)
 
         # Connect to upstream (route through AI proxy if rule says so)
         upstream_port = original_port
         use_proxy = rule and rule.get("use_proxy") and _ai_proxy
+        is_websocket = (
+            self.headers.get("Upgrade", "").lower() == "websocket"
+            and "upgrade" in self.headers.get("Connection", "").lower()
+        )
+        if is_websocket:
+            try:
+                t0 = time.monotonic()
+                upstream_sock = _open_upstream_socket(
+                    original_host, upstream_port, original_scheme, use_proxy
+                )
+                request_lines = [f"{self.command} {self.path} HTTP/1.1"]
+                for key, value in headers.items():
+                    request_lines.append(f"{key}: {value}")
+                request_lines.append("")
+                request_lines.append("")
+                upstream_sock.sendall("\r\n".join(request_lines).encode())
+                status_code, reason, upstream_headers, buffered = _read_http_response(upstream_sock)
+                self.send_response(status_code, reason)
+                for key, value in upstream_headers:
+                    lower = key.lower()
+                    if lower in ("transfer-encoding", "content-length", "keep-alive"):
+                        continue
+                    self.send_header(key, value)
+                if status_code != 101:
+                    self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                latency_ms = (time.monotonic() - t0) * 1000
+                debug(f"<<< {status_code} websocket-upgrade ({latency_ms:.0f}ms)")
+                if status_code == 101:
+                    self.connection.settimeout(WEBSOCKET_IDLE_TIMEOUT)
+                    upstream_sock.settimeout(WEBSOCKET_IDLE_TIMEOUT)
+                    try:
+                        _tunnel_bidirectional(self.connection, upstream_sock, buffered)
+                    finally:
+                        upstream_sock.close()
+                else:
+                    if buffered:
+                        self.wfile.write(buffered)
+                        self.wfile.flush()
+                    upstream_sock.close()
+                self.close_connection = True
+                return
+            except Exception as e:
+                debug(f"  WEBSOCKET UPSTREAM ERROR: {e}")
+                self.send_error_response(502, f"Failed to connect to {original_host}")
+                return
         try:
             t0 = time.monotonic()
-            if original_scheme == "https" and use_proxy:
-                conn = http.client.HTTPSConnection(
-                    _ai_proxy["host"], _ai_proxy["port"],
-                    context=_ai_ssl_ctx, timeout=UPSTREAM_TIMEOUT)
-                tunnel_headers = {}
-                if "auth" in _ai_proxy:
-                    tunnel_headers["Proxy-Authorization"] = _ai_proxy["auth"]
-                conn.set_tunnel(original_host, upstream_port, headers=tunnel_headers)
-            elif original_scheme == "https":
-                conn = http.client.HTTPSConnection(
-                    original_host, upstream_port, context=_ssl_ctx, timeout=UPSTREAM_TIMEOUT)
-            else:
-                conn = http.client.HTTPConnection(
-                    original_host, upstream_port, timeout=UPSTREAM_TIMEOUT)
+            conn = _open_upstream_connection(original_host, upstream_port, original_scheme, use_proxy)
             conn.request(self.command, self.path, body=body, headers=headers)
             upstream = conn.getresponse()
             latency_ms = (time.monotonic() - t0) * 1000

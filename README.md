@@ -4,7 +4,7 @@ Run AI coding agents inside sandboxed Linux VMs. The agent gets full autonomy wh
 
 Uses [Lima](https://lima-vm.io/) to create lightweight Debian VMs on macOS and Linux. Ships with dev tools, Docker, and a headless Chrome browser with [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) pre-configured.
 
-Supports [Claude Code](https://claude.ai/code) and [OpenCode](https://opencode.ai/). Other agents (Codex, etc.) can be added in the future.
+Supports [Claude Code](https://claude.ai/code), [OpenCode](https://opencode.ai/), and [Codex CLI](https://developers.openai.com/codex/cli/).
 
 Feedbacks welcome!
 
@@ -12,7 +12,7 @@ Feedbacks welcome!
 
 - macOS or Linux
 - [Lima](https://lima-vm.io/docs/installation/) (installed automatically via Homebrew if available)
-- A [Claude subscription](https://claude.ai/) (Pro, Max, or Team) and/or an [OpenCode](https://opencode.ai/) compatible provider
+- A [Claude subscription](https://claude.ai/) (Pro, Max, or Team), an [OpenCode](https://opencode.ai/) compatible provider, and/or an OpenAI Codex-capable account or API key
 
 ## Install
 
@@ -33,13 +33,13 @@ echo "source $(pwd)/claude-vm.sh" >> ~/.bashrc  # or bash
 agent-vm setup
 ```
 
-Creates a VM template with dev tools, Docker, Chromium, Claude Code, and OpenCode pre-installed. During setup, Claude will launch once for authentication. After it responds, type `/exit` to continue with the rest of the setup. (We haven't found a way to automate this step yet.)
+Creates a VM template with dev tools, Docker, Chromium, Claude Code, OpenCode, and Codex pre-installed. During setup, Claude will launch once for authentication. After it responds, type `/exit` to continue with the rest of the setup. (We haven't found a way to automate this step yet.)
 
 Options:
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--minimal` | Only install git, curl, jq, Claude Code, and OpenCode. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
+| `--minimal` | Only install git, curl, jq, Claude Code, OpenCode, and Codex. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
 | `--disk GB` | VM disk size in GB | 30 |
 | `--memory GB` | VM memory ceiling in GB | 16 (Linux), 4 (macOS) |
 
@@ -84,12 +84,39 @@ agent-vm opencode --continue                        # Continue last session
 agent-vm opencode -m anthropic/claude-sonnet-4-5    # Specify a model
 ```
 
+### Run Codex in a VM
+
+```bash
+cd your-project
+agent-vm codex
+```
+
+Runs [Codex CLI](https://developers.openai.com/codex/cli/) inside the same sandboxed VM model. `agent-vm` persists `~/.codex/` per project, configures Codex for `danger-full-access` + `approval_policy = "never"` on first use inside the VM, and updates Codex before launch.
+
+When launching Codex, `agent-vm` now prefers host-side Codex ChatGPT auth when available:
+
+1. It checks the host's Codex auth state and runs a minimal host `codex exec` to verify the login still works and to refresh tokens if needed.
+2. If that succeeds, it injects the refreshed bearer token through the host credential proxy and writes a placeholder `~/.codex/auth.json` inside the VM so the VM never sees the real tokens.
+3. If host-side Codex auth is unavailable or invalid, it falls back to the old behavior: the VM keeps its project-local `~/.codex/` state and users can run `codex login` inside the VM.
+
+If you set `OPENAI_API_KEY` on the host, `agent-vm` still uses the API-key-based proxy flow for Codex instead of host ChatGPT auth.
+
+Any arguments are forwarded to the `codex` command:
+
+```bash
+agent-vm codex "fix all lint errors"                  # Interactive TUI with an initial prompt
+agent-vm codex exec "explain this codebase"           # Non-interactive mode
+agent-vm codex resume --last                          # Resume the last Codex session
+agent-vm codex --model gpt-5.1-codex-mini            # Specify a model
+```
+
 ### Debug shell
 
 ```bash
 agent-vm shell                # Plain shell with API proxy configured
 agent-vm shell claude         # Shell pre-configured for Claude
 agent-vm shell opencode       # Shell pre-configured for OpenCode
+agent-vm shell codex          # Shell pre-configured for Codex
 ```
 
 Drops you into a bash shell inside a fresh VM instead of launching an agent. Useful for debugging or manual testing. When an agent is specified, the shell has that agent's configuration (env vars, MCP servers, etc.) pre-applied.
@@ -114,11 +141,11 @@ On macOS (Apple Silicon with VZ backend), QEMU is not used and balloon is not av
 
 | Flag | Applies to | Description |
 |------|-----------|-------------|
-| `--memory GB` | claude, opencode, shell | Initial memory (default: 2G with balloon, 4G without) |
-| `--max-memory GB` | claude, opencode, shell | Memory ceiling for balloon (default: from template) |
-| `--no-git` | claude, opencode, shell | Skip GitHub integration |
-| `--mount DIR` | claude, opencode, shell | Mount extra host directory into VM (repeatable) |
-| `--usb DEVICE` | claude, opencode, shell | Pass USB device to VM (repeatable) |
+| `--memory GB` | claude, opencode, codex, shell | Initial memory (default: 2G with balloon, 4G without) |
+| `--max-memory GB` | claude, opencode, codex, shell | Memory ceiling for balloon (default: from template) |
+| `--no-git` | claude, opencode, codex, shell | Skip GitHub integration |
+| `--mount DIR` | claude, opencode, codex, shell | Mount extra host directory into VM (repeatable) |
+| `--usb DEVICE` | claude, opencode, codex, shell | Pass USB device to VM (repeatable) |
 
 ## Customization
 
@@ -173,6 +200,16 @@ OpenCode configuration is stored in `<state-dir>/opencode-config/opencode.json` 
 - GitHub MCP server (when available)
 - Autoupdates disabled
 
+### Codex sessions and configuration
+
+Codex state is persisted in `<state-dir>/codex-home/` by symlinking `~/.codex/` inside the VM.
+
+On first use, `agent-vm` writes a minimal `config.toml` there with:
+- `sandbox_mode = "danger-full-access"`
+- `approval_policy = "never"`
+
+That matches the existing model for Claude/OpenCode: the VM is the sandbox, so Codex itself should not stop to ask for extra approval inside it. Existing Codex config is preserved on subsequent runs.
+
 ## Credential Proxy
 
 A two-layer proxy chain keeps all API credentials out of the VM:
@@ -188,16 +225,17 @@ The VM only ever sees placeholder tokens. Real credentials live in the host proc
 | Env var | Description | Default |
 |---------|-------------|---------|
 | `CLAUDE_VM_PROXY_ACCESS_TOKEN` | Anthropic API token to inject | — |
+| `OPENAI_API_KEY` | OpenAI API token to inject for Codex / `api.openai.com` | — |
 | `AI_HTTPS_PROXY` | Upstream proxy for AI API traffic only (e.g. `http://user:pass@host:8082`) | — |
 | `AI_SSL_CERT_FILE` | Extra CA cert PEM for `AI_HTTPS_PROXY` | — |
 | `CREDENTIAL_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
 | `CREDENTIAL_PROXY_LOG_DIR` | Directory for log file | `.` |
 
-When `AI_HTTPS_PROXY` is set, only AI API requests (`api.anthropic.com`) are routed through it. GitHub and other traffic goes direct.
+When `AI_HTTPS_PROXY` is set, only AI API requests (`api.anthropic.com`, `api.openai.com`) are routed through it. GitHub and other traffic goes direct.
 
 ## GitHub Integration
 
-When you run `agent-vm claude` or `agent-vm opencode` inside a git repo with a GitHub remote, it automatically:
+When you run `agent-vm claude`, `agent-vm opencode`, or `agent-vm codex` inside a git repo with a GitHub remote, it automatically:
 
 1. Detects the repository (and submodules) from `git remote`
 2. Checks push access via `git push --dry-run`
@@ -219,11 +257,12 @@ Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using t
 
 ## How it works
 
-1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode, and stops it as a reusable template
+1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode + Codex, and stops it as a reusable template
 2. **`agent-vm claude [args]`** clones the template, mounts your working directory read-write, starts the balloon daemon (Linux), runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
 3. **`agent-vm opencode [args]`** same as above but launches OpenCode instead, with its own config and session persistence
-4. **`agent-vm shell [agent]`** same VM setup but drops into a bash shell for debugging
-5. On exit, the cloned VM is stopped and deleted. The template persists for reuse
+4. **`agent-vm codex [args]`** same as above but launches Codex instead, with its own `~/.codex/` persistence and OpenAI proxy wiring
+5. **`agent-vm shell [agent]`** same VM setup but drops into a bash shell for debugging
+6. On exit, the cloned VM is stopped and deleted. The template persists for reuse
 
 Ports opened inside the VM (e.g. by Docker containers) are automatically forwarded to your host by Lima.
 
@@ -237,7 +276,7 @@ Ports opened inside the VM (e.g. by Docker containers) are automatically forward
 | Search | ripgrep, fd-find |
 | Browser | Chromium (headless), xvfb |
 | Containers | Docker Engine, Docker Compose |
-| AI | Claude Code, OpenCode, Chrome DevTools MCP server |
+| AI | Claude Code, OpenCode, Codex, Chrome DevTools MCP server |
 | Memory | virtio-balloon auto-scaling (Linux only) |
 
 ## Why a VM?

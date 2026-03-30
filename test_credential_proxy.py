@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -137,6 +138,36 @@ class ErrorHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class WebSocketUpgradeHandler(http.server.BaseHTTPRequestHandler):
+    """Mock upstream that accepts a websocket upgrade and echoes one frame payload."""
+
+    protocol_version = "HTTP/1.1"
+    received_headers = None
+    received_path = None
+    echoed_payload = None
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).received_headers = dict(self.headers.items())
+        type(self).received_path = self.path
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", "test-accept")
+        self.end_headers()
+        self.wfile.flush()
+        frame = self.connection.recv(1024)
+        payload_len = frame[1] & 0x7F
+        mask = frame[2:6]
+        payload = frame[6:6 + payload_len]
+        unmasked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        type(self).echoed_payload = unmasked
+        response = bytes([0x81, len(unmasked)]) + unmasked
+        self.connection.sendall(response)
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
@@ -449,6 +480,61 @@ class TestCredentialProxyStreaming(unittest.TestCase):
         self.assertIn("chunk-2", body)
 
 
+class TestCredentialProxyWebSocket(unittest.TestCase):
+    """Tests websocket upgrade forwarding with header injection."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream_server, cls.upstream_port = _start_mock_upstream(WebSocketUpgradeHandler)
+        cls.rules = [{
+            "domain": "127.0.0.1",
+            "headers": {"Authorization": "Bearer websocket-secret"},
+        }]
+        cls.proxy_proc, cls.proxy_port = _start_credential_proxy(cls.rules)
+
+    @classmethod
+    def tearDownClass(cls):
+        _stop_proxy(cls.proxy_proc)
+        cls.upstream_server.shutdown()
+
+    def test_websocket_upgrade_and_tunnel(self):
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=10)
+        request = "\r\n".join([
+            "GET /backend-api/codex/responses HTTP/1.1",
+            "Host: proxy.local",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Version: 13",
+            "Sec-WebSocket-Key: test-key",
+            "X-Original-Host: 127.0.0.1",
+            f"X-Original-Port: {self.upstream_port}",
+            "X-Original-Scheme: http",
+            "",
+            "",
+        ]).encode()
+        sock.sendall(request)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += sock.recv(4096)
+        self.assertIn(b"101 Switching Protocols", response)
+
+        payload = b"ping"
+        mask = b"\x01\x02\x03\x04"
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        sock.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + masked)
+        frame = sock.recv(1024)
+        sock.close()
+
+        self.assertEqual(frame[:2], bytes([0x81, len(payload)]))
+        self.assertEqual(frame[2:2 + len(payload)], payload)
+        self.assertEqual(WebSocketUpgradeHandler.echoed_payload, payload)
+        self.assertEqual(WebSocketUpgradeHandler.received_path, "/backend-api/codex/responses")
+        self.assertEqual(
+            WebSocketUpgradeHandler.received_headers["Authorization"],
+            "Bearer websocket-secret",
+        )
+
+
 class TestCredentialProxyStartup(unittest.TestCase):
     """Tests for startup behavior."""
 
@@ -497,22 +583,23 @@ class TestCredentialProxyStartup(unittest.TestCase):
 class TestBuildCredentialRules(unittest.TestCase):
     """Test the _claude_vm_build_credential_rules shell function."""
 
-    def _build_rules(self, anthropic_token, repos_json):
+    def _build_rules(self, anthropic_token, openai_token, repos_json):
         result = subprocess.run(
             ["bash", "-c",
              f'source claude-vm.sh 2>/dev/null && '
-             f"_claude_vm_build_credential_rules '{anthropic_token}' '{repos_json}'"],
+             f"_claude_vm_build_credential_rules '{anthropic_token}' '{openai_token}' '{repos_json}'"],
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
         return json.loads(result.stdout)
 
     def test_single_repo(self):
-        """Single repo produces anthropic + per-repo rules + fallback."""
+        """Single repo produces Anthropic/OpenAI/ChatGPT + per-repo rules + fallback."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", repos)
-        # 1 anthropic + 2 per-repo (github.com + api.github.com) + 2 fallback = 5
-        self.assertEqual(len(rules), 5)
+        rules = self._build_rules("", "", repos)
+        # 1 anthropic + 1 openai + 1 chatgpt + 2 per-repo
+        # + 2 fallback = 7
+        self.assertEqual(len(rules), 7)
         # Per-repo rules have path_prefix
         repo_rules = [r for r in rules if r.get("path_prefix")]
         self.assertEqual(len(repo_rules), 2)
@@ -520,9 +607,9 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_multi_repo(self):
         """Multiple repos produce per-repo rules with different tokens."""
         repos = json.dumps({"org1/repo1": "token1", "org2/repo2": "token2"})
-        rules = self._build_rules("", repos)
-        # 1 anthropic + 2 repos * 2 rules each + 2 fallback = 7
-        self.assertEqual(len(rules), 7)
+        rules = self._build_rules("", "", repos)
+        # 1 anthropic + 1 openai + 1 chatgpt + 2 repos * 2 rules each + 2 fallback = 9
+        self.assertEqual(len(rules), 9)
         # Check different path prefixes
         git_rules = [r for r in rules if r["domain"] == "github.com" and r.get("path_prefix")]
         prefixes = [r["path_prefix"] for r in git_rules]
@@ -532,7 +619,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_multi_repo_different_tokens(self):
         """Each repo gets its own token injected."""
         repos = json.dumps({"org1/repo1": "token_AAA", "org2/repo2": "token_BBB"})
-        rules = self._build_rules("", repos)
+        rules = self._build_rules("", "", repos)
         api_rules = {r["path_prefix"]: r for r in rules
                      if r["domain"] == "api.github.com" and r.get("path_prefix")}
         self.assertEqual(api_rules["/repos/org1/repo1"]["headers"]["Authorization"],
@@ -541,29 +628,51 @@ class TestBuildCredentialRules(unittest.TestCase):
                          "token token_BBB")
 
     def test_both_tokens(self):
-        """Both Anthropic and GitHub tokens produce correct rules."""
+        """Anthropic/OpenAI/GitHub tokens produce correct rules."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("sk-ant-test", repos)
-        # 1 anthropic + 2 per-repo + 2 fallback = 5
-        self.assertEqual(len(rules), 5)
+        rules = self._build_rules("sk-ant-test", "sk-openai-test", repos)
+        # 1 anthropic + 1 openai + 1 chatgpt + 2 per-repo + 2 fallback = 7
+        self.assertEqual(len(rules), 7)
         domains = [r["domain"] for r in rules]
         self.assertIn("api.anthropic.com", domains)
+        self.assertIn("api.openai.com", domains)
+        self.assertIn("chatgpt.com", domains)
         self.assertIn("github.com", domains)
         self.assertIn("api.github.com", domains)
 
     def test_anthropic_only(self):
-        """Only Anthropic token produces 1 rule."""
-        rules = self._build_rules("sk-ant-test", "")
-        self.assertEqual(len(rules), 1)
+        """Anthropic-only auth still includes OpenAI and ChatGPT routing rules."""
+        rules = self._build_rules("sk-ant-test", "", "")
+        self.assertEqual(len(rules), 3)
         self.assertEqual(rules[0]["domain"], "api.anthropic.com")
         self.assertEqual(rules[0]["headers"]["Authorization"], "Bearer sk-ant-test")
         self.assertNotIn("anthropic-beta", rules[0]["headers"])
         self.assertTrue(rules[0]["use_proxy"])
+        self.assertEqual(rules[1]["domain"], "api.openai.com")
+        self.assertEqual(rules[1]["headers"], {})
+        self.assertTrue(rules[1]["use_proxy"])
+        self.assertEqual(rules[2]["domain"], "chatgpt.com")
+        self.assertEqual(rules[2]["headers"], {})
+        self.assertTrue(rules[2]["use_proxy"])
+
+    def test_openai_only(self):
+        """OpenAI-only auth produces OpenAI/ChatGPT bearer rules plus Anthropic routing."""
+        rules = self._build_rules("", "sk-openai-test", "")
+        self.assertEqual(len(rules), 3)
+        self.assertEqual(rules[0]["domain"], "api.anthropic.com")
+        self.assertEqual(rules[0]["headers"], {})
+        self.assertTrue(rules[0]["use_proxy"])
+        self.assertEqual(rules[1]["domain"], "api.openai.com")
+        self.assertEqual(rules[1]["headers"]["Authorization"], "Bearer sk-openai-test")
+        self.assertTrue(rules[1]["use_proxy"])
+        self.assertEqual(rules[2]["domain"], "chatgpt.com")
+        self.assertEqual(rules[2]["headers"]["Authorization"], "Bearer sk-openai-test")
+        self.assertTrue(rules[2]["use_proxy"])
 
     def test_github_basic_auth_encoding(self):
         """GitHub token is base64-encoded as Basic auth for git."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", repos)
+        rules = self._build_rules("", "", repos)
         github_rule = next(r for r in rules
                            if r["domain"] == "github.com" and r.get("path_prefix"))
         auth = github_rule["headers"]["Authorization"]
@@ -575,7 +684,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_github_api_token_auth(self):
         """api.github.com uses token auth."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", repos)
+        rules = self._build_rules("", "", repos)
         api_rule = next(r for r in rules
                         if r["domain"] == "api.github.com" and r.get("path_prefix"))
         self.assertEqual(api_rule["headers"]["Authorization"], "token ghu_test")
@@ -583,20 +692,136 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_fallback_rules(self):
         """Domain-level fallback rules have no path_prefix."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", repos)
+        rules = self._build_rules("", "", repos)
         fallback = [r for r in rules if not r.get("path_prefix")]
-        # 1 anthropic + 2 github fallback = 3
-        self.assertEqual(len(fallback), 3)
+        # 1 anthropic + 1 openai + 1 chatgpt + 2 github fallback = 5
+        self.assertEqual(len(fallback), 5)
         fallback_domains = {r["domain"] for r in fallback}
-        self.assertEqual(fallback_domains, {"api.anthropic.com", "github.com", "api.github.com"})
+        self.assertEqual(
+            fallback_domains,
+            {"api.anthropic.com", "api.openai.com", "chatgpt.com", "github.com", "api.github.com"},
+        )
 
     def test_no_tokens(self):
-        """No tokens still produces Anthropic rule (for upstream proxy routing)."""
-        rules = self._build_rules("", "")
-        self.assertEqual(len(rules), 1)
+        """No tokens still produce Anthropic/OpenAI/ChatGPT rules for proxy routing."""
+        rules = self._build_rules("", "", "")
+        self.assertEqual(len(rules), 3)
         self.assertEqual(rules[0]["domain"], "api.anthropic.com")
         self.assertEqual(rules[0]["headers"], {})
         self.assertTrue(rules[0]["use_proxy"])
+        self.assertEqual(rules[1]["domain"], "api.openai.com")
+        self.assertEqual(rules[1]["headers"], {})
+        self.assertTrue(rules[1]["use_proxy"])
+        self.assertEqual(rules[2]["domain"], "chatgpt.com")
+        self.assertEqual(rules[2]["headers"], {})
+        self.assertTrue(rules[2]["use_proxy"])
+
+
+class TestCodexHostAuthHelpers(unittest.TestCase):
+    """Tests for host-side Codex auth extraction and placeholder generation."""
+
+    @staticmethod
+    def _fake_jwt(payload):
+        header = {"alg": "RS256", "typ": "JWT"}
+        h = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
+        p = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+        return f"{h}.{p}.sig"
+
+    def test_read_valid_host_auth(self):
+        """Helper accepts a ChatGPT auth.json with token data."""
+        import tempfile
+
+        account_id = "acct-123"
+        id_token = self._fake_jwt({
+            "iss": "https://auth.openai.com",
+            "aud": ["app_EMoamEEZ73f0CkXaXp7hrann"],
+            "iat": 100,
+            "exp": 200,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": "plus",
+            },
+        })
+        access_token = self._fake_jwt({
+            "iss": "https://auth.openai.com",
+            "aud": ["https://api.openai.com/v1"],
+            "iat": 100,
+            "nbf": 100,
+            "exp": 200,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": "plus",
+            },
+        })
+        auth = {
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": "rt_test",
+                "account_id": account_id,
+            },
+            "last_refresh": "2026-03-30T12:20:21Z",
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "auth.json"), "w", encoding="utf-8") as f:
+                json.dump(auth, f)
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "source claude-vm.sh 2>/dev/null && _codex_vm_read_valid_host_auth",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={**os.environ, "CODEX_HOME": td},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = json.loads(result.stdout)
+            self.assertEqual(parsed["access_token"], access_token)
+            self.assertEqual(parsed["account_id"], account_id)
+            self.assertEqual(parsed["plan_type"], "plus")
+            self.assertEqual(parsed["access_exp"], 200)
+
+    def test_build_placeholder_auth_json(self):
+        """Placeholder auth keeps metadata but replaces secrets."""
+        host_auth = json.dumps({
+            "access_token": "access-token-real",
+            "account_id": "acct-123",
+            "plan_type": "plus",
+            "access_exp": 1234567890,
+            "last_refresh": "2026-03-30T12:20:21Z",
+        })
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"source claude-vm.sh 2>/dev/null && _codex_vm_build_placeholder_auth_json '{host_auth}'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        placeholder = json.loads(result.stdout)
+        self.assertEqual(placeholder["auth_mode"], "chatgpt")
+        self.assertIsNone(placeholder["OPENAI_API_KEY"])
+        self.assertEqual(placeholder["tokens"]["account_id"], "acct-123")
+        self.assertEqual(
+            placeholder["tokens"]["refresh_token"],
+            "placeholder-refresh-token-injected-by-proxy",
+        )
+        self.assertNotEqual(placeholder["tokens"]["access_token"], "access-token-real")
+        payload = placeholder["tokens"]["access_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        self.assertEqual(claims["exp"], 1234567890)
+        self.assertEqual(
+            claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+            "acct-123",
+        )
 
 
 class TestCredentialProxyPathMatching(unittest.TestCase):

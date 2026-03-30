@@ -10,6 +10,7 @@
 #   agent-vm setup            - Create the VM template (run once)
 #   agent-vm claude [args]    - Run Claude in a fresh VM (args forwarded to claude)
 #   agent-vm opencode [args]  - Run OpenCode in a fresh VM (args forwarded to opencode)
+#   agent-vm codex [args]     - Run Codex in a fresh VM (args forwarded to codex)
 #   agent-vm shell [agent]    - Open a debug shell in a fresh VM
 
 CLAUDE_VM_TEMPLATE="claude-template"
@@ -186,10 +187,10 @@ _agent_vm_setup() {
       --help|-h)
         echo "Usage: agent-vm setup [--minimal] [--disk GB] [--memory GB]"
         echo ""
-        echo "Create a VM template with Claude Code and OpenCode pre-installed."
+        echo "Create a VM template with Claude Code, OpenCode, and Codex pre-installed."
         echo ""
         echo "Options:"
-        echo "  --minimal      Only install git, curl, jq, Claude Code, and OpenCode"
+        echo "  --minimal      Only install git, curl, jq, Claude Code, OpenCode, and Codex"
         echo "  --disk GB      VM disk size (default: 30)"
         echo "  --memory GB    VM memory (default: 16 on Linux with balloon, 4 on macOS)"
         echo "  --help         Show this help"
@@ -254,7 +255,8 @@ _agent_vm_setup() {
   # sshfs is required for Lima's reverse-sshfs mounts; pre-installing it avoids
   # a slow apt-get update + install on every clone boot (~15s savings)
   limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git curl jq sshfs gh
+    git curl jq sshfs gh ca-certificates
+  _claude_vm_install_host_proxy_ca "$CLAUDE_VM_TEMPLATE"
 
   if ! $minimal; then
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -365,6 +367,10 @@ MKTJSON
   # (the install script puts it in ~/.opencode/bin which isn't in PATH for non-interactive shells)
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -c 'mkdir -p ~/.local/bin && ln -sf ~/.opencode/bin/opencode ~/.local/bin/opencode'
 
+  # Install Codex
+  echo "Installing Codex..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc 'curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh'
+
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
     echo "Configuring Chrome MCP server..."
@@ -416,21 +422,36 @@ CIEOF
 
   limactl stop "$CLAUDE_VM_TEMPLATE"
 
-  echo "Template ready. Run 'agent-vm claude' or 'agent-vm opencode' in any project directory."
+  echo "Template ready. Run 'agent-vm claude', 'agent-vm opencode', or 'agent-vm codex' in any project directory."
+}
+
+_claude_vm_install_host_proxy_ca() {
+  local vm_name="$1"
+  local host_ca="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+  if [ ! -f "$host_ca" ]; then
+    return
+  fi
+
+  echo "Installing host MITM CA into VM trust store..."
+  cat "$host_ca" | limactl shell "$vm_name" sudo tee /usr/local/share/ca-certificates/host-mitmproxy-ca.crt > /dev/null
+  limactl shell "$vm_name" sudo update-ca-certificates
+  limactl shell "$vm_name" git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
 }
 
 _claude_vm_build_credential_rules() {
   # Build CREDENTIAL_PROXY_RULES JSON from tokens.
-  # Args: anthropic_token github_repos_json
+  # Args: anthropic_token openai_token github_repos_json
   # github_repos_json: '{"owner/repo": "token", ...}' — per-repo tokens
   local anthropic_token="$1"
-  local github_repos_json="$2"
+  local openai_token="$2"
+  local github_repos_json="$3"
 
   python3 -c "
 import base64, json, sys
 rules = []
 anthropic_token = sys.argv[1]
-repos = json.loads(sys.argv[2]) if sys.argv[2] else {}
+openai_token = sys.argv[2]
+repos = json.loads(sys.argv[3]) if sys.argv[3] else {}
 # Always intercept api.anthropic.com (for upstream proxy routing via use_proxy).
 # Inject Authorization only if a token is provided.
 anthropic_headers = {}
@@ -439,6 +460,19 @@ if anthropic_token:
 rules.append({
     'domain': 'api.anthropic.com',
     'headers': anthropic_headers,
+    'use_proxy': True,
+})
+openai_headers = {}
+if openai_token:
+    openai_headers['Authorization'] = f'Bearer {openai_token}'
+rules.append({
+    'domain': 'api.openai.com',
+    'headers': openai_headers,
+    'use_proxy': True,
+})
+rules.append({
+    'domain': 'chatgpt.com',
+    'headers': openai_headers,
     'use_proxy': True,
 })
 for slug, token in repos.items():
@@ -469,7 +503,7 @@ if repos:
         'headers': {'Authorization': f'token {first_token}'}
     })
 print(json.dumps(rules))
-" "$anthropic_token" "$github_repos_json"
+" "$anthropic_token" "$openai_token" "$github_repos_json"
 }
 
 _claude_vm_start_credential_proxy() {
@@ -734,21 +768,179 @@ XSHIM
   '
 }
 
+_codex_vm_host_auth_file() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  printf '%s\n' "${codex_home%/}/auth.json"
+}
+
+_codex_vm_refresh_host_auth() {
+  if ! command -v codex >/dev/null 2>&1; then
+    return 1
+  fi
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  if codex exec \
+    --skip-git-repo-check \
+    --dangerously-bypass-approvals-and-sandbox \
+    --color never \
+    -C "$tmpdir" \
+    "Reply with exactly OK and nothing else." >/dev/null 2>&1; then
+    rm -rf "$tmpdir"
+    return 0
+  fi
+  rm -rf "$tmpdir"
+  return 1
+}
+
+_codex_vm_read_valid_host_auth() {
+  local auth_file
+  auth_file="$(_codex_vm_host_auth_file)"
+  [ -f "$auth_file" ] || return 1
+  python3 -c '
+import base64, json, pathlib, sys
+
+auth = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if auth.get("auth_mode") != "chatgpt":
+    sys.exit(1)
+tokens = auth.get("tokens") or {}
+required = ("id_token", "access_token", "refresh_token", "account_id")
+if not all(tokens.get(k) for k in required):
+    sys.exit(1)
+
+def decode_payload(jwt):
+    parts = jwt.split(".")
+    if len(parts) != 3:
+        raise ValueError("invalid jwt")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+try:
+    id_claims = decode_payload(tokens["id_token"])
+    access_claims = decode_payload(tokens["access_token"])
+except Exception:
+    sys.exit(1)
+
+auth_claims = id_claims.get("https://api.openai.com/auth") or {}
+account_id = (
+    tokens.get("account_id")
+    or auth_claims.get("chatgpt_account_id")
+    or (access_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+)
+plan_type = (
+    auth_claims.get("chatgpt_plan_type")
+    or (access_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")
+)
+exp = access_claims.get("exp")
+if not account_id or not isinstance(exp, int):
+    sys.exit(1)
+
+print(json.dumps({
+    "access_token": tokens["access_token"],
+    "account_id": account_id,
+    "plan_type": plan_type,
+    "access_exp": exp,
+    "last_refresh": auth.get("last_refresh"),
+}))
+' "$auth_file"
+}
+
+_codex_vm_build_placeholder_auth_json() {
+  local host_auth_json="$1"
+  python3 -c '
+import base64, json, sys
+
+host = json.loads(sys.argv[1])
+
+def encode(payload):
+    header = {"alg": "RS256", "typ": "JWT"}
+    h = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
+    p = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"{h}.{p}.placeholder"
+
+account_id = host["account_id"]
+plan_type = host.get("plan_type")
+exp = int(host["access_exp"])
+iat = max(0, exp - 3600)
+
+id_payload = {
+    "iss": "https://auth.openai.com",
+    "aud": ["app_EMoamEEZ73f0CkXaXp7hrann"],
+    "iat": iat,
+    "exp": exp,
+    "https://api.openai.com/auth": {
+        "chatgpt_account_id": account_id,
+        "chatgpt_plan_type": plan_type,
+    },
+}
+access_payload = {
+    "iss": "https://auth.openai.com",
+    "aud": ["https://api.openai.com/v1"],
+    "iat": iat,
+    "nbf": iat,
+    "exp": exp,
+    "scp": ["openid", "profile", "email", "offline_access"],
+    "https://api.openai.com/auth": {
+        "chatgpt_account_id": account_id,
+        "chatgpt_plan_type": plan_type,
+    },
+}
+
+placeholder = {
+    "auth_mode": "chatgpt",
+    "OPENAI_API_KEY": None,
+    "tokens": {
+        "id_token": encode(id_payload),
+        "access_token": encode(access_payload),
+        "refresh_token": "placeholder-refresh-token-injected-by-proxy",
+        "account_id": account_id,
+    },
+    "last_refresh": host.get("last_refresh"),
+}
+print(json.dumps(placeholder))
+' "$host_auth_json"
+}
+
+_codex_vm_prepare_host_auth() {
+  local host_auth_json
+  if ! host_auth_json="$(_codex_vm_read_valid_host_auth)"; then
+    return 1
+  fi
+  if ! _codex_vm_refresh_host_auth; then
+    return 1
+  fi
+  host_auth_json="$(_codex_vm_read_valid_host_auth)" || return 1
+  _codex_host_auth_json="$host_auth_json"
+  _codex_proxy_token="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["access_token"])' "$host_auth_json")"
+  _codex_placeholder_auth_json="$(_codex_vm_build_placeholder_auth_json "$host_auth_json")" || return 1
+}
+
 _claude_vm_post_boot_setup() {
   # Shared post-boot setup for both claude-vm and claude-vm-shell.
   # Uses variables from the calling function's scope:
   #   vm_name, host_dir, state_dir, agent, use_github,
-  #   _anthropic_token, _credential_rules, _credential_proxy_port,
+  #   _anthropic_token, _openai_token, _codex_proxy_token,
+  #   _codex_placeholder_auth_json, _credential_rules, _credential_proxy_port,
   #   _credential_proxy_secret, _claude_vm_github_repos_json
-  # Sets: _oauth_token, _intercepted_domains
+  # Sets: _oauth_token, _codex_home, _intercepted_domains
 
-  # Write oauth token if we have one, or a placeholder if AI_HTTPS_PROXY is set
-  # (Claude Code needs a token to route requests through the proxy chain)
-  _oauth_token="${_anthropic_token:-${AI_HTTPS_PROXY:+placeholder}}"
-  _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
   _claude_vm_inject_clipboard_shim "$vm_name" "$state_dir"
-  _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
-  _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
+  _oauth_token=""
+  _codex_home=""
+
+  if [ "$agent" = "claude" ] || [ "$agent" = "opencode" ]; then
+    # Write oauth token if we have one, or a placeholder if AI_HTTPS_PROXY is set
+    # (Claude Code needs a token to route requests through the proxy chain)
+    _oauth_token="${_anthropic_token:-${AI_HTTPS_PROXY:+placeholder}}"
+    _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
+    _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
+    _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
+  fi
+
+  if [ "$agent" = "codex" ]; then
+    _codex_vm_setup_home "$vm_name" "$state_dir" "${_codex_placeholder_auth_json:-}"
+    _codex_vm_write_api_key "$vm_name" "${_openai_token:-}"
+    _codex_home="${state_dir}/codex-home"
+  fi
 
   # Start proxy chain only if there are credential rules
   _intercepted_domains=""
@@ -797,6 +989,15 @@ _claude_vm_print_config() {
     [ ${#_oauth_token} -gt 16 ] && _truncated="${_truncated}..."
     echo "VM env: CLAUDE_CODE_OAUTH_TOKEN=${_truncated}"
   fi
+  if [ "$agent" = "codex" ] && [ -n "${_openai_token:-}" ]; then
+    echo "VM env: OPENAI_API_KEY=dummy-key-auth-handled-by-proxy"
+  fi
+  if [ "$agent" = "codex" ] && [ -n "${_codex_proxy_token:-}" ] && [ -n "${_codex_placeholder_auth_json:-}" ]; then
+    echo "VM auth: ~/.codex/auth.json placeholders backed by host Codex auth"
+  fi
+  if [ -n "${_codex_home:-}" ]; then
+    echo "Codex home: ${_codex_home}"
+  fi
   if [ -n "${AI_HTTPS_PROXY:-}" ]; then
     echo "AI upstream proxy: $AI_HTTPS_PROXY"
   fi
@@ -818,6 +1019,22 @@ _claude_vm_write_oauth_token() {
 export CLAUDE_CODE_OAUTH_TOKEN=$token
 EOF
     sudo chmod 644 /etc/profile.d/claude-oauth.sh
+  "
+}
+
+_codex_vm_write_api_key() {
+  local vm_name="$1"
+  local token="$2"
+  if [ -z "$token" ]; then
+    return
+  fi
+  # Use a placeholder API key inside the VM. Real auth is injected by the
+  # host credential proxy for api.openai.com.
+  limactl shell "$vm_name" bash -c "
+    sudo tee /etc/profile.d/codex-api-key.sh > /dev/null <<EOF
+export OPENAI_API_KEY=dummy-key-auth-handled-by-proxy
+EOF
+    sudo chmod 644 /etc/profile.d/codex-api-key.sh
   "
 }
 
@@ -847,6 +1064,38 @@ _claude_vm_setup_session_persistence() {
     fi
     ln -sfn "$SESSION_DIR/claude.json" ~/.claude.json
   '
+}
+
+_codex_vm_setup_home() {
+  local vm_name="$1"
+  local state_dir="$2"
+  local placeholder_auth_json="${3:-}"
+  limactl shell "$vm_name" bash -c '
+    CODEX_HOME_DIR="'"$state_dir"'/codex-home"
+    mkdir -p "$CODEX_HOME_DIR"
+    if [ -d ~/.codex ] && [ ! -L ~/.codex ]; then
+      cp -a ~/.codex/. "$CODEX_HOME_DIR/" 2>/dev/null || true
+      rm -rf ~/.codex
+    fi
+    ln -sfn "$CODEX_HOME_DIR" ~/.codex
+    if [ -f "$CODEX_HOME_DIR/auth.json" ] && grep -q "placeholder-refresh-token-injected-by-proxy\|\\.placeholder\"" "$CODEX_HOME_DIR/auth.json"; then
+      rm -f "$CODEX_HOME_DIR/auth.json"
+    fi
+    if [ ! -f "$CODEX_HOME_DIR/config.toml" ]; then
+      cat > "$CODEX_HOME_DIR/config.toml" << '\''CONFIG'\''
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+CONFIG
+    fi
+  '
+  if [ -n "$placeholder_auth_json" ]; then
+    limactl shell "$vm_name" bash -c "
+      cat > '$state_dir/codex-home/auth.json' <<'AUTH'
+$placeholder_auth_json
+AUTH
+      chmod 600 '$state_dir/codex-home/auth.json'
+    "
+  fi
 }
 
 _claude_vm_ensure_onboarding_config() {
@@ -1212,6 +1461,19 @@ _agent_vm_run() {
 
   # Get Anthropic token
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
+  local _openai_token="${OPENAI_API_KEY:-}"
+  local _codex_proxy_token="${_openai_token:-}"
+  local _codex_host_auth_json=""
+  local _codex_placeholder_auth_json=""
+  if [ "$agent" = "codex" ] && [ -z "$_openai_token" ]; then
+    if _codex_vm_prepare_host_auth; then
+      echo "Using host Codex ChatGPT auth via credential proxy."
+    else
+      _codex_proxy_token=""
+      _codex_placeholder_auth_json=""
+      echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+    fi
+  fi
 
   # Get GitHub token
   _claude_vm_github_repos_json='{}'
@@ -1222,7 +1484,7 @@ _agent_vm_run() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1241,6 +1503,11 @@ _agent_vm_run() {
   for _m in "${extra_mounts[@]}"; do
     _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
   done
+  local clone_memory="$memory"
+  local _clone_memory_args=()
+  if [ -n "$clone_memory" ]; then
+    _clone_memory_args=(--memory "$clone_memory")
+  fi
 
   echo "Starting VM '$vm_name'..."
   # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
@@ -1250,6 +1517,7 @@ _agent_vm_run() {
     --set ".mounts=[${_mounts_json}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
+    "${_clone_memory_args[@]}" \
     --tty=false &>/dev/null
 
   # USB passthrough: resolve devices, unbind host drivers
@@ -1323,6 +1591,9 @@ _agent_vm_run() {
   if [ "$agent" = "opencode" ]; then
     echo "Updating OpenCode..."
     limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
+  elif [ "$agent" = "codex" ]; then
+    echo "Updating Codex..."
+    limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
   else
     echo "Updating Claude Code..."
     limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
@@ -1333,6 +1604,15 @@ _agent_vm_run() {
       limactl shell --workdir "$host_dir" "$vm_name" \
       env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
       opencode "${args[@]}"
+  elif [ "$agent" = "codex" ]; then
+    local codex_env=()
+    if [ -n "$_openai_token" ]; then
+      codex_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
+    fi
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+      limactl shell --workdir "$host_dir" "$vm_name" \
+      env "${codex_env[@]}" \
+      codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
   else
     local claude_args=("--model" "opus[1m]" "${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
@@ -1357,9 +1637,9 @@ _agent_vm_shell() {
   fi
 
   case "$agent" in
-    ""|claude|opencode) ;;
+    ""|claude|opencode|codex) ;;
     *)
-      echo "Error: Unknown agent '$agent' for shell. Use: claude or opencode." >&2
+      echo "Error: Unknown agent '$agent' for shell. Use: claude, opencode, or codex." >&2
       return 1
       ;;
   esac
@@ -1418,6 +1698,19 @@ _agent_vm_shell() {
 
   # Get Anthropic token
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
+  local _openai_token="${OPENAI_API_KEY:-}"
+  local _codex_proxy_token="${_openai_token:-}"
+  local _codex_host_auth_json=""
+  local _codex_placeholder_auth_json=""
+  if [ "$agent" = "codex" ] && [ -z "$_openai_token" ]; then
+    if _codex_vm_prepare_host_auth; then
+      echo "Using host Codex ChatGPT auth via credential proxy."
+    else
+      _codex_proxy_token=""
+      _codex_placeholder_auth_json=""
+      echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
+    fi
+  fi
 
   # Get GitHub token
   _claude_vm_github_repos_json='{}'
@@ -1428,7 +1721,7 @@ _agent_vm_shell() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_claude_vm_github_repos_json")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1447,12 +1740,18 @@ _agent_vm_shell() {
   for _m in "${extra_mounts[@]}"; do
     _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
   done
+  local clone_memory="$memory"
+  local _clone_memory_args=()
+  if [ -n "$clone_memory" ]; then
+    _clone_memory_args=(--memory "$clone_memory")
+  fi
 
   # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
     --set ".mounts=[${_mounts_json}]" \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
+    "${_clone_memory_args[@]}" \
     --tty=false &>/dev/null
 
   # USB passthrough: resolve devices, unbind host drivers
@@ -1619,10 +1918,11 @@ agent-vm() {
     echo "  setup              Create the VM template (run once)"
     echo "  claude [args]      Run Claude Code in a sandboxed VM"
     echo "  opencode [args]    Run OpenCode in a sandboxed VM"
+    echo "  codex [args]       Run Codex in a sandboxed VM"
     echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)"
     echo "  memory [vm] [size] Query or adjust VM memory via balloon (e.g. 'memory 12G')"
     echo ""
-    echo "Options (for claude, opencode, shell):"
+    echo "Options (for claude, opencode, codex, shell):"
     echo "  --memory GB        Initial memory for the VM (default: 2G with balloon, 4G without)"
     echo "  --max-memory GB    Memory ceiling (default: from template; balloon grows up to this)"
     echo "  --no-git           Skip GitHub integration"
@@ -1649,6 +1949,9 @@ agent-vm() {
       ;;
     opencode)
       _agent_vm_run opencode "$@"
+      ;;
+    codex)
+      _agent_vm_run codex "$@"
       ;;
     shell)
       _agent_vm_shell "$@"
