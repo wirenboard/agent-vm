@@ -130,7 +130,7 @@
 Перед запуском device auth flow для каждого репозитория (основного и подмодулей) проверяется наличие write-доступа через `git push --dry-run --no-verify origin HEAD`. Работает с любым типом хост-аутентификации (SSH-ключи, HTTPS-токены). Успешный exit code или отказ "non-fast-forward" / "up to date" означают наличие push-доступа. Репозитории без write-доступа пропускаются — device auth flow не запускается.
 
 **Условный запуск:**
-- `CLAUDE_VM_PROXY_ACCESS_TOKEN` задан → `CLAUDE_CODE_OAUTH_TOKEN=<token>` (proxy подменяет Authorization)
+- `CLAUDE_VM_PROXY_ACCESS_TOKEN` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (реальный токен остаётся на хосте, proxy подменяет Authorization)
 - `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан, но `AI_HTTPS_PROXY` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (трафик маршрутизируется через upstream proxy)
 - Ни `CLAUDE_VM_PROXY_ACCESS_TOKEN`, ни `AI_HTTPS_PROXY` не заданы → `CLAUDE_CODE_OAUTH_TOKEN` не создаётся
 - Нет ни одного токена (ни Anthropic, ни GitHub) и нет `AI_HTTPS_PROXY` → credential-proxy и mitmproxy не запускаются, ВМ работает без прокси

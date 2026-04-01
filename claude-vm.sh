@@ -993,9 +993,11 @@ _claude_vm_post_boot_setup() {
   _codex_home=""
 
   if [ "$agent" = "claude" ] || [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
-    # Write oauth token if we have one, or a placeholder if AI_HTTPS_PROXY is set
-    # (Claude Code needs a token to route requests through the proxy chain)
-    _oauth_token="${_anthropic_token:-${AI_HTTPS_PROXY:+placeholder}}"
+    # Write a placeholder oauth token so Claude Code attempts API requests.
+    # The real auth header is injected by the host credential proxy —
+    # never expose the actual token inside the VM.
+    _oauth_token="${_anthropic_token:+placeholder}"
+    _oauth_token="${_oauth_token:-${AI_HTTPS_PROXY:+placeholder}}"
     _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
     _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
     _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
@@ -1077,8 +1079,9 @@ _claude_vm_write_oauth_token() {
   if [ -z "$token" ]; then
     return
   fi
-  # Set CLAUDE_CODE_OAUTH_TOKEN so Claude Code authenticates via the proxy.
-  # Real auth header is injected by the host credential proxy.
+  # Set CLAUDE_CODE_OAUTH_TOKEN so Claude Code attempts API requests.
+  # The value is always a placeholder; the real auth header is injected
+  # by the host credential proxy.
   limactl shell "$vm_name" bash -c "
     sudo tee /etc/profile.d/claude-oauth.sh > /dev/null <<EOF
 export CLAUDE_CODE_OAUTH_TOKEN=$token
