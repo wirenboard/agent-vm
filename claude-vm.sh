@@ -707,6 +707,7 @@ pull requests, issues, and other GitHub operations:
 
 ${repo_list}
 INSTRUCTIONS
+
   "
 }
 
@@ -1040,6 +1041,12 @@ print(','.join(seen))
     _claude_vm_inject_git_credentials "$vm_name"
     _claude_vm_inject_gh_credentials "$vm_name"
     _claude_vm_write_instructions "$vm_name" "$_claude_vm_github_repos_json"
+
+    # Codex does not honor ~/.claude/CLAUDE.md; it reads ~/.codex/AGENTS.md
+    if [ "$agent" = "codex" ] || [ -z "$agent" ]; then
+      limactl shell "$vm_name" bash -c \
+        'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
+    fi
   fi
 
   if [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
