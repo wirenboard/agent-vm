@@ -510,12 +510,21 @@ if repos:
         'headers': {'Authorization': f'token {first_token}'}
     })
 if copilot_token:
-    copilot_headers = {'Authorization': f'Bearer {copilot_token}'}
-    for domain in ('api.githubcopilot.com', 'api.individual.githubcopilot.com'):
-        rules.append({
-            'domain': domain,
-            'headers': copilot_headers,
-        })
+    if copilot_token == 'proxy-managed':
+        # Upstream proxy handles auth — just route through it
+        for domain in ('api.githubcopilot.com', 'api.individual.githubcopilot.com'):
+            rules.append({
+                'domain': domain,
+                'headers': {},
+                'use_proxy': True,
+            })
+    else:
+        copilot_headers = {'Authorization': f'Bearer {copilot_token}'}
+        for domain in ('api.githubcopilot.com', 'api.individual.githubcopilot.com'):
+            rules.append({
+                'domain': domain,
+                'headers': copilot_headers,
+            })
 print(json.dumps(rules))
 " "$anthropic_token" "$openai_token" "$github_repos_json" "$copilot_token"
 }
@@ -1412,6 +1421,14 @@ _claude_vm_get_copilot_token() {
   # Populate _copilot_token for use with api.githubcopilot.com.
   # Uses the OpenCode OAuth App (Ov23li8tweQw6odWQebz, read:user scope) —
   # the only app that grants full model access (Claude, Gemini, GPT-5, etc.).
+
+  # Skip device flow when upstream proxy handles Copilot auth
+  if [ "${COPILOT_SKIP_DEVICE_FLOW:-0}" = "1" ] || [ -n "${AI_HTTPS_PROXY:-}" ]; then
+    echo "  Copilot auth handled by upstream proxy, skipping device flow"
+    _copilot_token="proxy-managed"
+    return
+  fi
+
   local copilot_cache_file="$HOME/.cache/claude-vm/copilot-token.json"
   local token
   token=$(python3 "$SCRIPT_DIR/copilot_token.py" "$copilot_cache_file") || true
