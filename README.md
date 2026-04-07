@@ -247,11 +247,20 @@ When `AI_HTTPS_PROXY` is set, only AI API requests (`api.anthropic.com`, `api.op
 When you run `agent-vm claude`, `agent-vm opencode`, or `agent-vm codex` inside a git repo with a GitHub remote, it automatically:
 
 1. Detects the repository (and submodules) from `git remote`
-2. Checks push access via `git push --dry-run`
-3. Obtains repo-scoped GitHub tokens via the device flow (browser-based OAuth)
-4. Configures the credential proxy with per-repo path-prefix rules
-5. Rewrites SSH URLs to HTTPS so all git traffic goes through mitmproxy
-6. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
+2. Scans any `--mount` directories for additional GitHub repos and their submodules
+3. Checks push access via `git push --dry-run`
+4. Obtains repo-scoped GitHub tokens via the device flow (browser-based OAuth)
+5. Configures the credential proxy with per-repo path-prefix rules
+6. Rewrites SSH URLs to HTTPS so all git traffic goes through mitmproxy
+7. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
+
+This means mounted git repos get full GitHub integration (push, pull, `gh` CLI) just like the main project directory. For example:
+
+```bash
+agent-vm claude --mount ../other-repo --mount ../shared-lib
+```
+
+All three repos (current directory, `other-repo`, and `shared-lib`) will get their own scoped tokens if they have GitHub remotes with push access.
 
 No credentials are ever exposed to the VM. The credential proxy injects tokens on the host side based on the request path (e.g. `/owner/repo` for git, `/repos/owner/repo` for the GitHub API).
 

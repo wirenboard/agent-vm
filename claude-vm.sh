@@ -1301,45 +1301,59 @@ _claude_vm_check_push_access() {
 }
 
 _claude_vm_get_github_token() {
-  # Acquire a GitHub token for the project and its submodules.
+  # Acquire a GitHub token for the project, its submodules, and any extra
+  # mounted directories that are GitHub repos.
+  # Usage: _claude_vm_get_github_token host_dir [extra_mount ...]
   # Sets _claude_vm_github_token (first repo's token) and _claude_vm_github_repos_json.
   local host_dir="$1"
-  local repos_json='{}'
-  local owner="" repo=""
+  shift
+  local extra_mounts=("$@")
+  local -A _seen_repos=()  # slug -> token, for dedup and final JSON build
   _claude_vm_github_token=""
 
-  # Detect main repo from git remote
-  local repo_url
-  repo_url=$(git -C "$host_dir" remote get-url origin 2>/dev/null)
-  if [ -n "$repo_url" ]; then
-    read -r owner repo < <(_claude_vm_parse_github_remote "$repo_url") || true
-    if [ -n "$owner" ] && [ -n "$repo" ]; then
-      # Check push access before starting device auth flow
-      if ! _claude_vm_check_push_access "$host_dir"; then
-        echo "  $owner/$repo: no write access, skipping token request"
-      else
-        echo "Requesting GitHub token for $owner/$repo..."
-        local token
-        token=$(python3 "$SCRIPT_DIR/github_app_token_demo.py" \
-          user-token --client-id Iv23liisR1WdpJmDUPLT \
-          --repo "$repo_url" --token-only \
-          --cache-dir "$HOME/.cache/claude-vm") || true
-        if [ -n "$token" ]; then
-          _claude_vm_github_token="$token"
-          repos_json=$(python3 -c "import json; print(json.dumps({__import__('sys').argv[1]: __import__('sys').argv[2]}))" \
-            "$owner/$repo" "$token")
-        else
-          echo "  Warning: no token for $owner/$repo"
+  _get_token_for_repo() {
+    local _owner="$1" _repo="$2" _url="$3" _dir="$4"
+    local _slug="$_owner/$_repo"
+    [[ -n "${_seen_repos[$_slug]+x}" ]] && return 0
+    if ! _claude_vm_check_push_access "$_dir"; then
+      echo "  $_slug: no write access, skipping token request"
+      return 0
+    fi
+    echo "Requesting GitHub token for $_slug..."
+    local _token
+    _token=$(python3 "$SCRIPT_DIR/github_app_token_demo.py" \
+      user-token --client-id Iv23liisR1WdpJmDUPLT \
+      --repo "$_url" --token-only \
+      --cache-dir "$HOME/.cache/claude-vm") || true
+    if [ -n "$_token" ]; then
+      _seen_repos[$_slug]="$_token"
+      [ -z "$_claude_vm_github_token" ] && _claude_vm_github_token="$_token"
+      echo "  Got token for $_slug"
+    else
+      echo "  Warning: no token for $_slug"
+    fi
+  }
+
+  _scan_dir_for_repos() {
+    local _dir="$1"
+    local _label="${2:-}"
+    [ -d "$_dir/.git" ] || [ -f "$_dir/.git" ] || return 0
+
+    local _url _owner _repo
+    _url=$(git -C "$_dir" remote get-url origin 2>/dev/null) || true
+    if [ -n "$_url" ]; then
+      read -r _owner _repo < <(_claude_vm_parse_github_remote "$_url") || true
+      if [ -n "$_owner" ] && [ -n "$_repo" ]; then
+        if [ -n "$_label" ]; then
+          echo "Found GitHub repo $_owner/$_repo in ${_label} $(basename "$_dir")"
         fi
+        _get_token_for_repo "$_owner" "$_repo" "$_url" "$_dir"
       fi
     fi
-  fi
 
-  # Detect GitHub submodules from .gitmodules
-  if [ -f "$host_dir/.gitmodules" ]; then
-    local sub_entries
-    # Print "url<TAB>path" for each GitHub submodule
-    sub_entries=$(python3 -c "
+    if [ -f "$_dir/.gitmodules" ]; then
+      local _sub_entries
+      _sub_entries=$(python3 -c "
 import configparser, sys
 p = configparser.ConfigParser()
 p.read(sys.argv[1])
@@ -1348,56 +1362,49 @@ for s in p.sections():
     path = p.get(s, 'path', fallback='')
     if 'github.com' in url:
         print(f'{url}\t{path}')
-" "$host_dir/.gitmodules")
-    local sub_url sub_path sub_owner sub_repo sub_token sub_dir
-    while IFS=$'\t' read -r sub_url sub_path; do
-      [ -z "$sub_url" ] && continue
-      read -r sub_owner sub_repo < <(_claude_vm_parse_github_remote "$sub_url") || continue
-      [ -z "$sub_owner" ] || [ -z "$sub_repo" ] && continue
-      # Skip if same as main repo
-      [ -n "$owner" ] && [ "$sub_owner/$sub_repo" = "$owner/$repo" ] && continue
+" "$_dir/.gitmodules")
+      local _sub_url _sub_path _sub_owner _sub_repo _sub_dir
+      while IFS=$'\t' read -r _sub_url _sub_path; do
+        [ -z "$_sub_url" ] && continue
+        read -r _sub_owner _sub_repo < <(_claude_vm_parse_github_remote "$_sub_url") || continue
+        [ -z "$_sub_owner" ] || [ -z "$_sub_repo" ] && continue
 
-      # Check push access before requesting a scoped token
-      sub_dir=""
-      [ -n "$sub_path" ] && [ -e "$host_dir/$sub_path/.git" ] && sub_dir="$host_dir/$sub_path"
-      if ! _claude_vm_check_push_access "$sub_dir"; then
-        echo "  Submodule $sub_owner/$sub_repo: no write access, skipping token request"
-        continue
-      fi
+        _sub_dir=""
+        [ -n "$_sub_path" ] && [ -e "$_dir/$_sub_path/.git" ] && _sub_dir="$_dir/$_sub_path"
+        _get_token_for_repo "$_sub_owner" "$_sub_repo" "$_sub_url" "$_sub_dir"
+      done <<< "$_sub_entries"
+    fi
+  }
 
-      echo "Requesting GitHub token for submodule $sub_owner/$sub_repo..."
-      sub_token=$(python3 "$SCRIPT_DIR/github_app_token_demo.py" \
-        user-token --client-id Iv23liisR1WdpJmDUPLT \
-        --repo "$sub_url" --token-only \
-        --cache-dir "$HOME/.cache/claude-vm") || true
-      if [ -n "$sub_token" ]; then
-        repos_json=$(python3 -c "
-import json, sys
-d = json.loads(sys.argv[1])
-d[sys.argv[2]] = sys.argv[3]
-print(json.dumps(d))
-" "$repos_json" "$sub_owner/$sub_repo" "$sub_token")
-        echo "  Got token for $sub_owner/$sub_repo"
-        # Use first available token if main repo didn't have one
-        [ -z "$_claude_vm_github_token" ] && _claude_vm_github_token="$sub_token"
-      else
-        echo "  Warning: no token for $sub_owner/$sub_repo (skipping credential injection)"
-      fi
-    done <<< "$sub_entries"
-  fi
+  _scan_dir_for_repos "$host_dir"
 
-  # If no repos were configured, skip GitHub integration
-  if [ "$repos_json" = '{}' ]; then
-    echo "Warning: No GitHub repos found (no remote, no submodules), skipping GitHub" >&2
+  local _host_realpath
+  _host_realpath="$(realpath "$host_dir" 2>/dev/null)" || true
+  local _mount
+  for _mount in "${extra_mounts[@]}"; do
+    _mount="$(realpath "$_mount" 2>/dev/null)" || continue
+    [ "$_mount" = "$_host_realpath" ] && continue
+    _scan_dir_for_repos "$_mount" "mount"
+  done
+
+  if [ ${#_seen_repos[@]} -eq 0 ]; then
+    echo "Warning: No GitHub repos found (no remote, no submodules, no mounts), skipping GitHub" >&2
     _claude_vm_github_repos_json='{}'
     return 1
   fi
 
-  local _scope_list
-  _scope_list=$(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1]).keys()))" "$repos_json")
-  echo "GitHub token acquired (scope: $_scope_list)"
+  # Build repos JSON from associative array
+  local _repos_json="{"
+  local _first=true _slug
+  for _slug in "${!_seen_repos[@]}"; do
+    $_first || _repos_json="${_repos_json},"
+    _first=false
+    _repos_json="${_repos_json}\"${_slug}\":\"${_seen_repos[$_slug]}\""
+  done
+  _repos_json="${_repos_json}}"
 
-  _claude_vm_github_repos_json="$repos_json"
+  echo "GitHub token acquired (scope: $(IFS=', '; echo "${!_seen_repos[*]}"))"
+  _claude_vm_github_repos_json="$_repos_json"
 }
 
 
@@ -1674,7 +1681,7 @@ _agent_vm_run() {
   _claude_vm_github_repos_json='{}'
   _claude_vm_github_token=""
   if $use_github; then
-    _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
+    _claude_vm_get_github_token "$host_dir" "${extra_mounts[@]}" || echo "Continuing without GitHub..."
     _claude_vm_get_copilot_token
   fi
 
@@ -1945,7 +1952,7 @@ _agent_vm_shell() {
   _claude_vm_github_repos_json='{}'
   _claude_vm_github_token=""
   if $use_github; then
-    _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
+    _claude_vm_get_github_token "$host_dir" "${extra_mounts[@]}" || echo "Continuing without GitHub..."
     _claude_vm_get_copilot_token
   fi
 
