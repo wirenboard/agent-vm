@@ -1056,6 +1056,12 @@ print(','.join(seen))
       limactl shell "$vm_name" bash -c \
         'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
     fi
+
+    # Copilot CLI reads ~/.copilot/copilot-instructions.md
+    if [ "$agent" = "copilot" ] || [ -z "$agent" ]; then
+      limactl shell "$vm_name" bash -c \
+        'mkdir -p "$HOME/.copilot" && ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.copilot/copilot-instructions.md"'
+    fi
   fi
 
   if [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
@@ -1223,6 +1229,12 @@ _copilot_vm_setup_home() {
       rm -rf ~/.copilot
     fi
     ln -sfn "$COPILOT_HOME_DIR" ~/.copilot
+    # Trust all folders — the VM itself is the sandbox
+    CONFIG="$COPILOT_HOME_DIR/config.json"
+    if [ ! -f "$CONFIG" ]; then
+      echo "{}" > "$CONFIG"
+    fi
+    jq ".trusted_folders = [\"/\"]" "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
   '
 }
 
