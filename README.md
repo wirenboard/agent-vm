@@ -264,6 +264,17 @@ Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using t
 3. **Multi-repo**: Each repo gets its own scoped token. The credential proxy uses path-prefix matching to inject the right token per request.
 4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired.
 
+### GitHub Copilot API
+
+Agents get access to the [GitHub Copilot API](https://docs.github.com/en/copilot/using-github-copilot/using-github-copilot-in-the-command-line) (`api.githubcopilot.com`) via a `gho_*` OAuth token injected by the credential proxy.
+
+Token acquisition strategy (in order):
+
+1. **Dedicated Copilot cache** — a previously cached token is loaded from `~/.cache/claude-vm/copilot-token.json`.
+2. **Device flow** — if no cached token is found, an OAuth device flow runs using the OpenCode OAuth App (`Ov23li8tweQw6odWQebz`) with `read:user` scope. This app grants access to the full model list (Claude, Gemini, GPT-5, etc.). The token is cached for future sessions.
+
+Copilot access requires your GitHub account to have an active Copilot subscription.
+
 ## How it works
 
 1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode + Codex, and stops it as a reusable template

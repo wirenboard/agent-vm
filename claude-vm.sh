@@ -440,11 +440,12 @@ _claude_vm_install_host_proxy_ca() {
 
 _claude_vm_build_credential_rules() {
   # Build CREDENTIAL_PROXY_RULES JSON from tokens.
-  # Args: anthropic_token openai_token github_repos_json
+  # Args: anthropic_token openai_token github_repos_json copilot_token
   # github_repos_json: '{"owner/repo": "token", ...}' — per-repo tokens
   local anthropic_token="$1"
   local openai_token="$2"
   local github_repos_json="$3"
+  local copilot_token="$4"
 
   python3 -c "
 import base64, json, sys
@@ -452,6 +453,7 @@ rules = []
 anthropic_token = sys.argv[1]
 openai_token = sys.argv[2]
 repos = json.loads(sys.argv[3]) if sys.argv[3] else {}
+copilot_token = sys.argv[4]
 # Always intercept api.anthropic.com (for upstream proxy routing via use_proxy).
 # Inject Authorization only if a token is provided.
 anthropic_headers = {}
@@ -502,8 +504,15 @@ if repos:
         'domain': 'api.github.com',
         'headers': {'Authorization': f'token {first_token}'}
     })
+if copilot_token:
+    copilot_headers = {'Authorization': f'Bearer {copilot_token}'}
+    for domain in ('api.githubcopilot.com', 'api.individual.githubcopilot.com'):
+        rules.append({
+            'domain': domain,
+            'headers': copilot_headers,
+        })
 print(json.dumps(rules))
-" "$anthropic_token" "$openai_token" "$github_repos_json"
+" "$anthropic_token" "$openai_token" "$github_repos_json" "$copilot_token"
 }
 
 _claude_vm_start_credential_proxy() {
@@ -983,7 +992,7 @@ _claude_vm_post_boot_setup() {
   # Shared post-boot setup for both claude-vm and claude-vm-shell.
   # Uses variables from the calling function's scope:
   #   vm_name, host_dir, state_dir, agent, use_github,
-  #   _anthropic_token, _openai_token, _codex_proxy_token,
+  #   _anthropic_token, _openai_token, _codex_proxy_token, _copilot_token,
   #   _codex_placeholder_auth_json, _credential_rules, _credential_proxy_port,
   #   _credential_proxy_secret, _claude_vm_github_repos_json
   # Sets: _oauth_token, _codex_home, _intercepted_domains
@@ -1008,6 +1017,8 @@ _claude_vm_post_boot_setup() {
     _codex_vm_write_api_key "$vm_name" "${_openai_token:-}"
     _codex_home="${state_dir}/codex-home"
   fi
+
+  _copilot_vm_write_token "$vm_name" "${_copilot_token:-}"
 
   # Start proxy chain only if there are credential rules
   _intercepted_domains=""
@@ -1059,6 +1070,9 @@ _claude_vm_print_config() {
   if [ -n "${_openai_token:-}" ]; then
     echo "VM env: OPENAI_API_KEY=dummy-key-auth-handled-by-proxy"
   fi
+  if [ -n "${_copilot_token:-}" ]; then
+    echo "VM auth: github-copilot placeholder in auth.json (proxy injects gho_* token at runtime)"
+  fi
   if [ -n "${_codex_proxy_token:-}" ] && [ -n "${_codex_placeholder_auth_json:-}" ]; then
     echo "VM auth: ~/.codex/auth.json placeholders backed by host Codex auth"
   fi
@@ -1103,6 +1117,22 @@ _codex_vm_write_api_key() {
 export OPENAI_API_KEY=dummy-key-auth-handled-by-proxy
 EOF
     sudo chmod 644 /etc/profile.d/codex-api-key.sh
+  "
+}
+
+_copilot_vm_write_token() {
+  local vm_name="$1"
+  local token="$2"
+  if [ -z "$token" ]; then
+    return
+  fi
+  # Use a placeholder token inside the VM. Real auth is injected by the
+  # host credential proxy for api.githubcopilot.com.
+  limactl shell "$vm_name" bash -c "
+    sudo tee /etc/profile.d/copilot-token.sh > /dev/null <<EOF
+export COPILOT_GITHUB_TOKEN=placeholder-copilot-token-injected-by-proxy
+EOF
+    sudo chmod 644 /etc/profile.d/copilot-token.sh
   "
 }
 
@@ -1329,6 +1359,108 @@ print(json.dumps(d))
 }
 
 
+_claude_vm_get_copilot_token() {
+  # Populate _copilot_token for use with api.githubcopilot.com.
+  #
+  # Strategy (in order):
+  #   1. Load from a dedicated Copilot token cache.
+  #   2. Run an OAuth device flow using the OpenCode OAuth App
+  #      (Ov23li8tweQw6odWQebz) with scope "read:user".
+  #      Only this app grants full model access (Claude, Gemini, GPT-5, etc.).
+
+  local copilot_cache_file="$HOME/.cache/claude-vm/copilot-token.json"
+
+  # 1. Check dedicated Copilot cache
+  if [ -f "$copilot_cache_file" ]; then
+    local cached_token
+    cached_token=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    print(json.load(f).get('access_token', ''))
+" "$copilot_cache_file" 2>/dev/null) || true
+    if [ -n "$cached_token" ]; then
+      _copilot_token="$cached_token"
+      echo "Using cached Copilot token"
+      return 0
+    fi
+  fi
+
+  # 2. OAuth device flow with read:user scope only (no repo access)
+  echo "Requesting GitHub token for Copilot API access..."
+  local token
+  token=$(python3 -c "
+import urllib.request, json, sys, time, os
+
+CLIENT_ID = 'Ov23li8tweQw6odWQebz'
+CACHE_FILE = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def post(url, params):
+    data = json.dumps(params).encode()
+    req = urllib.request.Request(url, data=data,
+        headers={'Accept': 'application/json', 'Content-Type': 'application/json'})
+    with opener.open(req, timeout=10) as r:
+        return json.load(r)
+
+# Request device code
+resp = post('https://github.com/login/device/code',
+    {'client_id': CLIENT_ID, 'scope': 'read:user'})
+code = resp['user_code']
+interval = resp.get('interval', 5)
+
+print(file=sys.stderr)
+print('  ' + '=' * 50, file=sys.stderr)
+print(f'    Open:  https://github.com/login/device', file=sys.stderr)
+print(f'    Enter: {code}', file=sys.stderr)
+print('  ' + '=' * 50, file=sys.stderr)
+print(file=sys.stderr)
+print(f'  Waiting for authorization (expires in {resp[\"expires_in\"]}s)...', file=sys.stderr)
+
+# Poll for token
+deadline = time.time() + resp['expires_in']
+while time.time() < deadline:
+    time.sleep(interval)
+    try:
+        token_resp = post('https://github.com/login/oauth/access_token', {
+            'client_id': CLIENT_ID,
+            'device_code': resp['device_code'],
+            'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+        })
+    except Exception:
+        continue
+
+    if 'access_token' in token_resp:
+        token = token_resp['access_token']
+        # Cache the token
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump({'access_token': token}, f)
+        os.chmod(CACHE_FILE, 0o600)
+        print('  Authorization successful!', file=sys.stderr)
+        print(token)
+        sys.exit(0)
+
+    error = token_resp.get('error', '')
+    if error == 'slow_down':
+        interval = token_resp.get('interval', interval + 5)
+    elif error == 'authorization_pending':
+        continue
+    else:
+        print(f'  Error: {error}', file=sys.stderr)
+        sys.exit(1)
+
+print('  Error: device code expired', file=sys.stderr)
+sys.exit(1)
+" "$copilot_cache_file") || true
+
+  if [ -n "$token" ]; then
+    _copilot_token="$token"
+  else
+    echo "  Warning: could not obtain Copilot token, Copilot API will be unavailable"
+  fi
+}
+
+
 _claude_vm_security_snapshot() {
   local host_dir="$1"
   local snapshot_file="$2"
@@ -1451,12 +1583,18 @@ _opencode_vm_setup_auth() {
     _openai_api_auth_json='{"type":"api","key":"dummy-key-auth-handled-by-proxy"}'
   fi
 
+  local _copilot_auth_json=""
+  if [ -n "${_copilot_token:-}" ]; then
+    _copilot_auth_json='{"type":"oauth","refresh":"placeholder-copilot-token-injected-by-proxy","access":"placeholder-copilot-token-injected-by-proxy","expires":0}'
+  fi
+
   local auth_json
   auth_json=$(python3 -c "
 import json, sys
 anthropic = sys.argv[1]
 openai_api = sys.argv[2]
 openai_oauth = sys.argv[3]
+copilot = sys.argv[4]
 auth = {}
 if anthropic:
     auth['anthropic'] = json.loads(anthropic)
@@ -1464,8 +1602,10 @@ if openai_oauth:
     auth['openai'] = json.loads(openai_oauth)
 elif openai_api:
     auth['openai'] = json.loads(openai_api)
+if copilot:
+    auth['github-copilot'] = json.loads(copilot)
 print(json.dumps(auth, indent=2))
-" "$_anthropic_auth_json" "$_openai_api_auth_json" "$_openai_oauth_auth_json")
+" "$_anthropic_auth_json" "$_openai_api_auth_json" "$_openai_oauth_auth_json" "$_copilot_auth_json")
 
   limactl shell "$vm_name" bash -c '
     mkdir -p ~/.local/share/opencode
@@ -1552,6 +1692,7 @@ _agent_vm_run() {
   # Get Anthropic token
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
   local _openai_token="${OPENAI_API_KEY:-}"
+  local _copilot_token=""
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
@@ -1579,11 +1720,12 @@ _agent_vm_run() {
   _claude_vm_github_token=""
   if $use_github; then
     _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
+    _claude_vm_get_copilot_token
   fi
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1798,6 +1940,7 @@ _agent_vm_shell() {
   # Get Anthropic token
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
   local _openai_token="${OPENAI_API_KEY:-}"
+  local _copilot_token=""
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
@@ -1841,11 +1984,12 @@ _agent_vm_shell() {
   _claude_vm_github_token=""
   if $use_github; then
     _claude_vm_get_github_token "$host_dir" || echo "Continuing without GitHub..."
+    _claude_vm_get_copilot_token
   fi
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
