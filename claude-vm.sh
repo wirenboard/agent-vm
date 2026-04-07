@@ -11,6 +11,7 @@
 #   agent-vm claude [args]    - Run Claude in a fresh VM (args forwarded to claude)
 #   agent-vm opencode [args]  - Run OpenCode in a fresh VM (args forwarded to opencode)
 #   agent-vm codex [args]     - Run Codex in a fresh VM (args forwarded to codex)
+#   agent-vm copilot [args]   - Run GitHub Copilot CLI in a fresh VM (args forwarded to copilot)
 #   agent-vm shell [agent]    - Open a debug shell in a fresh VM
 
 CLAUDE_VM_TEMPLATE="claude-template"
@@ -187,10 +188,10 @@ _agent_vm_setup() {
       --help|-h)
         echo "Usage: agent-vm setup [--minimal] [--disk GB] [--memory GB]"
         echo ""
-        echo "Create a VM template with Claude Code, OpenCode, and Codex pre-installed."
+        echo "Create a VM template with Claude Code, OpenCode, Codex, and Copilot CLI pre-installed."
         echo ""
         echo "Options:"
-        echo "  --minimal      Only install git, curl, jq, Claude Code, OpenCode, and Codex"
+        echo "  --minimal      Only install git, curl, jq, Claude Code, OpenCode, Codex, and Copilot CLI"
         echo "  --disk GB      VM disk size (default: 30)"
         echo "  --memory GB    VM memory (default: 16 on Linux with balloon, 4 on macOS)"
         echo "  --help         Show this help"
@@ -370,6 +371,10 @@ MKTJSON
   # Install Codex
   echo "Installing Codex..."
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc 'curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh'
+
+  # Install GitHub Copilot CLI
+  echo "Installing GitHub Copilot CLI..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc 'curl -fsSL https://gh.io/copilot-install | bash'
 
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
@@ -1019,6 +1024,10 @@ _claude_vm_post_boot_setup() {
     _codex_home="${state_dir}/codex-home"
   fi
 
+  if [ "$agent" = "copilot" ] || [ -z "$agent" ]; then
+    _copilot_vm_setup_home "$vm_name" "$state_dir"
+  fi
+
   _copilot_vm_write_token "$vm_name" "${_copilot_token:-}"
 
   # Start proxy chain only if there are credential rules
@@ -1201,6 +1210,20 @@ AUTH
       chmod 600 '$state_dir/codex-home/auth.json'
     "
   fi
+}
+
+_copilot_vm_setup_home() {
+  local vm_name="$1"
+  local state_dir="$2"
+  limactl shell "$vm_name" bash -c '
+    COPILOT_HOME_DIR="'"$state_dir"'/copilot-home"
+    mkdir -p "$COPILOT_HOME_DIR"
+    if [ -d ~/.copilot ] && [ ! -L ~/.copilot ]; then
+      cp -a ~/.copilot/. "$COPILOT_HOME_DIR/" 2>/dev/null || true
+      rm -rf ~/.copilot
+    fi
+    ln -sfn "$COPILOT_HOME_DIR" ~/.copilot
+  '
 }
 
 _claude_vm_ensure_onboarding_config() {
@@ -1755,6 +1778,9 @@ _agent_vm_run() {
   elif [ "$agent" = "codex" ]; then
     echo "Updating Codex..."
     limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+  elif [ "$agent" = "copilot" ]; then
+    echo "Updating Copilot CLI..."
+    limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | bash) >/dev/null 2>&1 || true'
   else
     echo "Updating Claude Code..."
     limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
@@ -1774,6 +1800,10 @@ _agent_vm_run() {
       limactl shell --workdir "$host_dir" "$vm_name" \
       env "${codex_env[@]}" \
       codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
+  elif [ "$agent" = "copilot" ]; then
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+      limactl shell --workdir "$host_dir" "$vm_name" \
+      env copilot --yolo "${args[@]}"
   else
     local claude_args=("--model" "opus[1m]" "${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
@@ -1798,9 +1828,9 @@ _agent_vm_shell() {
   fi
 
   case "$agent" in
-    ""|claude|opencode|codex) ;;
+    ""|claude|opencode|codex|copilot) ;;
     *)
-      echo "Error: Unknown agent '$agent' for shell. Use: claude, opencode, or codex." >&2
+      echo "Error: Unknown agent '$agent' for shell. Use: claude, opencode, codex, or copilot." >&2
       return 1
       ;;
   esac
@@ -2015,6 +2045,8 @@ _agent_vm_shell() {
   limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
   echo "Updating Codex..."
   limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+  echo "Updating Copilot CLI..."
+  limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | bash) >/dev/null 2>&1 || true'
 
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
   _claude_vm_print_config
@@ -2117,10 +2149,11 @@ agent-vm() {
     echo "  claude [args]      Run Claude Code in a sandboxed VM"
     echo "  opencode [args]    Run OpenCode in a sandboxed VM"
     echo "  codex [args]       Run Codex in a sandboxed VM"
+    echo "  copilot [args]     Run GitHub Copilot CLI in a sandboxed VM"
     echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)"
     echo "  memory [vm] [size] Query or adjust VM memory via balloon (e.g. 'memory 12G')"
     echo ""
-    echo "Options (for claude, opencode, codex, shell):"
+    echo "Options (for claude, opencode, codex, copilot, shell):"
     echo "  --memory GB        Initial memory for the VM (default: 2G with balloon, 4G without)"
     echo "  --max-memory GB    Memory ceiling (default: from template; balloon grows up to this)"
     echo "  --no-git           Skip GitHub integration"
@@ -2150,6 +2183,9 @@ agent-vm() {
       ;;
     codex)
       _agent_vm_run codex "$@"
+      ;;
+    copilot)
+      _agent_vm_run copilot "$@"
       ;;
     shell)
       _agent_vm_shell "$@"
