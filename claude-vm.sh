@@ -1361,98 +1361,11 @@ print(json.dumps(d))
 
 _claude_vm_get_copilot_token() {
   # Populate _copilot_token for use with api.githubcopilot.com.
-  #
-  # Strategy (in order):
-  #   1. Load from a dedicated Copilot token cache.
-  #   2. Run an OAuth device flow using the OpenCode OAuth App
-  #      (Ov23li8tweQw6odWQebz) with scope "read:user".
-  #      Only this app grants full model access (Claude, Gemini, GPT-5, etc.).
-
+  # Uses the OpenCode OAuth App (Ov23li8tweQw6odWQebz, read:user scope) —
+  # the only app that grants full model access (Claude, Gemini, GPT-5, etc.).
   local copilot_cache_file="$HOME/.cache/claude-vm/copilot-token.json"
-
-  # 1. Check dedicated Copilot cache
-  if [ -f "$copilot_cache_file" ]; then
-    local cached_token
-    cached_token=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    print(json.load(f).get('access_token', ''))
-" "$copilot_cache_file" 2>/dev/null) || true
-    if [ -n "$cached_token" ]; then
-      _copilot_token="$cached_token"
-      echo "Using cached Copilot token"
-      return 0
-    fi
-  fi
-
-  # 2. OAuth device flow with read:user scope only (no repo access)
-  echo "Requesting GitHub token for Copilot API access..."
   local token
-  token=$(python3 -c "
-import urllib.request, json, sys, time, os
-
-CLIENT_ID = 'Ov23li8tweQw6odWQebz'
-CACHE_FILE = sys.argv[1]
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-def post(url, params):
-    data = json.dumps(params).encode()
-    req = urllib.request.Request(url, data=data,
-        headers={'Accept': 'application/json', 'Content-Type': 'application/json'})
-    with opener.open(req, timeout=10) as r:
-        return json.load(r)
-
-# Request device code
-resp = post('https://github.com/login/device/code',
-    {'client_id': CLIENT_ID, 'scope': 'read:user'})
-code = resp['user_code']
-interval = resp.get('interval', 5)
-
-print(file=sys.stderr)
-print('  ' + '=' * 50, file=sys.stderr)
-print(f'    Open:  https://github.com/login/device', file=sys.stderr)
-print(f'    Enter: {code}', file=sys.stderr)
-print('  ' + '=' * 50, file=sys.stderr)
-print(file=sys.stderr)
-print(f'  Waiting for authorization (expires in {resp[\"expires_in\"]}s)...', file=sys.stderr)
-
-# Poll for token
-deadline = time.time() + resp['expires_in']
-while time.time() < deadline:
-    time.sleep(interval)
-    try:
-        token_resp = post('https://github.com/login/oauth/access_token', {
-            'client_id': CLIENT_ID,
-            'device_code': resp['device_code'],
-            'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
-        })
-    except Exception:
-        continue
-
-    if 'access_token' in token_resp:
-        token = token_resp['access_token']
-        # Cache the token
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        with open(CACHE_FILE, 'w') as f:
-            json.dump({'access_token': token}, f)
-        os.chmod(CACHE_FILE, 0o600)
-        print('  Authorization successful!', file=sys.stderr)
-        print(token)
-        sys.exit(0)
-
-    error = token_resp.get('error', '')
-    if error == 'slow_down':
-        interval = token_resp.get('interval', interval + 5)
-    elif error == 'authorization_pending':
-        continue
-    else:
-        print(f'  Error: {error}', file=sys.stderr)
-        sys.exit(1)
-
-print('  Error: device code expired', file=sys.stderr)
-sys.exit(1)
-" "$copilot_cache_file") || true
-
+  token=$(python3 "$SCRIPT_DIR/copilot_token.py" "$copilot_cache_file") || true
   if [ -n "$token" ]; then
     _copilot_token="$token"
   else
