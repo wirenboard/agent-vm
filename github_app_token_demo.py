@@ -293,6 +293,24 @@ def load_cached_token(cache_dir, client_id, owner, repo):
             pass
         return None
 
+    # Validate the token is still accepted by GitHub
+    req = urllib.request.Request("https://api.github.com/user")
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            verbose("Cached token rejected by GitHub (401), discarding")
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+    except Exception:
+        pass  # Network error — keep token, let it fail later
+
     verbose(f"Using cached token")
     return token
 
