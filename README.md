@@ -330,6 +330,19 @@ Finally, using a VM means you don't need Node.js, npm, Docker, or any other dev 
 
 For AI agents running with `--dangerously-skip-permissions`, a VM is the only sandbox that provides meaningful security.
 
+## Usage tracking
+
+Since each VM instance stores Claude session data in its own state directory rather than the standard `~/.claude/`, tools like [ccusage](https://github.com/ryoppippi/ccusage) won't find them by default. A wrapper script is included that discovers all agent-vm session directories automatically:
+
+```bash
+bin/ccusage                        # Daily report (default)
+bin/ccusage monthly                # Monthly report
+bin/ccusage --since 20260401       # Filter by date
+bin/ccusage -i                     # Break down by project
+```
+
+The wrapper sets `CLAUDE_CONFIG_DIR` to include `~/.claude`, `~/.config/claude`, and all `claude-sessions/` directories under `~/.local/state/agent-vm/`.
+
 ## License
 
 MIT
