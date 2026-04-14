@@ -14,6 +14,61 @@ Feedbacks welcome!
 - [Lima](https://lima-vm.io/docs/installation/) (installed automatically via Homebrew if available)
 - A [Claude subscription](https://claude.ai/) (Pro, Max, or Team), an [OpenCode](https://opencode.ai/) compatible provider, and/or an OpenAI Codex-capable account or API key
 
+## Windows (WSL2)
+
+agent-vm also runs on Windows via WSL2, using `agent-vm-wsl.sh` instead of Lima. Each agent run gets its own ephemeral WSL2 distro cloned from a template, with the same credential proxy and mitmproxy setup.
+
+### Prerequisites
+
+- Windows 10 (build 19041+) or Windows 11
+- [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with at least one distro installed (`wsl --install`)
+- Docker Desktop (for building the Debian base image) **or** a pre-made `debian13-base.tar`
+
+### Install
+
+From inside any WSL2 distro (e.g. the one you use day-to-day):
+
+```bash
+git clone https://github.com/sylvinus/agent-vm.git
+cd agent-vm
+
+# Add to your shell config
+echo "source $(pwd)/agent-vm-wsl.sh" >> ~/.bashrc
+source ~/.bashrc
+```
+
+### One-time setup
+
+```bash
+agent-vm setup --minimal
+```
+
+Downloads a Debian 13 base image, installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy, then exports a reusable `template.tar`. Takes ~15–25 minutes depending on internet speed.
+
+The `--minimal` flag is recommended on Windows — it skips Docker, Node.js, Python dev tools, and Chromium (not supported in WSL2 instances). The full `agent-vm setup` is macOS/Linux only.
+
+### Run an agent
+
+```bash
+cd your-project
+agent-vm claude
+agent-vm opencode
+agent-vm codex
+agent-vm copilot
+```
+
+Same interface as the Linux/macOS version. Each invocation clones the template into a fresh WSL2 distro, mounts your project directory, runs the agent, and deletes the distro on exit.
+
+### Limitations vs macOS/Linux
+
+| Feature | WSL2 |
+|---------|------|
+| `--memory` / balloon | Not supported |
+| `--usb` | Not supported |
+| Docker inside agent distro | Not supported (no systemd in instances) |
+| Chromium / Chrome MCP | Not supported |
+| `--minimal` only | Yes (full setup unsupported) |
+
 ## Install
 
 ```bash

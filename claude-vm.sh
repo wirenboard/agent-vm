@@ -374,7 +374,7 @@ MKTJSON
 
   # Install GitHub Copilot CLI
   echo "Installing GitHub Copilot CLI..."
-  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc 'curl -fsSL https://gh.io/copilot-install | bash'
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc 'curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null'
 
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
@@ -1522,14 +1522,7 @@ _opencode_vm_setup_config() {
 import json
 config = {
     '\$schema': 'https://opencode.ai/config.json',
-    'provider': {
-        'anthropic': {
-            'options': {
-                'baseURL': 'https://api.anthropic.com/v1',
-                'apiKey': 'dummy-key-auth-handled-by-proxy'
-            }
-        }
-    },
+    'disabled_providers': ['anthropic'],
     'permission': 'allow',
     'autoupdate': False,
     'watcher': {
@@ -1816,7 +1809,7 @@ _agent_vm_run() {
     limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
   elif [ "$agent" = "copilot" ]; then
     echo "Updating Copilot CLI..."
-    limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | bash) >/dev/null 2>&1 || true'
+    limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
   else
     echo "Updating Claude Code..."
     limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
@@ -1837,9 +1830,13 @@ _agent_vm_run() {
       env "${codex_env[@]}" \
       codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
   elif [ "$agent" = "copilot" ]; then
+    if ! limactl shell "$vm_name" bash -c 'command -v copilot &>/dev/null'; then
+      echo "Note: Copilot CLI is not installed in the VM template. Run 'agent-vm update-template' to add it." >&2
+      return 1
+    fi
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
       limactl shell --workdir "$host_dir" "$vm_name" \
-      env copilot --yolo "${args[@]}"
+      env copilot --yolo --model claude-opus-4.6 "${args[@]}"
   else
     local claude_args=("--model" "opus[1m]" "${args[@]}")
     CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
@@ -2082,7 +2079,7 @@ _agent_vm_shell() {
   echo "Updating Codex..."
   limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
   echo "Updating Copilot CLI..."
-  limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | bash) >/dev/null 2>&1 || true'
+  limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
 
   echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
   _claude_vm_print_config

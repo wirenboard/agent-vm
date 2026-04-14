@@ -10,9 +10,11 @@ always forwarded to the child.
 Usage:
     CLIPBOARD_DIR=/path/to/shared python3 clipboard-pty.py limactl shell ...
 
-Supports macOS (osascript/pbpaste) and Linux (wl-paste / xclip).
+Supports macOS (osascript/pbpaste), Linux (wl-paste / xclip), and
+WSL2 on Windows (powershell.exe System.Windows.Forms.Clipboard).
 """
 
+import functools
 import os
 import pty
 import select
@@ -28,8 +30,41 @@ import termios
 CTRL_V = 0x16
 
 
+@functools.lru_cache(maxsize=None)
+def _is_wsl2():
+    """Return True if running inside a WSL2 distro."""
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 def _read_clipboard_image():
     """Try to read PNG image data from the host clipboard. Returns bytes or None."""
+    if _is_wsl2():
+        # WSL2: read clipboard image via PowerShell (Windows interop)
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$img = [System.Windows.Forms.Clipboard]::GetImage();"
+            "if ($img -ne $null) {"
+            "  $ms = New-Object System.IO.MemoryStream;"
+            "  $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png);"
+            "  [Console]::OpenStandardOutput().Write($ms.ToArray(), 0, $ms.Length)"
+            "}"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout[:4] == b"\x89PNG":
+                return result.stdout
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            pass
+        return None
+
     if sys.platform == "darwin":
         # macOS: use osascript to write clipboard PNGf data to a temp file
         try:
