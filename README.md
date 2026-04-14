@@ -22,7 +22,6 @@ agent-vm also runs on Windows via WSL2, using `agent-vm-wsl.sh` instead of Lima.
 
 - Windows 10 (build 19041+) or Windows 11
 - [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with at least one distro installed (`wsl --install`)
-- Docker Desktop (for building the Debian base image) **or** a pre-made `debian13-base.tar`
 
 ### Install
 
@@ -43,7 +42,9 @@ source ~/.bashrc
 agent-vm setup --minimal
 ```
 
-Downloads a Debian 13 base image, installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy, then exports a reusable `template.tar`. Takes ~15–25 minutes depending on internet speed.
+Installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy into a fresh Debian 13 distro, then exports it as a reusable `template.tar`. Takes ~15–25 minutes depending on internet speed.
+
+The Debian 13 base image is created automatically — setup tries in order: exporting your existing Debian/Ubuntu WSL2 distro, Docker (if running), or debootstrap.
 
 The `--minimal` flag is recommended on Windows — it skips Docker, Node.js, Python dev tools, and Chromium (not supported in WSL2 instances). The full `agent-vm setup` is macOS/Linux only.
 
