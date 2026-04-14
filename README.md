@@ -2,7 +2,7 @@
 
 Run AI coding agents inside sandboxed Linux VMs. The agent gets full autonomy while your host system stays safe.
 
-Uses [Lima](https://lima-vm.io/) to create lightweight Debian VMs on macOS and Linux. Ships with dev tools, Docker, and a headless Chrome browser with [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) pre-configured.
+Uses [Lima](https://lima-vm.io/) on macOS/Linux and WSL2 on Windows to create lightweight Debian VMs. Ships with dev tools, Docker, and a headless Chrome browser with [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) pre-configured.
 
 Supports [Claude Code](https://claude.ai/code), [OpenCode](https://opencode.ai/), and [Codex CLI](https://developers.openai.com/codex/cli/).
 
@@ -16,7 +16,7 @@ Feedbacks welcome!
 
 ## Windows (WSL2)
 
-agent-vm also runs on Windows via WSL2, using `agent-vm-wsl.sh` instead of Lima. Each agent run gets its own ephemeral WSL2 distro cloned from a template, with the same credential proxy and mitmproxy setup.
+agent-vm also runs on Windows via WSL2. Each agent run gets its own ephemeral WSL2 distro cloned from a template, with the same credential proxy and mitmproxy setup. WSL2 support is built into `claude-vm.sh` — it auto-detects WSL2 at source time.
 
 ### Prerequisites
 
@@ -32,7 +32,7 @@ git clone https://github.com/sylvinus/agent-vm.git
 cd agent-vm
 
 # Add to your shell config
-echo "source $(pwd)/agent-vm-wsl.sh" >> ~/.bashrc
+echo "source $(pwd)/claude-vm.sh" >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -44,7 +44,7 @@ agent-vm setup --minimal
 
 Installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy into a fresh Debian 13 distro, then exports it as a reusable `template.tar`. Takes ~15–25 minutes depending on internet speed.
 
-The Debian 13 base image is created automatically from your existing WSL2 distro — if you have Ubuntu or Debian installed (the default from `wsl --install`), setup exports it as the base. Docker or debootstrap are used as fallbacks if no Debian/Ubuntu distro is found.
+The Debian 13 base image is created automatically — setup tries in order: exporting your existing Debian/Ubuntu WSL2 distro, Docker (if running), or debootstrap.
 
 The `--minimal` flag is recommended on Windows — it skips Docker, Node.js, Python dev tools, and Chromium (not supported in WSL2 instances). The full `agent-vm setup` is macOS/Linux only.
 
