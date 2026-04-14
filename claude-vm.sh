@@ -35,8 +35,8 @@ _agent_vm_state_root() {
   if [ -n "${AGENT_VM_STATE_DIR:-}" ]; then
     printf '%s\n' "$AGENT_VM_STATE_DIR"
   elif [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
-    # Use Windows AppData so per-project state dirs live on C: drive,
-    # accessible from every WSL2 distro via DrvFs auto-mount.
+    # Use Windows AppData so per-project state persists on C: drive across
+    # agent runs. Agent distros access it via /mnt/wsl/ bind mount (not DrvFs).
     local win_home; win_home="$(_wsl_win_home)"
     printf '%s\n' "${win_home}/.local/state/agent-vm"
   else
@@ -220,24 +220,26 @@ _wsl_run_root() {
 _wsl_run_script() {
   local distro="$1"
   local run_user="${2:-root}"
-  # Read stdin FIRST: $(cmd.exe) inside _wsl_win_home inherits stdin via binfmt_misc
-  # interop and consumes heredoc bytes, leaving cat with an empty stream.
   local script
   script=$(cat)
-  local win_tmp; win_tmp="$(_wsl_win_home)/AppData/Local/Temp/agent-vm-$$-${RANDOM}.sh"
-  printf '%s\n' "$script" > "$win_tmp"
+  # Use /mnt/wsl/ shared tmpfs so the script is accessible in the target distro
+  # without relying on DrvFs (/mnt/c/ Windows drive automount).
+  local shared_tmp="/mnt/wsl/agent-vm-tmp"
+  mkdir -p "$shared_tmp"
+  local tmp_script; tmp_script="${shared_tmp}/script-$$-${RANDOM}.sh"
+  printf '%s\n' "$script" > "$tmp_script"
+  chmod 644 "$tmp_script"
   if [ "$run_user" = "root" ]; then
-    wsl.exe -d "$distro" -u root -- bash "$win_tmp" < /dev/null
+    wsl.exe -d "$distro" -u root -- bash "$tmp_script" < /dev/null
   else
     # Don't use wsl.exe -u user: the relay tries chdir(/mnt/c/Users/user) before
     # applying --cd and gets EACCES on fresh distros. Run as root and switch via
     # sudo -u (not su -): sudo does not open a PAM session, so it won't create a
     # lingering systemd user session that blocks wsl.exe --terminate / --export.
-    local distro_tmp="/tmp/agent-vm-$$-${RANDOM}.sh"
-    wsl.exe -d "$distro" -u root -- bash -c "cp '$win_tmp' '$distro_tmp' && chmod 755 '$distro_tmp' && sudo -u '$run_user' env HOME=/home/'$run_user' bash '$distro_tmp'; rc=\$?; rm -f '$distro_tmp'; exit \$rc" < /dev/null
+    wsl.exe -d "$distro" -u root -- bash -c "sudo -u '$run_user' env HOME=/home/'$run_user' bash '$tmp_script'" < /dev/null
   fi
   local rc=$?
-  rm -f "$win_tmp" 2>/dev/null || true
+  rm -f "$tmp_script" 2>/dev/null || true
   return $rc
 }
 
@@ -292,13 +294,11 @@ _wsl_mount_dir() {
   local guest_path="${3:-$host_path}"
   local readonly="${4:-false}"
 
-  # Windows drive paths (/mnt/c/...) are auto-mounted in all distros
-  if [[ "$host_path" == /mnt/[a-zA-Z]/* || "$host_path" == /mnt/[a-zA-Z] ]]; then
-    wsl.exe -d "$distro" -u root -- bash -c "mkdir -p '$guest_path'" 2>/dev/null || true
-    return 0
-  fi
-
   # Use /mnt/wsl/ as the shared namespace for cross-distro bind mounts.
+  # DrvFs automount is disabled in agent distros for isolation, so ALL paths
+  # (including /mnt/c/... Windows paths) go through this bind-mount path.
+  # The HOST distro (which always has DrvFs) mounts host_path into /mnt/wsl/,
+  # then the agent distro accesses it there via a symlink at guest_path.
   local shared_path; shared_path="$(_wsl_shared_mnt_root)/${distro}${host_path}"
   local bind_opts="--bind"
   if [ "$readonly" = "true" ]; then
@@ -475,6 +475,8 @@ _wsl_agent_vm_setup() {
 default=user
 [boot]
 systemd=true
+[automount]
+enabled=false
 EOF
     grep -q "$(hostname)" /etc/hosts 2>/dev/null || echo "127.0.0.1 $(hostname)" >> /etc/hosts
   '
@@ -1300,8 +1302,9 @@ else:
 " "$repos_json")
 
   if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
-    # Write instructions to a Windows-accessible temp file (avoids heredoc escaping issues)
-    local instructions_file; instructions_file="$(_wsl_win_home)/AppData/Local/Temp/agent-vm-instructions-$$.md"
+    # Write instructions to /mnt/wsl/ shared tmpfs (accessible in agent without DrvFs)
+    local instructions_file; instructions_file="/mnt/wsl/agent-vm-tmp/agent-vm-instructions-$$.md"
+    mkdir -p "/mnt/wsl/agent-vm-tmp"
     cat > "$instructions_file" << 'INSTREOF'
 
 # Git access
