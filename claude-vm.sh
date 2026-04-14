@@ -1,28 +1,44 @@
 #!/usr/bin/env bash
 #
-# agent-vm: Run AI coding agents inside a sandboxed Lima VM
+# agent-vm: Run AI coding agents inside a sandboxed VM
 # Part of https://github.com/sylvinus/agent-vm
 #
 # Source this file in your shell config:
 #   source /path/to/agent-vm/claude-vm.sh
 #
 # Usage:
-#   agent-vm setup            - Create the VM template (run once)
+#   agent-vm setup            - Create the VM template/distro (run once)
 #   agent-vm claude [args]    - Run Claude in a fresh VM (args forwarded to claude)
 #   agent-vm opencode [args]  - Run OpenCode in a fresh VM (args forwarded to opencode)
 #   agent-vm codex [args]     - Run Codex in a fresh VM (args forwarded to codex)
 #   agent-vm copilot [args]   - Run GitHub Copilot CLI in a fresh VM (args forwarded to copilot)
 #   agent-vm shell [agent]    - Open a debug shell in a fresh VM
+#
+# Supports: Lima VMs (macOS/Linux), WSL2 distros (Windows)
 
 CLAUDE_VM_TEMPLATE="claude-template"
+AGENT_VM_WSL_TEMPLATE_DISTRO="agent-vm-template"
 
 # Capture script directory at source time — BASH_SOURCE[0] is only reliable
 # at the top level in zsh; inside functions it may resolve to empty/cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
+# ── Platform detection ────────────────────────────────────────────────────────
+
+_agent_vm_is_wsl2() {
+  [ -f /proc/version ] && grep -qi microsoft /proc/version
+}
+_AGENT_VM_BACKEND="lima"
+_agent_vm_is_wsl2 && _AGENT_VM_BACKEND="wsl2"
+
 _agent_vm_state_root() {
   if [ -n "${AGENT_VM_STATE_DIR:-}" ]; then
     printf '%s\n' "$AGENT_VM_STATE_DIR"
+  elif [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    # Use Windows AppData so per-project state dirs live on C: drive,
+    # accessible from every WSL2 distro via DrvFs auto-mount.
+    local win_home; win_home="$(_wsl_win_home)"
+    printf '%s\n' "${win_home}/.local/state/agent-vm"
   else
     printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm"
   fi
@@ -171,7 +187,513 @@ WRAPPER
   printf '%s\n' "$wrapper"
 }
 
+# ── WSL2 management helpers ───────────────────────────────────────────────────
+# These functions are only used when _AGENT_VM_BACKEND="wsl2".
+
+# Normalize wsl.exe output: remove BOM, CR characters, null bytes, empty lines
+_wsl_normalize() {
+  tr -d '\r\000' | grep -v '^$'
+}
+
+_wsl_list_distros() {
+  wsl.exe --list --quiet 2>/dev/null | _wsl_normalize
+}
+
+_wsl_distro_exists() {
+  _wsl_list_distros | grep -qFx "$1"
+}
+
+# Run a bash login command as user inside a WSL2 distro
+_wsl_run() {
+  local distro="$1"; shift
+  wsl.exe -d "$distro" -u user -- bash -lc "$*"
+}
+
+# Run a bash command as root inside a WSL2 distro
+_wsl_run_root() {
+  local distro="$1"; shift
+  wsl.exe -d "$distro" -u root -- bash -c "$*"
+}
+
+# Run a bash script in a WSL2 distro via a temp file on the Windows drive.
+# Avoids binfmt_misc interop problems with heredoc quoting.
+_wsl_run_script() {
+  local distro="$1"
+  local run_user="${2:-root}"
+  # Read stdin FIRST: $(cmd.exe) inside _wsl_win_home inherits stdin via binfmt_misc
+  # interop and consumes heredoc bytes, leaving cat with an empty stream.
+  local script
+  script=$(cat)
+  local win_tmp; win_tmp="$(_wsl_win_home)/AppData/Local/Temp/agent-vm-$$-${RANDOM}.sh"
+  printf '%s\n' "$script" > "$win_tmp"
+  if [ "$run_user" = "root" ]; then
+    wsl.exe -d "$distro" -u root -- bash "$win_tmp" < /dev/null
+  else
+    # Don't use wsl.exe -u user: the relay tries chdir(/mnt/c/Users/user) before
+    # applying --cd and gets EACCES on fresh distros. Run as root and switch via
+    # sudo -u (not su -): sudo does not open a PAM session, so it won't create a
+    # lingering systemd user session that blocks wsl.exe --terminate / --export.
+    local distro_tmp="/tmp/agent-vm-$$-${RANDOM}.sh"
+    wsl.exe -d "$distro" -u root -- bash -c "cp '$win_tmp' '$distro_tmp' && chmod 755 '$distro_tmp' && sudo -u '$run_user' env HOME=/home/'$run_user' bash '$distro_tmp'; rc=\$?; rm -f '$distro_tmp'; exit \$rc" < /dev/null
+  fi
+  local rc=$?
+  rm -f "$win_tmp" 2>/dev/null || true
+  return $rc
+}
+
+# Get Windows path from a WSL path (forward-slash form for wsl.exe --export).
+_wsl_win_path() {
+  wslpath -m "$1" 2>/dev/null || echo "$1"
+}
+
+# Get the Windows user's home directory as a WSL2 /mnt/c/... path.
+_wsl_win_home() {
+  local win_home; win_home="$(cmd.exe /C "echo %USERPROFILE%" 2>/dev/null | tr -d '\r\n')"
+  if [ -n "$win_home" ]; then
+    wslpath -u "$win_home" 2>/dev/null || echo "/mnt/c/Users/${USER}"
+  else
+    echo "/mnt/c/Users/${USER}"
+  fi
+}
+
+# Where the template tar and per-run instances live (Windows-native C: drive).
+_wsl_data_dir() {
+  local win_home; win_home="$(_wsl_win_home)"
+  printf '%s\n' "${win_home}/AppData/Local/agent-vm"
+}
+
+_wsl_template_tar() {
+  printf '%s\n' "$(_wsl_data_dir)/template.tar"
+}
+
+_wsl_instances_dir() {
+  printf '%s\n' "$(_wsl_data_dir)/instances"
+}
+
+# Import template tar as a new named distro (equivalent of limactl clone).
+_wsl_import_template() {
+  local distro="$1"
+  local instance_dir; instance_dir="$(_wsl_instances_dir)/$distro"
+  mkdir -p "$instance_dir"
+  local win_instance_dir; win_instance_dir="$(_wsl_win_path "$instance_dir")"
+  local win_template_tar; win_template_tar="$(_wsl_win_path "$(_wsl_template_tar)")"
+  wsl.exe --import "$distro" "$win_instance_dir" "$win_template_tar" --version 2
+}
+
+# Shared tmpfs mount point root for cross-distro directory sharing.
+_wsl_shared_mnt_root() {
+  echo "/mnt/wsl/agent-vm"
+}
+
+# Mount a HOST distro directory into a running AGENT distro via /mnt/wsl/ bind mount.
+_wsl_mount_dir() {
+  local distro="$1"
+  local host_path="$2"
+  local guest_path="${3:-$host_path}"
+  local readonly="${4:-false}"
+
+  # Windows drive paths (/mnt/c/...) are auto-mounted in all distros
+  if [[ "$host_path" == /mnt/[a-zA-Z]/* || "$host_path" == /mnt/[a-zA-Z] ]]; then
+    wsl.exe -d "$distro" -u root -- bash -c "mkdir -p '$guest_path'" 2>/dev/null || true
+    return 0
+  fi
+
+  # Use /mnt/wsl/ as the shared namespace for cross-distro bind mounts.
+  local shared_path; shared_path="$(_wsl_shared_mnt_root)/${distro}${host_path}"
+  local bind_opts="--bind"
+  if [ "$readonly" = "true" ]; then
+    bind_opts="--bind -o ro"
+  fi
+
+  sudo mkdir -p "$shared_path"
+  sudo mount $bind_opts "$host_path" "$shared_path" 2>/dev/null || {
+    mkdir -p "$shared_path"
+    mount $bind_opts "$host_path" "$shared_path" 2>/dev/null || true
+  }
+
+  if [ "$guest_path" != "$shared_path" ]; then
+    _wsl_run_script "$distro" "root" << EOF
+mkdir -p "$(dirname "$guest_path")"
+ln -sfn "$shared_path" "$guest_path" 2>/dev/null || true
+EOF
+  fi
+}
+
+# Unmount all shared directories for a distro from /mnt/wsl/
+_wsl_unmount_shared() {
+  local distro="$1"
+  local shared_root; shared_root="$(_wsl_shared_mnt_root)/${distro}"
+  if [ -d "$shared_root" ]; then
+    mount | grep "$shared_root" | awk '{print $3}' | sort -r | while read -r mnt; do
+      sudo umount "$mnt" 2>/dev/null || true
+    done
+    rm -rf "$shared_root" 2>/dev/null || true
+  fi
+}
+
+# In WSL2 all distros share the same network namespace, so the credential
+# proxy bound on localhost is reachable from the agent distro.
+_wsl_credential_proxy_host() {
+  echo "localhost"
+}
+
+# Acquire a Debian 13 base rootfs tar for WSL2 import.
+# Tries three methods: Docker, existing Debian/Ubuntu distro, debootstrap.
+_wsl_get_debian_base() {
+  local output_tar="$1"
+
+  # Method 1: Docker
+  if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+    echo "  Building Debian 13 rootfs via Docker..."
+    local cid
+    cid=$(docker create debian:trixie)
+    docker export "$cid" > "$output_tar"
+    docker rm "$cid" &>/dev/null
+    echo "  Debian 13 base image created."
+    return 0
+  fi
+
+  # Method 2: export an existing Debian/Ubuntu WSL2 distro.
+  local _current_distro="${WSL_DISTRO_NAME:-}"
+  local _existing
+  _existing=$(wsl.exe --list --quiet 2>/dev/null | tr -d '\r\000' \
+    | grep -iE '^(Debian|Ubuntu|Ubuntu-[0-9]+\.[0-9]+)$' \
+    | grep -v "^${_current_distro}$" \
+    | head -1)
+  if [ -n "$_existing" ]; then
+    echo "  Exporting '$_existing' as base image..."
+    local win_output_tar; win_output_tar="$(_wsl_win_path "$output_tar")"
+    wsl.exe --terminate "$_existing" 2>/dev/null || true
+    if wsl.exe --export "$_existing" "$win_output_tar"; then
+      echo "  Base image created from '$_existing'."
+      return 0
+    fi
+    echo "  Warning: export of '$_existing' failed, falling through to debootstrap..." >&2
+  fi
+
+  # Method 3: debootstrap
+  if ! command -v debootstrap &>/dev/null && command -v apt-get &>/dev/null; then
+    echo "  Installing debootstrap..."
+    sudo apt-get install -y -qq debootstrap 2>/dev/null || true
+  fi
+  if command -v debootstrap &>/dev/null; then
+    echo "  Building Debian 13 rootfs via debootstrap..."
+    local tmpdir; tmpdir="$(mktemp -d)"
+    sudo debootstrap --arch=amd64 trixie "$tmpdir" https://deb.debian.org/debian
+    sudo chmod 755 "$tmpdir"
+    sudo tar -C "$tmpdir" -cf "$output_tar" .
+    sudo rm -rf "$tmpdir"
+    echo "  Debian 13 base image created."
+    return 0
+  fi
+
+  cat >&2 << 'EOF'
+Error: Cannot create Debian 13 base image.
+
+No suitable base found. To create it manually, one of:
+
+  Option A — Export your existing Debian/Ubuntu WSL2 distro:
+    wsl --export Debian "%USERPROFILE%\.local\share\agent-vm\debian13-base.tar"
+
+  Option B — Docker (on Windows host, Docker Desktop):
+    docker export $(docker create debian:trixie) > %USERPROFILE%\.local\share\agent-vm\debian13-base.tar
+
+  Option C — Any Linux machine with debootstrap:
+    debootstrap --arch=amd64 trixie /tmp/debian13 https://deb.debian.org/debian
+    tar -C /tmp/debian13 -cf ~/.local/share/agent-vm/debian13-base.tar .
+EOF
+  return 1
+}
+
+# ── Setup: WSL2 template distro ───────────────────────────────────────────────
+
+_wsl_agent_vm_setup() {
+  local minimal=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        echo "Usage: agent-vm setup [--minimal]"
+        echo ""
+        echo "Create a WSL2 distro template with Claude Code, OpenCode, Codex, and Copilot CLI."
+        echo ""
+        echo "Options:"
+        echo "  --minimal      Only install git, curl, jq, Claude Code, OpenCode, Codex, Copilot CLI"
+        echo "  --help         Show this help"
+        return 0
+        ;;
+      --minimal) minimal=true; shift ;;
+      # Silently accept Lima-specific flags for portability
+      --disk|--memory) shift 2 ;;
+      --disk=*|--memory=*) shift ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if ! command -v wsl.exe &>/dev/null; then
+    echo "Error: wsl.exe not found. This script must run inside a WSL2 distro." >&2
+    return 1
+  fi
+
+  local data_dir; data_dir="$(_wsl_data_dir)"
+  local template_tar; template_tar="$(_wsl_template_tar)"
+  mkdir -p "$data_dir"
+
+  # Remove existing template distro if present
+  if _wsl_distro_exists "$AGENT_VM_WSL_TEMPLATE_DISTRO"; then
+    wsl.exe --terminate "$AGENT_VM_WSL_TEMPLATE_DISTRO" 2>/dev/null || true
+    wsl.exe --unregister "$AGENT_VM_WSL_TEMPLATE_DISTRO" 2>/dev/null || true
+  fi
+
+  # Acquire Debian 13 (trixie) base rootfs
+  local base_tar="${data_dir}/debian13-base.tar"
+  if [ ! -f "$base_tar" ]; then
+    echo "Creating Debian 13 base image..."
+    _wsl_get_debian_base "$base_tar" || return 1
+  fi
+
+  echo "Creating WSL2 template distro '$AGENT_VM_WSL_TEMPLATE_DISTRO'..."
+  local setup_dir="${data_dir}/distro-setup"
+  mkdir -p "$setup_dir"
+  local win_setup_dir; win_setup_dir="$(_wsl_win_path "$setup_dir")"
+  local win_base_tar; win_base_tar="$(_wsl_win_path "$base_tar")"
+
+  wsl.exe --import "$AGENT_VM_WSL_TEMPLATE_DISTRO" "$win_setup_dir" "$win_base_tar" --version 2
+
+  # Fix root directory permissions (WSL2 exports capture 700; processes see 755 but raw inode is 700)
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c 'chmod 755 /'
+
+  echo "Configuring base system..."
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+    groupadd -g 1000 user 2>/dev/null || true
+    id user &>/dev/null || useradd -m -s /bin/bash -u 1000 -g 1000 user
+    apt-get install -y sudo 2>/dev/null || true
+    echo "user ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/user
+    chmod 440 /etc/sudoers.d/user
+    cat > /etc/wsl.conf << '"'"'EOF'"'"'
+[user]
+default=user
+[boot]
+systemd=true
+EOF
+    grep -q "$(hostname)" /etc/hosts 2>/dev/null || echo "127.0.0.1 $(hostname)" >> /etc/hosts
+  '
+
+  # Disable needrestart interactive prompts
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+    mkdir -p /etc/needrestart/conf.d
+    printf "\$nrconf{restart} = '"'"'a'"'"';\n" > /etc/needrestart/conf.d/no-prompt.conf
+  ' 2>/dev/null || true
+
+  echo "Installing base packages..."
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- \
+    env DEBIAN_FRONTEND=noninteractive bash -c '
+      apt-get update -qq
+      apt-get install -y git curl jq gh ca-certificates sudo python3 python3-pip
+    '
+
+  _claude_vm_install_host_proxy_ca "$AGENT_VM_WSL_TEMPLATE_DISTRO"
+
+  if ! $minimal; then
+    echo "Installing dev tools..."
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- \
+      env DEBIAN_FRONTEND=noninteractive bash -c '
+        apt-get install -y \
+          wget build-essential \
+          python3 python3-pip python3-venv \
+          ripgrep fd-find htop \
+          unzip zip \
+          mosquitto-clients
+      '
+
+    echo "Installing Docker..."
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+        https://download.docker.com/linux/debian \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update -qq
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+      usermod -aG docker user
+    '
+
+    echo "Installing Node.js 22..."
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+    '
+
+    echo "Installing Chromium..."
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- \
+      env DEBIAN_FRONTEND=noninteractive bash -c '
+        apt-get install -y chromium fonts-liberation xvfb
+        ln -sf /usr/bin/chromium /usr/bin/google-chrome
+        ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable
+        mkdir -p /opt/google/chrome
+        ln -sf /usr/bin/chromium /opt/google/chrome/chrome
+      '
+
+    echo "Installing LSP servers..."
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- \
+      env DEBIAN_FRONTEND=noninteractive apt-get install -y clangd golang-go
+    _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+export PATH=$HOME/.local/bin:$PATH
+GOBIN=$HOME/.local/bin go install golang.org/x/tools/gopls@latest 2>/dev/null || true
+sudo npm install -g typescript-language-server typescript pyright 2>/dev/null || true
+EOF
+  fi
+
+  echo "Installing mitmproxy..."
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+    python3 -m pip install --break-system-packages --ignore-installed bcrypt mitmproxy 2>/dev/null || \
+    python3 -m pip install --ignore-installed bcrypt mitmproxy
+  '
+
+  echo "Installing Claude Code..."
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+curl -fsSL https://claude.ai/install.sh | bash
+EOF
+
+  # Write PATH additions to .profile (not .bashrc which has an early-return for non-interactive).
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "root" << 'EOF'
+cat >> /home/user/.profile << 'PROFEOF'
+
+# agent-vm: agent tools PATH
+export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$HOME/.opencode/bin:$PATH
+PROFEOF
+chown user:user /home/user/.profile
+EOF
+
+  # Skip first-run onboarding
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+mkdir -p ~/.claude
+printf '{"theme":"dark","hasCompletedOnboarding":true,"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' \
+  > ~/.claude/settings.json
+EOF
+
+  # Pre-install LSP plugins
+  echo "Installing Claude Code LSP plugins..."
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$PATH
+MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/claude-plugins-official"
+mkdir -p "$HOME/.claude/plugins/marketplaces"
+git clone --depth 1 https://github.com/anthropics/claude-plugins-official.git "$MARKETPLACE_DIR" 2>/dev/null || true
+cat > "$HOME/.claude/plugins/known_marketplaces.json" << MKTJSON
+{"claude-plugins-official":{"source":{"source":"github","repo":"anthropics/claude-plugins-official"},"installLocation":"$HOME/.claude/plugins/marketplaces/claude-plugins-official","lastUpdated":"2026-01-01T00:00:00.000Z"}}
+MKTJSON
+for plugin in clangd-lsp pyright-lsp typescript-lsp gopls-lsp; do
+  claude plugin install "${plugin}@claude-plugins-official" --scope user 2>/dev/null || true
+done
+EOF
+
+  echo "Installing OpenCode..."
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+curl -fsSL https://opencode.ai/install | bash
+mkdir -p ~/.local/bin
+ln -sf ~/.opencode/bin/opencode ~/.local/bin/opencode 2>/dev/null || true
+EOF
+
+  echo "Installing Codex..."
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
+EOF
+
+  echo "Installing GitHub Copilot CLI..."
+  _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+# Installer opens /dev/tty directly (bypasses < /dev/null). Rewrite to /dev/stdin
+# so the PATH-update prompt gets EOF (= N = default; agent-vm owns PATH in .profile).
+curl -fsSL https://gh.io/copilot-install | sed 's|/dev/tty|/dev/stdin|g' | bash < /dev/null
+EOF
+
+  if ! $minimal; then
+    echo "Configuring Chrome DevTools MCP server..."
+    _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" << 'EOF'
+CONFIG="$HOME/.claude.json"
+if [ -f "$CONFIG" ]; then
+  jq '.mcpServers["chrome-devtools"] = {
+    "command": "npx",
+    "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"]
+  }' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+else
+  cat > "$CONFIG" << 'JSON'
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"]
+    }
+  }
+}
+JSON
+fi
+EOF
+  fi
+
+  # Run user's custom setup script if present
+  local user_setup="$HOME/.claude-vm.setup.sh"
+  if [ -f "$user_setup" ]; then
+    echo "Running custom setup from $user_setup..."
+    _wsl_run_script "$AGENT_VM_WSL_TEMPLATE_DISTRO" "user" < "$user_setup"
+  fi
+
+  echo "Exporting template..."
+  # Kill user processes before terminating (defensive; sudo -u doesn't create systemd sessions)
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c 'pkill -u user 2>/dev/null; loginctl kill-user user 2>/dev/null; true' < /dev/null 2>/dev/null || true
+  wsl.exe --terminate "$AGENT_VM_WSL_TEMPLATE_DISTRO" 2>/dev/null || true
+
+  # --terminate only REQUESTS shutdown; with systemd=true the distro can take
+  # 15-90 seconds to fully stop. Poll until "Stopped" before export.
+  local _wait=0
+  while wsl.exe --list --verbose 2>/dev/null | tr -d '\r\000' | grep -q "$AGENT_VM_WSL_TEMPLATE_DISTRO.*Running"; do
+    [ $_wait -eq 0 ] && echo "  Waiting for distro to stop..."
+    sleep 3
+    _wait=$((_wait + 3))
+    if [ $_wait -ge 120 ]; then
+      echo "  Warning: distro still running after 120s, proceeding anyway..."
+      break
+    fi
+  done
+
+  local win_template_tar; win_template_tar="$(_wsl_win_path "$template_tar")"
+  echo "  Exporting to: $win_template_tar"
+  local _exported=false
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    if wsl.exe --export "$AGENT_VM_WSL_TEMPLATE_DISTRO" "$win_template_tar"; then
+      _exported=true
+      break
+    fi
+    echo "  Export attempt $_i failed, retrying in 5s..."
+    sleep 5
+  done
+  if ! $_exported; then
+    echo "Error: Failed to export template after 10 attempts." >&2
+    return 1
+  fi
+
+  # Clean up the setup distro — only the tar is kept.
+  for _i in 1 2 3 4 5; do
+    if wsl.exe --unregister "$AGENT_VM_WSL_TEMPLATE_DISTRO" 2>/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  rm -rf "$setup_dir" 2>/dev/null || true
+
+  echo "Template ready. Run 'agent-vm claude', 'agent-vm opencode', or 'agent-vm codex' in any project directory."
+}
+
+# ── Setup: Lima VM template ───────────────────────────────────────────────────
+
 _agent_vm_setup() {
+  # Dispatch to WSL2 implementation when running on Windows
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_agent_vm_setup "$@"
+    return $?
+  fi
+
   local minimal=false
   local disk=30
   local _has_balloon=false
@@ -433,7 +955,13 @@ CIEOF
 _claude_vm_install_host_proxy_ca() {
   local vm_name="$1"
   local host_ca="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-  if [ ! -f "$host_ca" ]; then
+  [ -f "$host_ca" ] || return 0
+
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    echo "Installing host MITM CA into WSL2 distro trust store..."
+    cat "$host_ca" | wsl.exe -d "$vm_name" -u root -- tee /usr/local/share/ca-certificates/host-mitmproxy-ca.crt > /dev/null
+    wsl.exe -d "$vm_name" -u root -- update-ca-certificates
+    wsl.exe -d "$vm_name" -u user -- git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
     return
   fi
 
@@ -555,24 +1083,39 @@ _claude_vm_start_credential_proxy() {
 _claude_vm_setup_mitmproxy() {
   local vm_name="$1"
 
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << 'EOF'
+if [ ! -f ~/.mitmproxy/mitmproxy-ca-cert.pem ]; then
+  timeout 2 mitmdump --listen-port 0 2>/dev/null || true
+fi
+sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
+sudo update-ca-certificates
+git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+EOF
+    _wsl_run_script "$vm_name" "root" << 'EOF'
+tee /etc/profile.d/credential-proxy.sh > /dev/null << 'PROXYEOF'
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export https_proxy=http://127.0.0.1:8080
+export http_proxy=http://127.0.0.1:8080
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+PROXYEOF
+chmod 644 /etc/profile.d/credential-proxy.sh
+EOF
+    return
+  fi
+
   # Generate mitmproxy CA cert and install in system trust store
   limactl shell "$vm_name" bash -c '
-    # Generate CA if not already present
     if [ ! -f ~/.mitmproxy/mitmproxy-ca-cert.pem ]; then
-      # Run mitmdump briefly to generate CA certs
       timeout 2 mitmdump --listen-port 0 2>/dev/null || true
     fi
-
-    # Install CA in system trust store
     sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
     sudo update-ca-certificates
-
-    # Configure git to use system CA bundle (includes mitmproxy CA)
     git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
   '
 
   # Set HTTPS_PROXY env var for all processes via profile.d
-  # (not .bashrc — avoids polluting the shell after mitmproxy stops)
   limactl shell "$vm_name" bash -c '
     sudo tee /etc/profile.d/credential-proxy.sh > /dev/null <<EOF
 export HTTPS_PROXY=http://127.0.0.1:8080
@@ -588,13 +1131,53 @@ EOF
 _claude_vm_start_mitmproxy() {
   local vm_name="$1"
   local credential_proxy_port="$2"
-  local intercepted_domains="$3"  # comma-separated: "api.anthropic.com,github.com,api.github.com"
-  # Copy addon script to VM
+  local intercepted_domains="$3"
+
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    local proxy_host; proxy_host="$(_wsl_credential_proxy_host)"
+    wsl.exe -d "$vm_name" -u user -- bash -c 'mkdir -p ~/.mitmproxy'
+    cat "$SCRIPT_DIR/mitmproxy-addon.py" | wsl.exe -d "$vm_name" -u user -- bash -c 'cat > ~/.mitmproxy/addon.py'
+    _wsl_run_script "$vm_name" "user" << 'EOF'
+cat > /tmp/start-mitmproxy.sh << 'LAUNCHER'
+#!/bin/bash
+exec mitmdump \
+  --listen-port 8080 \
+  --set connection_strategy=lazy \
+  -s ~/.mitmproxy/addon.py
+LAUNCHER
+chmod +x /tmp/start-mitmproxy.sh
+EOF
+    # Start mitmproxy in the background via nohup + setsid.
+    # setsid ensures it survives the parent shell exiting.
+    _wsl_run_script "$vm_name" "user" << EOF
+nohup setsid env \\
+  CREDENTIAL_PROXY_HOST='${proxy_host}' \\
+  CREDENTIAL_PROXY_PORT='${credential_proxy_port}' \\
+  CREDENTIAL_PROXY_SECRET='${_credential_proxy_secret}' \\
+  CREDENTIAL_PROXY_DOMAINS='${intercepted_domains}' \\
+  BLOCKED_DOMAINS='datadoghq.com' \\
+  /tmp/start-mitmproxy.sh > /tmp/mitmproxy.log 2>&1 &
+echo \$! > /tmp/mitmproxy.pid
+EOF
+    _wsl_run_script "$vm_name" "user" << 'EOF'
+for i in $(seq 1 30); do
+  if bash -c "echo >/dev/tcp/127.0.0.1/8080" 2>/dev/null; then
+    echo "mitmproxy ready"
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "ERROR: mitmproxy failed to start. Logs:" >&2
+cat /tmp/mitmproxy.log >&2
+exit 1
+EOF
+    return
+  fi
+
+  # Lima: copy addon script and start via systemd-run
   limactl shell "$vm_name" bash -c 'mkdir -p ~/.mitmproxy'
   cat "$SCRIPT_DIR/mitmproxy-addon.py" | limactl shell "$vm_name" bash -c 'cat > ~/.mitmproxy/addon.py'
 
-  # Write a launcher script into the VM, then start it via systemd-run.
-  # Direct "nohup ... &" inside "limactl shell" doesn't survive the SSH session exit.
   limactl shell "$vm_name" bash -c "
     cat > /tmp/start-mitmproxy.sh << 'LAUNCHER'
 #!/bin/bash
@@ -606,7 +1189,6 @@ LAUNCHER
     chmod +x /tmp/start-mitmproxy.sh
   "
 
-  # Start as a systemd user service so it survives the limactl shell session
   limactl shell "$vm_name" bash -c "
     systemd-run --user --unit=mitmproxy \
       --setenv=CREDENTIAL_PROXY_HOST=host.lima.internal \
@@ -617,7 +1199,6 @@ LAUNCHER
       /tmp/start-mitmproxy.sh
   "
 
-  # Wait for mitmproxy to be ready (single session: launch + wait)
   limactl shell "$vm_name" bash -c '
     for i in $(seq 1 30); do
       if bash -c "echo >/dev/tcp/127.0.0.1/8080" 2>/dev/null; then
@@ -634,22 +1215,28 @@ LAUNCHER
 
 _claude_vm_inject_git_credentials() {
   local vm_name="$1"
-
-  # Get git user identity from host
   local git_name git_email
   git_name=$(git config user.name 2>/dev/null || echo "")
   git_email=$(git config user.email 2>/dev/null || echo "")
 
-  # Set up git credential helper with a placeholder token.
-  # The real token is injected by the host credential proxy via mitmproxy.
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+git config --global credential.helper store
+mkdir -p \$HOME
+echo 'https://x-access-token:placeholder@github.com' > \$HOME/.git-credentials
+chmod 600 \$HOME/.git-credentials
+git config --global url."https://github.com/".insteadOf "git@github.com:"
+${git_name:+git config --global user.name "${git_name}"}
+${git_email:+git config --global user.email "${git_email}"}
+EOF
+    return
+  fi
+
   limactl shell "$vm_name" bash -c "
     git config --global credential.helper store
-    # Store a placeholder credential for github.com
-    # (git will send this, mitmproxy intercepts, host proxy overwrites with real token)
     mkdir -p \$HOME
     echo 'https://x-access-token:placeholder@github.com' > \$HOME/.git-credentials
     chmod 600 \$HOME/.git-credentials
-    # Rewrite SSH URLs to HTTPS so all git traffic goes through mitmproxy
     git config --global url.\"https://github.com/\".insteadOf \"git@github.com:\"
     ${git_name:+git config --global user.name \"$git_name\"}
     ${git_email:+git config --global user.email \"$git_email\"}
@@ -659,10 +1246,23 @@ _claude_vm_inject_git_credentials() {
 _claude_vm_inject_gh_credentials() {
   local vm_name="$1"
 
-  # Write gh config with placeholder token.
-  # Real auth is injected by the host credential proxy via mitmproxy.
-  # config.yml must have version: "1" to prevent gh >=2.40 from attempting
-  # a multi-account migration that calls the GitHub API (which fails without proxy).
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << 'EOF'
+mkdir -p "$HOME/.config/gh"
+cat > "$HOME/.config/gh/config.yml" << 'CONFIG'
+version: "1"
+git_protocol: https
+CONFIG
+cat > "$HOME/.config/gh/hosts.yml" << 'HOSTS'
+github.com:
+    oauth_token: placeholder-token-injected-by-proxy
+    user: x-access-token
+    git_protocol: https
+HOSTS
+EOF
+    return
+  fi
+
   limactl shell "$vm_name" bash -c '
     mkdir -p "$HOME/.config/gh"
     cat > "$HOME/.config/gh/config.yml" << '\''CONFIG'\''
@@ -680,7 +1280,7 @@ HOSTS
 
 _claude_vm_write_instructions() {
   local vm_name="$1"
-  local repos_json="$2"  # JSON dict: {"owner/repo": "token", ...} or "{}"
+  local repos_json="$2"
 
   local repo_list
   repo_list=$(python3 -c "
@@ -698,6 +1298,37 @@ else:
         print(f'  - {s}')
     print('Other repos will require their own authentication.')
 " "$repos_json")
+
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    # Write instructions to a Windows-accessible temp file (avoids heredoc escaping issues)
+    local instructions_file; instructions_file="$(_wsl_win_home)/AppData/Local/Temp/agent-vm-instructions-$$.md"
+    cat > "$instructions_file" << 'INSTREOF'
+
+# Git access
+
+Git push and pull to GitHub work out of the box for this repository.
+You can use standard git commands:
+
+    git push origin main
+    git push origin HEAD:my-branch
+    git pull origin main
+
+The `gh` CLI also works and is pre-authenticated. You can use it for
+pull requests, issues, and other GitHub operations:
+
+    gh pr list
+    gh pr create --title "..." --body "..."
+    gh issue list
+
+INSTREOF
+    printf '%s\n' "$repo_list" >> "$instructions_file"
+    _wsl_run_script "$vm_name" "user" << EOF
+mkdir -p \$HOME/.claude
+cat "${instructions_file}" >> \$HOME/.claude/CLAUDE.md
+rm -f "${instructions_file}"
+EOF
+    return
+  fi
 
   limactl shell "$vm_name" bash -c "
     mkdir -p \$HOME/.claude
@@ -728,6 +1359,47 @@ INSTRUCTIONS
 _claude_vm_inject_clipboard_shim() {
   local vm_name="$1"
   local state_dir="$2"
+
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+mkdir -p ~/.local/bin
+
+cat > ~/.local/bin/wl-paste << 'SHIM'
+#!/bin/sh
+CLIPBOARD_FILE="${state_dir}/clipboard.png"
+for arg in "\$@"; do
+  case "\$arg" in
+    -l|--list-types)
+      if [ -f "\$CLIPBOARD_FILE" ]; then echo "image/png"; exit 0
+      else exit 1; fi
+      ;;
+  esac
+done
+if [ -f "\$CLIPBOARD_FILE" ]; then exec cat "\$CLIPBOARD_FILE"; fi
+exit 1
+SHIM
+chmod +x ~/.local/bin/wl-paste
+
+cat > ~/.local/bin/xclip << 'XSHIM'
+#!/bin/sh
+CLIPBOARD_FILE="${state_dir}/clipboard.png"
+has_targets=false; has_output=false
+for arg in "\$@"; do
+  case "\$arg" in TARGETS) has_targets=true;; -o) has_output=true;; esac
+done
+if \$has_targets && \$has_output; then
+  [ -f "\$CLIPBOARD_FILE" ] && echo "image/png" && exit 0; exit 1
+fi
+if \$has_output; then
+  [ -f "\$CLIPBOARD_FILE" ] && exec cat "\$CLIPBOARD_FILE"; exit 1
+fi
+exit 1
+XSHIM
+chmod +x ~/.local/bin/xclip
+EOF
+    return
+  fi
+
   limactl shell "$vm_name" bash -c '
     mkdir -p ~/.local/bin
     cat > ~/.local/bin/wl-paste << '\''SHIM'\''
@@ -1062,14 +1734,24 @@ print(','.join(seen))
 
     # Codex does not honor ~/.claude/CLAUDE.md; it reads ~/.codex/AGENTS.md
     if [ "$agent" = "codex" ] || [ -z "$agent" ]; then
-      limactl shell "$vm_name" bash -c \
-        'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
+      if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+        wsl.exe -d "$vm_name" -u user -- bash -c \
+          'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
+      else
+        limactl shell "$vm_name" bash -c \
+          'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
+      fi
     fi
 
     # Copilot CLI reads ~/.copilot/copilot-instructions.md
     if [ "$agent" = "copilot" ] || [ -z "$agent" ]; then
-      limactl shell "$vm_name" bash -c \
-        'mkdir -p "$HOME/.copilot" && ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.copilot/copilot-instructions.md"'
+      if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+        wsl.exe -d "$vm_name" -u user -- bash -c \
+          'mkdir -p "$HOME/.copilot" && ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.copilot/copilot-instructions.md"'
+      else
+        limactl shell "$vm_name" bash -c \
+          'mkdir -p "$HOME/.copilot" && ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.copilot/copilot-instructions.md"'
+      fi
     fi
   fi
 
@@ -1082,7 +1764,11 @@ print(','.join(seen))
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
     echo "Running project runtime setup..."
-    limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
+    if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+      wsl.exe -d "$vm_name" -u user -- bash -l < "${host_dir}/.claude-vm.runtime.sh"
+    else
+      limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
+    fi
   fi
 }
 
@@ -1090,7 +1776,13 @@ _claude_vm_print_config() {
   # Print proxy/credential configuration summary.
   # Uses variables from the calling function's scope.
   if [ -n "$_credential_proxy_port" ]; then
-    echo "Credential proxy: http://host.lima.internal:${_credential_proxy_port}"
+    local _proxy_host
+    if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+      _proxy_host="localhost"
+    else
+      _proxy_host="host.lima.internal"
+    fi
+    echo "Credential proxy: http://${_proxy_host}:${_credential_proxy_port}"
     echo "Intercepted domains: $_intercepted_domains"
   fi
   if [ -n "$_oauth_token" ]; then
@@ -1121,12 +1813,16 @@ _claude_vm_print_config() {
 _claude_vm_write_oauth_token() {
   local vm_name="$1"
   local token="$2"
-  if [ -z "$token" ]; then
+  [ -z "$token" ] && return 0
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "root" << EOF
+tee /etc/profile.d/claude-oauth.sh > /dev/null << 'TOKENEOF'
+export CLAUDE_CODE_OAUTH_TOKEN=${token}
+TOKENEOF
+chmod 644 /etc/profile.d/claude-oauth.sh
+EOF
     return
   fi
-  # Set CLAUDE_CODE_OAUTH_TOKEN so Claude Code attempts API requests.
-  # The value is always a placeholder; the real auth header is injected
-  # by the host credential proxy.
   limactl shell "$vm_name" bash -c "
     sudo tee /etc/profile.d/claude-oauth.sh > /dev/null <<EOF
 export CLAUDE_CODE_OAUTH_TOKEN=$token
@@ -1138,11 +1834,16 @@ EOF
 _codex_vm_write_api_key() {
   local vm_name="$1"
   local token="$2"
-  if [ -z "$token" ]; then
+  [ -z "$token" ] && return 0
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "root" << 'EOF'
+tee /etc/profile.d/codex-api-key.sh > /dev/null << 'KEYEOF'
+export OPENAI_API_KEY=dummy-key-auth-handled-by-proxy
+KEYEOF
+chmod 644 /etc/profile.d/codex-api-key.sh
+EOF
     return
   fi
-  # Use a placeholder API key inside the VM. Real auth is injected by the
-  # host credential proxy for api.openai.com.
   limactl shell "$vm_name" bash -c "
     sudo tee /etc/profile.d/codex-api-key.sh > /dev/null <<EOF
 export OPENAI_API_KEY=dummy-key-auth-handled-by-proxy
@@ -1154,11 +1855,16 @@ EOF
 _copilot_vm_write_token() {
   local vm_name="$1"
   local token="$2"
-  if [ -z "$token" ]; then
+  [ -z "$token" ] && return 0
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "root" << 'EOF'
+tee /etc/profile.d/copilot-token.sh > /dev/null << 'TOKEOF'
+export COPILOT_GITHUB_TOKEN=placeholder-copilot-token-injected-by-proxy
+TOKEOF
+chmod 644 /etc/profile.d/copilot-token.sh
+EOF
     return
   fi
-  # Use a placeholder token inside the VM. Real auth is injected by the
-  # host credential proxy for api.githubcopilot.com.
   limactl shell "$vm_name" bash -c "
     sudo tee /etc/profile.d/copilot-token.sh > /dev/null <<EOF
 export COPILOT_GITHUB_TOKEN=placeholder-copilot-token-injected-by-proxy
@@ -1170,6 +1876,31 @@ EOF
 _claude_vm_setup_session_persistence() {
   local vm_name="$1"
   local state_dir="$2"
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+SESSION_DIR="${state_dir}/claude-sessions"
+mkdir -p ~/.claude \\
+  "\$SESSION_DIR/projects" \\
+  "\$SESSION_DIR/file-history" \\
+  "\$SESSION_DIR/todos" \\
+  "\$SESSION_DIR/plans"
+ln -sfn "\$SESSION_DIR/projects" ~/.claude/projects
+ln -sfn "\$SESSION_DIR/file-history" ~/.claude/file-history
+ln -sfn "\$SESSION_DIR/todos" ~/.claude/todos
+ln -sfn "\$SESSION_DIR/plans" ~/.claude/plans
+touch "\$SESSION_DIR/history.jsonl"
+ln -sfn "\$SESSION_DIR/history.jsonl" ~/.claude/history.jsonl
+if [ ! -f "\$SESSION_DIR/claude.json" ]; then
+  if [ -f ~/.claude.json ] && [ ! -L ~/.claude.json ]; then
+    cp ~/.claude.json "\$SESSION_DIR/claude.json"
+  else
+    echo '{}' > "\$SESSION_DIR/claude.json"
+  fi
+fi
+ln -sfn "\$SESSION_DIR/claude.json" ~/.claude.json
+EOF
+    return
+  fi
   limactl shell "$vm_name" bash -c '
     SESSION_DIR="'"$state_dir"'/claude-sessions"
     mkdir -p ~/.claude \
@@ -1183,7 +1914,6 @@ _claude_vm_setup_session_persistence() {
     ln -sfn "$SESSION_DIR/plans" ~/.claude/plans
     touch "$SESSION_DIR/history.jsonl"
     ln -sfn "$SESSION_DIR/history.jsonl" ~/.claude/history.jsonl
-
     if [ ! -f "$SESSION_DIR/claude.json" ]; then
       if [ -f ~/.claude.json ] && [ ! -L ~/.claude.json ]; then
         cp ~/.claude.json "$SESSION_DIR/claude.json"
@@ -1199,6 +1929,30 @@ _codex_vm_setup_home() {
   local vm_name="$1"
   local state_dir="$2"
   local placeholder_auth_json="${3:-}"
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+CODEX_HOME_DIR="${state_dir}/codex-home"
+mkdir -p "\$CODEX_HOME_DIR"
+if [ -d ~/.codex ] && [ ! -L ~/.codex ]; then
+  cp -a ~/.codex/. "\$CODEX_HOME_DIR/" 2>/dev/null || true
+  rm -rf ~/.codex
+fi
+ln -sfn "\$CODEX_HOME_DIR" ~/.codex
+if [ -f "\$CODEX_HOME_DIR/auth.json" ] && grep -q "placeholder-refresh-token-injected-by-proxy\|\\.placeholder\"" "\$CODEX_HOME_DIR/auth.json"; then
+  rm -f "\$CODEX_HOME_DIR/auth.json"
+fi
+if [ ! -f "\$CODEX_HOME_DIR/config.toml" ]; then
+  printf 'sandbox_mode = "danger-full-access"\napproval_policy = "never"\n' \\
+    > "\$CODEX_HOME_DIR/config.toml"
+fi
+EOF
+    if [ -n "$placeholder_auth_json" ]; then
+      mkdir -p "${state_dir}/codex-home"
+      printf '%s\n' "$placeholder_auth_json" > "${state_dir}/codex-home/auth.json"
+      chmod 600 "${state_dir}/codex-home/auth.json" 2>/dev/null || true
+    fi
+    return
+  fi
   limactl shell "$vm_name" bash -c '
     CODEX_HOME_DIR="'"$state_dir"'/codex-home"
     mkdir -p "$CODEX_HOME_DIR"
@@ -1230,6 +1984,21 @@ AUTH
 _copilot_vm_setup_home() {
   local vm_name="$1"
   local state_dir="$2"
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+COPILOT_HOME_DIR="${state_dir}/copilot-home"
+mkdir -p "\$COPILOT_HOME_DIR"
+if [ -d ~/.copilot ] && [ ! -L ~/.copilot ]; then
+  cp -a ~/.copilot/. "\$COPILOT_HOME_DIR/" 2>/dev/null || true
+  rm -rf ~/.copilot
+fi
+ln -sfn "\$COPILOT_HOME_DIR" ~/.copilot
+CONFIG="\$COPILOT_HOME_DIR/config.json"
+[ ! -f "\$CONFIG" ] && echo '{}' > "\$CONFIG"
+jq ".trusted_folders = [\"/\"]" "\$CONFIG" > "\$CONFIG.tmp" && mv "\$CONFIG.tmp" "\$CONFIG"
+EOF
+    return
+  fi
   limactl shell "$vm_name" bash -c '
     COPILOT_HOME_DIR="'"$state_dir"'/copilot-home"
     mkdir -p "$COPILOT_HOME_DIR"
@@ -1238,7 +2007,6 @@ _copilot_vm_setup_home() {
       rm -rf ~/.copilot
     fi
     ln -sfn "$COPILOT_HOME_DIR" ~/.copilot
-    # Trust all folders — the VM itself is the sandbox
     CONFIG="$COPILOT_HOME_DIR/config.json"
     if [ ! -f "$CONFIG" ]; then
       echo "{}" > "$CONFIG"
@@ -1250,24 +2018,38 @@ _copilot_vm_setup_home() {
 _claude_vm_ensure_onboarding_config() {
   local vm_name="$1"
   local host_dir="$2"
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+CONFIG="\$HOME/.claude.json"
+SETTINGS="\$HOME/.claude/settings.json"
+mkdir -p "\$HOME/.claude"
+[ ! -f "\$SETTINGS" ] && echo '{}' > "\$SETTINGS"
+jq ".hasCompletedOnboarding = true | .skipDangerousModePermissionPrompt = true" \\
+  "\$SETTINGS" > "\$SETTINGS.tmp" && mv "\$SETTINGS.tmp" "\$SETTINGS"
+[ ! -f "\$CONFIG" ] && echo '{}' > "\$CONFIG"
+jq --arg project_path "${host_dir}" \\
+  '.hasCompletedOnboarding = true
+   | .lastOnboardingVersion = (.lastOnboardingVersion // "vm")
+   | .effortCalloutDismissed = true
+   | .projects = (.projects // {})
+   | .projects[\$project_path] = ((.projects[\$project_path] // {}) + {hasTrustDialogAccepted: true})' \\
+  "\$CONFIG" > "\$CONFIG.tmp" && mv "\$CONFIG.tmp" "\$CONFIG"
+EOF
+    return
+  fi
   limactl shell "$vm_name" bash -c '
     CONFIG="$HOME/.claude.json"
     SETTINGS="$HOME/.claude/settings.json"
     PROJECT_PATH="'"$host_dir"'"
-
     mkdir -p "$HOME/.claude"
-
     if [ ! -f "$SETTINGS" ]; then
       echo "{}" > "$SETTINGS"
     fi
-
     jq ".hasCompletedOnboarding = true | .skipDangerousModePermissionPrompt = true" \
       "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-
     if [ ! -f "$CONFIG" ]; then
       echo "{}" > "$CONFIG"
     fi
-
     jq --arg project_path "$PROJECT_PATH" \
       ".hasCompletedOnboarding = true
        | .lastOnboardingVersion = (.lastOnboardingVersion // \"vm\")
@@ -1579,18 +2361,41 @@ if copilot:
 print(json.dumps(auth, indent=2))
 " "$_anthropic_auth_json" "$_openai_api_auth_json" "$_openai_oauth_auth_json" "$_copilot_auth_json")
 
-  limactl shell "$vm_name" bash -c '
-    mkdir -p ~/.local/share/opencode
-    cat > ~/.local/share/opencode/auth.json << '\''AUTH'\''
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+mkdir -p ~/.local/share/opencode
+cat > ~/.local/share/opencode/auth.json << 'AUTHEOF'
+${auth_json}
+AUTHEOF
+chmod 600 ~/.local/share/opencode/auth.json
+EOF
+  else
+    limactl shell "$vm_name" bash -c '
+      mkdir -p ~/.local/share/opencode
+      cat > ~/.local/share/opencode/auth.json << '\''AUTH'\''
 '"$auth_json"'
 AUTH
-    chmod 600 ~/.local/share/opencode/auth.json
-  '
+      chmod 600 ~/.local/share/opencode/auth.json
+    '
+  fi
 }
 
 _opencode_vm_setup_session_persistence() {
   local vm_name="$1"
   local state_dir="$2"
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    _wsl_run_script "$vm_name" "user" << EOF
+SESSION_DIR="${state_dir}/opencode-sessions"
+mkdir -p "\$SESSION_DIR" ~/.local/share
+if [ -d ~/.local/share/opencode ] && [ ! -L ~/.local/share/opencode ]; then
+  cp -a ~/.local/share/opencode/. "\$SESSION_DIR/" 2>/dev/null || true
+  rm -rf ~/.local/share/opencode
+fi
+mkdir -p "\$SESSION_DIR"
+ln -sfn "\$SESSION_DIR" ~/.local/share/opencode
+EOF
+    return
+  fi
   limactl shell "$vm_name" bash -c '
     SESSION_DIR="'"$state_dir"'/opencode-sessions"
     mkdir -p "$SESSION_DIR" \
@@ -1615,15 +2420,56 @@ _agent_vm_run() {
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --help|-h)
+        echo "Usage: agent-vm ${agent} [options] [agent-args...]"
+        echo "Options: --no-git, --mount DIR, --memory GB, --max-memory GB, --usb DEVICE"
+        return 0
+        ;;
       --no-git) use_github=false; shift ;;
-      --usb) usb_devices+=("$2"); shift 2 ;;
-      --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --usb)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --usb is not supported on WSL2" >&2; shift 2
+        else
+          usb_devices+=("$2"); shift 2
+        fi
+        ;;
+      --usb=*)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --usb is not supported on WSL2" >&2; shift
+        else
+          usb_devices+=("${1#*=}"); shift
+        fi
+        ;;
       --mount) extra_mounts+=("$2"); shift 2 ;;
       --mount=*) extra_mounts+=("${1#*=}"); shift ;;
-      --memory) memory="$2"; shift 2 ;;
-      --memory=*) memory="${1#*=}"; shift ;;
-      --max-memory) max_memory="$2"; shift 2 ;;
-      --max-memory=*) max_memory="${1#*=}"; shift ;;
+      --memory)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --memory not supported on WSL2, ignored" >&2; shift 2
+        else
+          memory="$2"; shift 2
+        fi
+        ;;
+      --memory=*)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --memory not supported on WSL2, ignored" >&2; shift
+        else
+          memory="${1#*=}"; shift
+        fi
+        ;;
+      --max-memory)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --max-memory not supported on WSL2, ignored" >&2; shift 2
+        else
+          max_memory="$2"; shift 2
+        fi
+        ;;
+      --max-memory=*)
+        if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+          echo "Warning: --max-memory not supported on WSL2, ignored" >&2; shift
+        else
+          max_memory="${1#*=}"; shift
+        fi
+        ;;
       *) args+=("$1"); shift ;;
     esac
   done
@@ -1635,33 +2481,50 @@ _agent_vm_run() {
   local _usb_qemu_wrapper=""
   local _balloon_daemon_pid=""
 
-  if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
-    echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
-    return 1
+  # Check template exists
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    if [ ! -f "$(_wsl_template_tar)" ]; then
+      echo "Error: WSL2 template not found. Run 'agent-vm setup' first." >&2
+      return 1
+    fi
+  else
+    if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
+      echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
+      return 1
+    fi
   fi
 
-  # Set up cleanup trap before starting any background processes so Ctrl+C
-  # at any point (proxy start, clone, boot, etc.) cleans up everything.
+  # Set up cleanup trap before starting any background processes
   local security_snapshot=""
+  local _cleanup_done=false
   _claude_vm_cleanup() {
-    echo "Cleaning up VM..."
-    [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
-    [ -n "$_credential_proxy_pid" ] && kill "$_credential_proxy_pid" 2>/dev/null
-    limactl stop "$vm_name" &>/dev/null
-    limactl delete "$vm_name" --force &>/dev/null
-    # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
-    # breaks all future limactl commands)
-    [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
+    $_cleanup_done && return
+    _cleanup_done=true
+    if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+      echo "Cleaning up WSL2 distro '$vm_name'..."
+      [ -n "${_credential_proxy_pid:-}" ] && kill "$_credential_proxy_pid" 2>/dev/null || true
+      wsl.exe --terminate "$vm_name" 2>/dev/null || true
+      wsl.exe --unregister "$vm_name" 2>/dev/null || true
+      rm -rf "$(_wsl_instances_dir)/$vm_name" 2>/dev/null || true
+      _wsl_unmount_shared "$vm_name"
+    else
+      echo "Cleaning up VM..."
+      [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
+      [ -n "${_credential_proxy_pid:-}" ] && kill "$_credential_proxy_pid" 2>/dev/null
+      limactl stop "$vm_name" &>/dev/null
+      limactl delete "$vm_name" --force &>/dev/null
+      [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
+      local port
+      for port in "${_usb_sysfs_ports[@]}"; do
+        _agent_vm_usb_rebind "$port"
+      done
+      [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
+    fi
     [ -n "$security_snapshot" ] && rm -f "$security_snapshot" "${security_snapshot}.git-config"
-    local port
-    for port in "${_usb_sysfs_ports[@]}"; do
-      _agent_vm_usb_rebind "$port"
-    done
-    [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
-  # Get Anthropic token
+  # ── Token acquisition (shared) ────────────────────────────────────────────
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
   local _openai_token="${OPENAI_API_KEY:-}"
   local _copilot_token=""
@@ -1687,7 +2550,6 @@ _agent_vm_run() {
     fi
   fi
 
-  # Get GitHub token
   _claude_vm_github_repos_json='{}'
   _claude_vm_github_token=""
   if $use_github; then
@@ -1695,158 +2557,196 @@ _agent_vm_run() {
     _claude_vm_get_copilot_token
   fi
 
-  # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
   _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
   local _credential_proxy_port=""
+  local _credential_proxy_pid=""
+  local _credential_proxy_secret=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
   fi
 
-  # Security: snapshot before session
   security_snapshot="$(mktemp)"
   _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
-
-  # Ensure .git/hooks exists for read-only mount
   mkdir -p "${host_dir}/.git/hooks"
 
-  # Build mounts JSON array
-  local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
-  local _m
-  for _m in "${extra_mounts[@]}"; do
-    _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
-  done
-  local clone_memory="$memory"
-  local _clone_memory_args=()
-  if [ -n "$clone_memory" ]; then
-    _clone_memory_args=(--memory "$clone_memory")
-  fi
-
-  echo "Starting VM '$vm_name'..."
-  # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
-  # Note: .git/config is a file (not a directory) so it cannot be a Lima mount;
-  # it is protected via the pre/post-session security check instead.
-  limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[${_mounts_json}]" \
-    --set '.containerd.system=false' \
-    --set '.containerd.user=false' \
-    "${_clone_memory_args[@]}" \
-    --tty=false &>/dev/null
-
-  # USB passthrough: resolve devices, unbind host drivers
-  local _usb_vidpids=()
-  if [ ${#usb_devices[@]} -gt 0 ]; then
-    local dev vidpid port
-    for dev in "${usb_devices[@]}"; do
-      vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
-      port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
-      echo "USB: $dev → $vidpid (port $port)"
-      _agent_vm_usb_unbind "$port"
-      _usb_sysfs_ports+=("$port")
-      _usb_vidpids+=("$vidpid")
+  # ── Start VM / distro (platform-specific) ────────────────────────────────
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    echo "Starting WSL2 distro '$vm_name'..."
+    _wsl_import_template "$vm_name" || {
+      echo "Error: Failed to import WSL2 template." >&2
+      _claude_vm_cleanup; trap - EXIT INT TERM; return 1
+    }
+    echo "Mounting project directory..."
+    _wsl_mount_dir "$vm_name" "$host_dir" "$host_dir"
+    mkdir -p "$state_dir"
+    _wsl_mount_dir "$vm_name" "$state_dir" "$state_dir"
+    local _m
+    for _m in "${extra_mounts[@]}"; do
+      _m="$(realpath "$_m" 2>/dev/null)" || continue
+      _wsl_mount_dir "$vm_name" "$_m" "$_m"
     done
-  fi
-
-  # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
-  local _has_balloon=false
-  if command -v qemu-system-x86_64 &>/dev/null; then
-    # Override memory ceiling if --max-memory was specified
-    if [ -n "$max_memory" ]; then
-      limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
-    fi
-    if [ ${#_usb_vidpids[@]} -gt 0 ]; then
-      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
-    else
-      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
-    fi
-    if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
-      _has_balloon=true
-    else
-      # Balloon may have broken QEMU (e.g. PCI conflict); retry without it
-      echo "Warning: VM failed to start with balloon, retrying without..." >&2
-      limactl stop "$vm_name" &>/dev/null
-      rm -f "$_usb_qemu_wrapper"
-      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
-        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
-        QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
-      else
-        _usb_qemu_wrapper=""
-        limactl start "$vm_name" &>/dev/null
-      fi
-    fi
-
-    # Start balloon daemon only if balloon device is present
-    if $_has_balloon; then
-      local _balloon_script
-      _balloon_script="$SCRIPT_DIR/balloon-daemon.py"
-      local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
-      local _balloon_daemon_args=()
-      if [ -n "$max_memory" ]; then
-        _balloon_daemon_args+=(--max-memory "${max_memory}G")
-      fi
-      python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
-      _balloon_daemon_pid=$!
-    fi
   else
-    if [ -n "$max_memory" ]; then
-      echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+    # Lima: clone and start
+    local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
+    local _m
+    for _m in "${extra_mounts[@]}"; do
+      _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
+    done
+    local _clone_memory_args=()
+    [ -n "$memory" ] && _clone_memory_args=(--memory "$memory")
+
+    echo "Starting VM '$vm_name'..."
+    limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
+      --set ".mounts=[${_mounts_json}]" \
+      --set '.containerd.system=false' \
+      --set '.containerd.user=false' \
+      "${_clone_memory_args[@]}" \
+      --tty=false &>/dev/null
+
+    # USB passthrough
+    local _usb_vidpids=()
+    if [ ${#usb_devices[@]} -gt 0 ]; then
+      local dev vidpid port
+      for dev in "${usb_devices[@]}"; do
+        vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+        port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
+        echo "USB: $dev → $vidpid (port $port)"
+        _agent_vm_usb_unbind "$port"
+        _usb_sysfs_ports+=("$port")
+        _usb_vidpids+=("$vidpid")
+      done
     fi
-    if [ -n "$memory" ]; then
-      limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+
+    local _has_balloon=false
+    if command -v qemu-system-x86_64 &>/dev/null; then
+      [ -n "$max_memory" ] && limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
+      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
+      else
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
+      fi
+      if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
+        _has_balloon=true
+      else
+        echo "Warning: VM failed to start with balloon, retrying without..." >&2
+        limactl stop "$vm_name" &>/dev/null
+        rm -f "$_usb_qemu_wrapper"
+        if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+          _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
+          QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+        else
+          _usb_qemu_wrapper=""
+          limactl start "$vm_name" &>/dev/null
+        fi
+      fi
+      if $_has_balloon; then
+        local _balloon_daemon_args=()
+        [ -n "$max_memory" ] && _balloon_daemon_args+=(--max-memory "${max_memory}G")
+        python3 "$SCRIPT_DIR/balloon-daemon.py" "$HOME/.lima/$vm_name/qmp.sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+        _balloon_daemon_pid=$!
+      fi
+    else
+      [ -n "$max_memory" ] && echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+      [ -n "$memory" ] && limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+      limactl start "$vm_name" &>/dev/null
     fi
-    limactl start "$vm_name" &>/dev/null
   fi
 
+  # ── Post-boot setup (shared, dispatches internally) ───────────────────────
   _claude_vm_post_boot_setup
   _claude_vm_print_config
 
-  # Update the agent tool to latest version before launching
-  if [ "$agent" = "opencode" ]; then
-    echo "Updating OpenCode..."
-    limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
-  elif [ "$agent" = "codex" ]; then
-    echo "Updating Codex..."
-    limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
-  elif [ "$agent" = "copilot" ]; then
-    echo "Updating Copilot CLI..."
-    limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
+  # ── Update agent and run (platform-specific) ─────────────────────────────
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    if [ "$agent" = "opencode" ]; then
+      echo "Updating OpenCode..."
+      wsl.exe -d "$vm_name" -u user -- bash -lc 'opencode update 2>/dev/null || true'
+    elif [ "$agent" = "codex" ]; then
+      echo "Updating Codex..."
+      wsl.exe -d "$vm_name" -u user -- bash -lc \
+        '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+    elif [ "$agent" = "copilot" ]; then
+      echo "Updating Copilot CLI..."
+      wsl.exe -d "$vm_name" -u user -- bash -lc \
+        '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
+    else
+      echo "Updating Claude Code..."
+      wsl.exe -d "$vm_name" -u user -- bash -lc 'claude update --yes 2>/dev/null || true'
+    fi
+
+    if [ "$agent" = "opencode" ]; then
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        "cd '$host_dir' && OPENCODE_CONFIG='${state_dir}/opencode-config/opencode.json' opencode $(printf '%q ' "${args[@]}")"
+    elif [ "$agent" = "codex" ]; then
+      local codex_env_prefix=""
+      [ -n "$_openai_token" ] && codex_env_prefix="OPENAI_API_KEY=dummy-key-auth-handled-by-proxy "
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        "cd '$host_dir' && ${codex_env_prefix}codex --dangerously-bypass-approvals-and-sandbox $(printf '%q ' "${args[@]}")"
+    elif [ "$agent" = "copilot" ]; then
+      if ! wsl.exe -d "$vm_name" -u user -- bash -c 'command -v copilot &>/dev/null'; then
+        echo "Note: Copilot CLI not installed in template. Run 'agent-vm setup' to add it." >&2
+        _claude_vm_cleanup; trap - EXIT INT TERM; return 1
+      fi
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        "cd '$host_dir' && copilot --yolo --model claude-opus-4.6 $(printf '%q ' "${args[@]}")"
+    else
+      local claude_args=("--model" "opus[1m]" "${args[@]}")
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        wsl.exe -d "$vm_name" -u user -- \
+        env IS_SANDBOX=1 ENABLE_LSP_TOOL=1 bash -lc \
+        "cd '$host_dir' && claude --dangerously-skip-permissions $(printf '%q ' "${claude_args[@]}")"
+    fi
   else
-    echo "Updating Claude Code..."
-    limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+    # Lima agent execution
+    if [ "$agent" = "opencode" ]; then
+      echo "Updating OpenCode..."
+      limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
+    elif [ "$agent" = "codex" ]; then
+      echo "Updating Codex..."
+      limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+    elif [ "$agent" = "copilot" ]; then
+      echo "Updating Copilot CLI..."
+      limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
+    else
+      echo "Updating Claude Code..."
+      limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+    fi
+
+    if [ "$agent" = "opencode" ]; then
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        limactl shell --workdir "$host_dir" "$vm_name" \
+        env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
+        opencode "${args[@]}"
+    elif [ "$agent" = "codex" ]; then
+      local codex_env=()
+      [ -n "$_openai_token" ] && codex_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        limactl shell --workdir "$host_dir" "$vm_name" \
+        env "${codex_env[@]}" \
+        codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
+    elif [ "$agent" = "copilot" ]; then
+      if ! limactl shell "$vm_name" bash -c 'command -v copilot &>/dev/null'; then
+        echo "Note: Copilot CLI is not installed in the VM template. Run 'agent-vm update-template' to add it." >&2
+        return 1
+      fi
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        limactl shell --workdir "$host_dir" "$vm_name" \
+        env copilot --yolo --model claude-opus-4.6 "${args[@]}"
+    else
+      local claude_args=("--model" "opus[1m]" "${args[@]}")
+      CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+        limactl shell --workdir "$host_dir" "$vm_name" \
+        env IS_SANDBOX=1 \
+        ENABLE_LSP_TOOL=1 \
+        claude --dangerously-skip-permissions "${claude_args[@]}"
+    fi
   fi
 
-  if [ "$agent" = "opencode" ]; then
-    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-      limactl shell --workdir "$host_dir" "$vm_name" \
-      env OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
-      opencode "${args[@]}"
-  elif [ "$agent" = "codex" ]; then
-    local codex_env=()
-    if [ -n "$_openai_token" ]; then
-      codex_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
-    fi
-    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-      limactl shell --workdir "$host_dir" "$vm_name" \
-      env "${codex_env[@]}" \
-      codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
-  elif [ "$agent" = "copilot" ]; then
-    if ! limactl shell "$vm_name" bash -c 'command -v copilot &>/dev/null'; then
-      echo "Note: Copilot CLI is not installed in the VM template. Run 'agent-vm update-template' to add it." >&2
-      return 1
-    fi
-    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-      limactl shell --workdir "$host_dir" "$vm_name" \
-      env copilot --yolo --model claude-opus-4.6 "${args[@]}"
-  else
-    local claude_args=("--model" "opus[1m]" "${args[@]}")
-    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-      limactl shell --workdir "$host_dir" "$vm_name" \
-      env IS_SANDBOX=1 \
-      ENABLE_LSP_TOOL=1 \
-      claude --dangerously-skip-permissions "${claude_args[@]}"
-  fi
   _claude_vm_security_check "$host_dir" "$security_snapshot"
-
   _claude_vm_cleanup
   trap - EXIT INT TERM
 }
@@ -1875,14 +2775,22 @@ _agent_vm_shell() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-git) use_github=false; shift ;;
-      --usb) usb_devices+=("$2"); shift 2 ;;
-      --usb=*) usb_devices+=("${1#*=}"); shift ;;
+      --usb|--usb=*|--memory|--memory=*|--max-memory|--max-memory=*)
+        if [ "$_AGENT_VM_BACKEND" != "wsl2" ]; then
+          case "$1" in
+            --usb) usb_devices+=("$2"); shift 2 ;;
+            --usb=*) usb_devices+=("${1#*=}"); shift ;;
+            --memory) memory="$2"; shift 2 ;;
+            --memory=*) memory="${1#*=}"; shift ;;
+            --max-memory) max_memory="$2"; shift 2 ;;
+            --max-memory=*) max_memory="${1#*=}"; shift ;;
+          esac
+        else
+          [[ "$1" == *=* ]] && shift || shift 2
+        fi
+        ;;
       --mount) extra_mounts+=("$2"); shift 2 ;;
       --mount=*) extra_mounts+=("${1#*=}"); shift ;;
-      --memory) memory="$2"; shift 2 ;;
-      --memory=*) memory="${1#*=}"; shift ;;
-      --max-memory) max_memory="$2"; shift 2 ;;
-      --max-memory=*) max_memory="${1#*=}"; shift ;;
       *) shift ;;
     esac
   done
@@ -1894,33 +2802,48 @@ _agent_vm_shell() {
   local _usb_qemu_wrapper=""
   local _balloon_daemon_pid=""
 
-  if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
-    echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
-    return 1
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    if [ ! -f "$(_wsl_template_tar)" ]; then
+      echo "Error: WSL2 template not found. Run 'agent-vm setup' first." >&2
+      return 1
+    fi
+  else
+    if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
+      echo "Error: Template VM not found. Run 'agent-vm setup' first." >&2
+      return 1
+    fi
   fi
 
-  # Set up cleanup trap before starting any background processes so Ctrl+C
-  # at any point (proxy start, clone, boot, etc.) cleans up everything.
   local security_snapshot=""
+  local _cleanup_done=false
   _claude_vm_shell_cleanup() {
-    echo "Cleaning up VM..."
-    [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
-    [ -n "$_credential_proxy_pid" ] && kill "$_credential_proxy_pid" 2>/dev/null
-    limactl stop "$vm_name" &>/dev/null
-    limactl delete "$vm_name" --force &>/dev/null
-    # Fall back to rm if limactl delete left a broken directory (missing lima.yaml
-    # breaks all future limactl commands)
-    [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
+    $_cleanup_done && return
+    _cleanup_done=true
+    if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+      echo "Cleaning up WSL2 distro '$vm_name'..."
+      [ -n "${_credential_proxy_pid:-}" ] && kill "$_credential_proxy_pid" 2>/dev/null || true
+      wsl.exe --terminate "$vm_name" 2>/dev/null || true
+      wsl.exe --unregister "$vm_name" 2>/dev/null || true
+      rm -rf "$(_wsl_instances_dir)/$vm_name" 2>/dev/null || true
+      _wsl_unmount_shared "$vm_name"
+    else
+      echo "Cleaning up VM..."
+      [ -n "$_balloon_daemon_pid" ] && kill "$_balloon_daemon_pid" 2>/dev/null
+      [ -n "${_credential_proxy_pid:-}" ] && kill "$_credential_proxy_pid" 2>/dev/null
+      limactl stop "$vm_name" &>/dev/null
+      limactl delete "$vm_name" --force &>/dev/null
+      [ -d "$HOME/.lima/$vm_name" ] && rm -rf "$HOME/.lima/$vm_name"
+      local port
+      for port in "${_usb_sysfs_ports[@]}"; do
+        _agent_vm_usb_rebind "$port"
+      done
+      [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
+    fi
     [ -n "$security_snapshot" ] && rm -f "$security_snapshot" "${security_snapshot}.git-config"
-    local port
-    for port in "${_usb_sysfs_ports[@]}"; do
-      _agent_vm_usb_rebind "$port"
-    done
-    [ -n "$_usb_qemu_wrapper" ] && rm -f "$_usb_qemu_wrapper"
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
-  # Get Anthropic token
+  # ── Token acquisition (shared) ────────────────────────────────────────────
   local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
   local _openai_token="${OPENAI_API_KEY:-}"
   local _copilot_token=""
@@ -1931,38 +2854,23 @@ _agent_vm_shell() {
   local _opencode_openai_auth_json=""
   if [ -z "$_openai_token" ]; then
     if [ "$agent" = "opencode" ]; then
-      if _opencode_vm_prepare_host_auth; then
-        echo "Using host Codex ChatGPT auth via native OpenCode OAuth."
-      else
-        _opencode_openai_auth_json=""
-        echo "Host Codex auth not available or invalid; OpenCode will use its configured non-ChatGPT providers."
-      fi
+      _opencode_vm_prepare_host_auth 2>/dev/null && \
+        echo "Using host Codex ChatGPT auth via native OpenCode OAuth." || \
+        { _opencode_openai_auth_json=""; echo "Host Codex auth not available; OpenCode will use its configured providers."; }
     elif [ -z "$agent" ]; then
-      if _codex_vm_prepare_host_auth; then
-        echo "Using host Codex ChatGPT auth via credential proxy."
-      else
-        _codex_proxy_token=""
-        _codex_placeholder_auth_json=""
-        echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
-      fi
-      if _opencode_vm_prepare_host_auth; then
-        echo "Using host Codex ChatGPT auth via native OpenCode OAuth."
-      else
-        _opencode_openai_auth_json=""
-        echo "Host Codex auth not available or invalid; OpenCode will use its configured non-ChatGPT providers."
-      fi
+      _codex_vm_prepare_host_auth 2>/dev/null && \
+        echo "Using host Codex ChatGPT auth via credential proxy." || \
+        { _codex_proxy_token=""; _codex_placeholder_auth_json=""; echo "Host Codex auth not available; falling back to VM-local Codex login."; }
+      _opencode_vm_prepare_host_auth 2>/dev/null && \
+        echo "Using host Codex ChatGPT auth via native OpenCode OAuth." || \
+        { _opencode_openai_auth_json=""; }
     else
-      if _codex_vm_prepare_host_auth; then
-        echo "Using host Codex ChatGPT auth via credential proxy."
-      else
-        _codex_proxy_token=""
-        _codex_placeholder_auth_json=""
-        echo "Host Codex auth not available or invalid; falling back to VM-local Codex login."
-      fi
+      _codex_vm_prepare_host_auth 2>/dev/null && \
+        echo "Using host Codex ChatGPT auth via credential proxy." || \
+        { _codex_proxy_token=""; _codex_placeholder_auth_json=""; echo "Host Codex auth not available; falling back to VM-local Codex login."; }
     fi
   fi
 
-  # Get GitHub token
   _claude_vm_github_repos_json='{}'
   _claude_vm_github_token=""
   if $use_github; then
@@ -1970,135 +2878,148 @@ _agent_vm_shell() {
     _claude_vm_get_copilot_token
   fi
 
-  # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
   _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
   local _credential_proxy_port=""
+  local _credential_proxy_pid=""
+  local _credential_proxy_secret=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
   fi
 
-  # Security: snapshot before session
   security_snapshot="$(mktemp)"
   _claude_vm_security_snapshot "$host_dir" "$security_snapshot"
-
-  # Ensure .git/hooks exists for read-only mount
   mkdir -p "${host_dir}/.git/hooks"
 
-  # Build mounts JSON array
-  local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
-  local _m
-  for _m in "${extra_mounts[@]}"; do
-    _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
-  done
-  local clone_memory="$memory"
-  local _clone_memory_args=()
-  if [ -n "$clone_memory" ]; then
-    _clone_memory_args=(--memory "$clone_memory")
-  fi
-
-  # Mount project dir writable, but .git/hooks read-only at the Lima level (VM root cannot override)
-  limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[${_mounts_json}]" \
-    --set '.containerd.system=false' \
-    --set '.containerd.user=false' \
-    "${_clone_memory_args[@]}" \
-    --tty=false &>/dev/null
-
-  # USB passthrough: resolve devices, unbind host drivers
-  local _usb_vidpids=()
-  if [ ${#usb_devices[@]} -gt 0 ]; then
-    local dev vidpid port
-    for dev in "${usb_devices[@]}"; do
-      vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
-      port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
-      echo "USB: $dev → $vidpid (port $port)"
-      _agent_vm_usb_unbind "$port"
-      _usb_sysfs_ports+=("$port")
-      _usb_vidpids+=("$vidpid")
+  # ── Start VM / distro (platform-specific) ────────────────────────────────
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    echo "Starting WSL2 distro '$vm_name'..."
+    _wsl_import_template "$vm_name" || {
+      echo "Error: Failed to import WSL2 template." >&2
+      _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1
+    }
+    echo "Mounting project directory..."
+    _wsl_mount_dir "$vm_name" "$host_dir" "$host_dir"
+    mkdir -p "$state_dir"
+    _wsl_mount_dir "$vm_name" "$state_dir" "$state_dir"
+    local _m
+    for _m in "${extra_mounts[@]}"; do
+      _m="$(realpath "$_m" 2>/dev/null)" || continue
+      _wsl_mount_dir "$vm_name" "$_m" "$_m"
     done
-  fi
-
-  # Start VM — with virtio-balloon if QEMU is available (Linux), plain otherwise
-  local _has_balloon=false
-  if command -v qemu-system-x86_64 &>/dev/null; then
-    # Override memory ceiling if --max-memory was specified
-    if [ -n "$max_memory" ]; then
-      limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
-    fi
-    if [ ${#_usb_vidpids[@]} -gt 0 ]; then
-      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
-    else
-      _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
-    fi
-    if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
-      _has_balloon=true
-    else
-      # Balloon may have broken QEMU (e.g. PCI conflict); retry without it
-      echo "Warning: VM failed to start with balloon, retrying without..." >&2
-      limactl stop "$vm_name" &>/dev/null
-      rm -f "$_usb_qemu_wrapper"
-      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
-        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
-        QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
-      else
-        _usb_qemu_wrapper=""
-        limactl start "$vm_name" &>/dev/null
-      fi
-    fi
-
-    # Start balloon daemon only if balloon device is present
-    if $_has_balloon; then
-      local _balloon_script
-      _balloon_script="$SCRIPT_DIR/balloon-daemon.py"
-      local _qmp_sock="$HOME/.lima/$vm_name/qmp.sock"
-      local _balloon_daemon_args=()
-      if [ -n "$max_memory" ]; then
-        _balloon_daemon_args+=(--max-memory "${max_memory}G")
-      fi
-      python3 "$_balloon_script" "$_qmp_sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
-      _balloon_daemon_pid=$!
-    fi
   else
-    if [ -n "$max_memory" ]; then
-      echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+    local _mounts_json="{\"location\":\"${host_dir}\",\"writable\":true},{\"location\":\"${host_dir}/.git/hooks\",\"writable\":false},{\"location\":\"${state_dir}\",\"writable\":true}"
+    local _m
+    for _m in "${extra_mounts[@]}"; do
+      _mounts_json="${_mounts_json},{\"location\":\"$(realpath "$_m")\",\"writable\":true}"
+    done
+    local _clone_memory_args=()
+    [ -n "$memory" ] && _clone_memory_args=(--memory "$memory")
+
+    limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
+      --set ".mounts=[${_mounts_json}]" \
+      --set '.containerd.system=false' \
+      --set '.containerd.user=false' \
+      "${_clone_memory_args[@]}" \
+      --tty=false &>/dev/null
+
+    local _usb_vidpids=()
+    if [ ${#usb_devices[@]} -gt 0 ]; then
+      local dev vidpid port
+      for dev in "${usb_devices[@]}"; do
+        vidpid="$(_agent_vm_usb_resolve "$dev")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+        port="$(_agent_vm_usb_find_sysfs "$vidpid")" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
+        echo "USB: $dev → $vidpid (port $port)"
+        _agent_vm_usb_unbind "$port"
+        _usb_sysfs_ports+=("$port")
+        _usb_vidpids+=("$vidpid")
+      done
     fi
-    if [ -n "$memory" ]; then
-      limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+
+    local _has_balloon=false
+    if command -v qemu-system-x86_64 &>/dev/null; then
+      [ -n "$max_memory" ] && limactl edit "$vm_name" --memory="$max_memory" --tty=false &>/dev/null
+      if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper "${_usb_vidpids[@]}")"
+      else
+        _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper)"
+      fi
+      if QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null; then
+        _has_balloon=true
+      else
+        echo "Warning: VM failed to start with balloon, retrying without..." >&2
+        limactl stop "$vm_name" &>/dev/null
+        rm -f "$_usb_qemu_wrapper"
+        if [ ${#_usb_vidpids[@]} -gt 0 ]; then
+          _usb_qemu_wrapper="$(_agent_vm_qemu_wrapper --no-balloon "${_usb_vidpids[@]}")"
+          QEMU_SYSTEM_X86_64="$_usb_qemu_wrapper" limactl start "$vm_name" &>/dev/null
+        else
+          _usb_qemu_wrapper=""
+          limactl start "$vm_name" &>/dev/null
+        fi
+      fi
+      if $_has_balloon; then
+        local _balloon_daemon_args=()
+        [ -n "$max_memory" ] && _balloon_daemon_args+=(--max-memory "${max_memory}G")
+        python3 "$SCRIPT_DIR/balloon-daemon.py" "$HOME/.lima/$vm_name/qmp.sock" daemon "${_balloon_daemon_args[@]}" &>/dev/null &
+        _balloon_daemon_pid=$!
+      fi
+    else
+      [ -n "$max_memory" ] && echo "Warning: --max-memory ignored without balloon (QEMU not available)" >&2
+      [ -n "$memory" ] && limactl edit "$vm_name" --memory="$memory" --tty=false &>/dev/null
+      limactl start "$vm_name" &>/dev/null
     fi
-    limactl start "$vm_name" &>/dev/null
   fi
 
   _claude_vm_post_boot_setup
 
-  # Update all agents so they're ready to launch manually
-  echo "Updating Claude Code..."
-  limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
-  echo "Updating OpenCode..."
-  limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
-  echo "Updating Codex..."
-  limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
-  echo "Updating Copilot CLI..."
-  limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
+  # ── Update agents and open shell (platform-specific) ─────────────────────
+  if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+    echo "Updating agents..."
+    wsl.exe -d "$vm_name" -u user -- bash -lc 'claude update --yes 2>/dev/null || true'
+    wsl.exe -d "$vm_name" -u user -- bash -lc 'opencode update 2>/dev/null || true'
+    wsl.exe -d "$vm_name" -u user -- bash -lc \
+      '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+    wsl.exe -d "$vm_name" -u user -- bash -lc \
+      '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
 
-  echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
-  _claude_vm_print_config
-  echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
-  echo "Type 'exit' to stop and delete the VM"
-  local shell_env=(
-    ENABLE_LSP_TOOL=1
-    IS_SANDBOX=1
-    OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json"
-  )
-  if [ -n "$_openai_token" ]; then
-    shell_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
+    echo "WSL2 distro: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
+    _claude_vm_print_config
+    echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
+    echo "Type 'exit' to stop and delete the WSL2 distro"
+
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+      wsl.exe -d "$vm_name" -u user -- \
+      env ENABLE_LSP_TOOL=1 IS_SANDBOX=1 \
+      OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json" \
+      bash -lc "cd '$host_dir' && bash -l"
+  else
+    echo "Updating Claude Code..."
+    limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+    echo "Updating OpenCode..."
+    limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
+    echo "Updating Codex..."
+    limactl shell "$vm_name" bash -lc '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
+    echo "Updating Copilot CLI..."
+    limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
+
+    echo "VM: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
+    _claude_vm_print_config
+    echo "OpenCode config: ${state_dir}/opencode-config/opencode.json"
+    echo "Type 'exit' to stop and delete the VM"
+    local shell_env=(
+      ENABLE_LSP_TOOL=1
+      IS_SANDBOX=1
+      OPENCODE_CONFIG="${state_dir}/opencode-config/opencode.json"
+    )
+    [ -n "$_openai_token" ] && shell_env+=(OPENAI_API_KEY=dummy-key-auth-handled-by-proxy)
+    CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
+      limactl shell --workdir "$host_dir" "$vm_name" \
+      env "${shell_env[@]}" \
+      bash -l
   fi
-  CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-    limactl shell --workdir "$host_dir" "$vm_name" \
-    env "${shell_env[@]}" \
-    bash -l
-  _claude_vm_security_check "$host_dir" "$security_snapshot"
 
+  _claude_vm_security_check "$host_dir" "$security_snapshot"
   _claude_vm_shell_cleanup
   trap - EXIT INT TERM
 }
@@ -2175,28 +3096,37 @@ agent-vm() {
   if [ -z "$subcmd" ] || [ "$subcmd" = "--help" ] || [ "$subcmd" = "-h" ]; then
     echo "Usage: agent-vm <command> [options]"
     echo ""
-    echo "Run AI coding agents inside sandboxed Lima VMs."
+    if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+      echo "Run AI coding agents inside sandboxed WSL2 distros (Windows)."
+    else
+      echo "Run AI coding agents inside sandboxed Lima VMs (macOS/Linux)."
+    fi
     echo ""
     echo "Commands:"
-    echo "  setup              Create the VM template (run once)"
-    echo "  claude [args]      Run Claude Code in a sandboxed VM"
-    echo "  opencode [args]    Run OpenCode in a sandboxed VM"
-    echo "  codex [args]       Run Codex in a sandboxed VM"
-    echo "  copilot [args]     Run GitHub Copilot CLI in a sandboxed VM"
+    echo "  setup              Create the VM/distro template (run once)"
+    echo "  claude [args]      Run Claude Code in a sandboxed VM/distro"
+    echo "  opencode [args]    Run OpenCode in a sandboxed VM/distro"
+    echo "  codex [args]       Run Codex in a sandboxed VM/distro"
+    echo "  copilot [args]     Run GitHub Copilot CLI in a sandboxed VM/distro"
     echo "  shell [agent]      Open a debug shell (optionally pre-configured for an agent)"
-    echo "  memory [vm] [size] Query or adjust VM memory via balloon (e.g. 'memory 12G')"
+    if [ "$_AGENT_VM_BACKEND" != "wsl2" ]; then
+      echo "  memory [vm] [size] Query or adjust VM memory via balloon (e.g. 'memory 12G')"
+    fi
     echo ""
     echo "Options (for claude, opencode, codex, copilot, shell):"
-    echo "  --memory GB        Initial memory for the VM (default: 2G with balloon, 4G without)"
-    echo "  --max-memory GB    Memory ceiling (default: from template; balloon grows up to this)"
     echo "  --no-git           Skip GitHub integration"
-    echo "  --usb DEVICE       Pass USB device to VM (repeatable; /dev/ttyACM0 or 1a86:55d3)"
-    echo ""
-    echo "Memory management:"
-    echo "  On Linux (QEMU), VMs use a virtio-balloon to start with 2G and auto-grow"
-    echo "  up to the ceiling as the guest needs more memory."
-    echo "  Example: agent-vm claude --memory 5 --max-memory 10"
-    echo "  On macOS (VZ), --memory sets a fixed allocation (default: 4G, no balloon)."
+    echo "  --mount DIR        Mount additional directory into the VM/distro"
+    if [ "$_AGENT_VM_BACKEND" != "wsl2" ]; then
+      echo "  --memory GB        Initial memory for the VM (default: 2G with balloon, 4G without)"
+      echo "  --max-memory GB    Memory ceiling (default: from template; balloon grows up to this)"
+      echo "  --usb DEVICE       Pass USB device to VM (repeatable; /dev/ttyACM0 or 1a86:55d3)"
+      echo ""
+      echo "Memory management:"
+      echo "  On Linux (QEMU), VMs use a virtio-balloon to start with 2G and auto-grow"
+      echo "  up to the ceiling as the guest needs more memory."
+      echo "  Example: agent-vm claude --memory 5 --max-memory 10"
+      echo "  On macOS (VZ), --memory sets a fixed allocation (default: 4G, no balloon)."
+    fi
     echo ""
     echo "Run 'agent-vm <command> --help' for command-specific help."
     [ -z "$subcmd" ] && return 1
@@ -2205,25 +3135,17 @@ agent-vm() {
   shift
 
   case "$subcmd" in
-    setup)
-      _agent_vm_setup "$@"
-      ;;
-    claude)
-      _agent_vm_run claude "$@"
-      ;;
-    opencode)
-      _agent_vm_run opencode "$@"
-      ;;
-    codex)
-      _agent_vm_run codex "$@"
-      ;;
-    copilot)
-      _agent_vm_run copilot "$@"
-      ;;
-    shell)
-      _agent_vm_shell "$@"
-      ;;
+    setup)    _agent_vm_setup "$@" ;;
+    claude)   _agent_vm_run claude "$@" ;;
+    opencode) _agent_vm_run opencode "$@" ;;
+    codex)    _agent_vm_run codex "$@" ;;
+    copilot)  _agent_vm_run copilot "$@" ;;
+    shell)    _agent_vm_shell "$@" ;;
     memory)
+      if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
+        echo "Error: 'agent-vm memory' (balloon control) is not supported on WSL2." >&2
+        return 1
+      fi
       _agent_vm_memory "$@"
       ;;
     *)
