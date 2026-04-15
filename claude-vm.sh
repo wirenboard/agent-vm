@@ -337,23 +337,12 @@ _wsl_credential_proxy_host() {
   echo "localhost"
 }
 
-# Acquire a Debian 13 base rootfs tar for WSL2 import.
-# Tries two methods: Docker, then exporting an existing Debian/Ubuntu distro.
+# Acquire a base rootfs tar for WSL2 import by exporting an existing
+# Debian or Ubuntu distro. The user is expected to have one installed
+# via `wsl --install` (the WSL2 prerequisite).
 _wsl_get_debian_base() {
   local output_tar="$1"
 
-  # Method 1: Docker
-  if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-    echo "  Building Debian 13 rootfs via Docker..."
-    local cid
-    cid=$(docker create debian:trixie)
-    docker export "$cid" > "$output_tar"
-    docker rm "$cid" &>/dev/null
-    echo "  Debian 13 base image created."
-    return 0
-  fi
-
-  # Method 2: export an existing Debian/Ubuntu WSL2 distro.
   local _current_distro="${WSL_DISTRO_NAME:-}"
   local _existing
   _existing=$(wsl.exe --list --quiet 2>/dev/null | tr -d '\r\000' \
@@ -371,19 +360,9 @@ _wsl_get_debian_base() {
     echo "  Warning: export of '$_existing' failed." >&2
   fi
 
-  cat >&2 << 'EOF'
-Error: Cannot create Debian 13 base image automatically.
-
-To create it manually, use one of:
-
-  Option A — Export your existing Debian/Ubuntu WSL2 distro:
-    wsl --export Debian "%USERPROFILE%\AppData\Local\agent-vm\debian13-base.tar"
-
-  Option B — Docker Desktop:
-    docker export $(docker create debian:trixie) > "%USERPROFILE%\AppData\Local\agent-vm\debian13-base.tar"
-
-Then re-run: agent-vm setup --minimal
-EOF
+  echo "Error: No Debian or Ubuntu WSL2 distro found." >&2
+  echo "Run the following, then re-run 'agent-vm setup':" >&2
+  echo "  wsl --install Debian" >&2
   return 1
 }
 

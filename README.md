@@ -46,7 +46,7 @@ agent-vm setup --minimal
 
 Installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy into a fresh Debian 13 distro, then exports it as a reusable `template.tar`. Takes ~15–25 minutes depending on internet speed.
 
-The Debian 13 base image is created automatically — setup tries in order: exporting your existing Debian/Ubuntu WSL2 distro, Docker (if running), or debootstrap.
+The Debian 13 base image is created automatically by exporting your existing Debian or Ubuntu WSL2 distro. If you don't have one yet, run `wsl --install Debian` first.
 
 The `--minimal` flag is recommended on Windows — it skips Docker and the associated dev tools. Docker daemon requires system-level systemd services that may not start reliably in ephemeral WSL2 instances. Everything else (Node.js, Chromium, Chrome MCP) works fine on WSL2.
 
