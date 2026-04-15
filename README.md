@@ -48,7 +48,7 @@ Installs Claude Code, OpenCode, Codex, GitHub Copilot CLI, and mitmproxy into a 
 
 The Debian 13 base image is created automatically — setup tries in order: exporting your existing Debian/Ubuntu WSL2 distro, Docker (if running), or debootstrap.
 
-The `--minimal` flag is recommended on Windows — it skips Docker, Node.js, Python dev tools, and Chromium (not supported in WSL2 instances). The full `agent-vm setup` is macOS/Linux only.
+The `--minimal` flag is recommended on Windows — it skips Docker and the associated dev tools. Docker daemon requires system-level systemd services that may not start reliably in ephemeral WSL2 instances. Everything else (Node.js, Chromium, Chrome MCP) works fine on WSL2.
 
 ### Run an agent
 
@@ -68,9 +68,8 @@ Same interface as the Linux/macOS version. Each invocation clones the template i
 |---------|------|
 | `--memory` / balloon | Not supported |
 | `--usb` | Not supported |
-| Docker inside agent distro | Not supported (no systemd in instances) |
-| Chromium / Chrome MCP | Not supported |
-| `--minimal` only | Yes (full setup unsupported) |
+| Docker inside agent distro | Unreliable (systemd system services may not start) |
+| `--minimal` recommended | Yes (skips Docker; everything else works) |
 
 ## Install
 
