@@ -338,7 +338,7 @@ _wsl_credential_proxy_host() {
 }
 
 # Acquire a Debian 13 base rootfs tar for WSL2 import.
-# Tries three methods: Docker, existing Debian/Ubuntu distro, debootstrap.
+# Tries two methods: Docker, then exporting an existing Debian/Ubuntu distro.
 _wsl_get_debian_base() {
   local output_tar="$1"
 
@@ -368,39 +368,21 @@ _wsl_get_debian_base() {
       echo "  Base image created from '$_existing'."
       return 0
     fi
-    echo "  Warning: export of '$_existing' failed, falling through to debootstrap..." >&2
-  fi
-
-  # Method 3: debootstrap
-  if ! command -v debootstrap &>/dev/null && command -v apt-get &>/dev/null; then
-    echo "  Installing debootstrap..."
-    sudo apt-get install -y -qq debootstrap 2>/dev/null || true
-  fi
-  if command -v debootstrap &>/dev/null; then
-    echo "  Building Debian 13 rootfs via debootstrap..."
-    local tmpdir; tmpdir="$(mktemp -d)"
-    sudo debootstrap --arch=amd64 trixie "$tmpdir" https://deb.debian.org/debian
-    sudo chmod 755 "$tmpdir"
-    sudo tar -C "$tmpdir" -cf "$output_tar" .
-    sudo rm -rf "$tmpdir"
-    echo "  Debian 13 base image created."
-    return 0
+    echo "  Warning: export of '$_existing' failed." >&2
   fi
 
   cat >&2 << 'EOF'
-Error: Cannot create Debian 13 base image.
+Error: Cannot create Debian 13 base image automatically.
 
-No suitable base found. To create it manually, one of:
+To create it manually, use one of:
 
   Option A — Export your existing Debian/Ubuntu WSL2 distro:
-    wsl --export Debian "%USERPROFILE%\.local\share\agent-vm\debian13-base.tar"
+    wsl --export Debian "%USERPROFILE%\AppData\Local\agent-vm\debian13-base.tar"
 
-  Option B — Docker (on Windows host, Docker Desktop):
-    docker export $(docker create debian:trixie) > %USERPROFILE%\.local\share\agent-vm\debian13-base.tar
+  Option B — Docker Desktop:
+    docker export $(docker create debian:trixie) > "%USERPROFILE%\AppData\Local\agent-vm\debian13-base.tar"
 
-  Option C — Any Linux machine with debootstrap:
-    debootstrap --arch=amd64 trixie /tmp/debian13 https://deb.debian.org/debian
-    tar -C /tmp/debian13 -cf ~/.local/share/agent-vm/debian13-base.tar .
+Then re-run: agent-vm setup --minimal
 EOF
   return 1
 }
