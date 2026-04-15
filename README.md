@@ -18,6 +18,8 @@ Feedbacks welcome!
 
 agent-vm also runs on Windows via WSL2. Each agent run gets its own ephemeral WSL2 distro cloned from a template, with the same credential proxy and mitmproxy setup. WSL2 support is built into `claude-vm.sh` — it auto-detects WSL2 at source time.
 
+Filesystem isolation matches the Lima model: DrvFs automount is disabled in agent distros, so the agent cannot access the Windows C: drive or any other drive directly. Only the project directory and session state dir are explicitly bind-mounted into the distro via `/mnt/wsl/`.
+
 ### Prerequisites
 
 - Windows 10 (build 19041+) or Windows 11
