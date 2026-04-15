@@ -206,13 +206,13 @@ _wsl_distro_exists() {
 # Run a bash login command as user inside a WSL2 distro
 _wsl_run() {
   local distro="$1"; shift
-  wsl.exe -d "$distro" -u user -- bash -lc "$*"
+  wsl.exe -d "$distro" -u user --cd / -- bash -lc "$*"
 }
 
 # Run a bash command as root inside a WSL2 distro
 _wsl_run_root() {
   local distro="$1"; shift
-  wsl.exe -d "$distro" -u root -- bash -c "$*"
+  wsl.exe -d "$distro" -u root --cd / -- bash -c "$*"
 }
 
 # Run a bash script in a WSL2 distro via a temp file on the Windows drive.
@@ -230,13 +230,13 @@ _wsl_run_script() {
   printf '%s\n' "$script" > "$tmp_script"
   chmod 644 "$tmp_script"
   if [ "$run_user" = "root" ]; then
-    wsl.exe -d "$distro" -u root -- bash "$tmp_script" < /dev/null
+    wsl.exe -d "$distro" -u root --cd / -- bash "$tmp_script" < /dev/null
   else
     # Don't use wsl.exe -u user: the relay tries chdir(/mnt/c/Users/user) before
     # applying --cd and gets EACCES on fresh distros. Run as root and switch via
     # sudo -u (not su -): sudo does not open a PAM session, so it won't create a
     # lingering systemd user session that blocks wsl.exe --terminate / --export.
-    wsl.exe -d "$distro" -u root -- bash -c "sudo -u '$run_user' env HOME=/home/'$run_user' bash '$tmp_script'" < /dev/null
+    wsl.exe -d "$distro" -u root --cd / -- bash -c "sudo -u '$run_user' env HOME=/home/'$run_user' bash '$tmp_script'" < /dev/null
   fi
   local rc=$?
   rm -f "$tmp_script" 2>/dev/null || true
@@ -461,10 +461,10 @@ _wsl_agent_vm_setup() {
   wsl.exe --import "$AGENT_VM_WSL_TEMPLATE_DISTRO" "$win_setup_dir" "$win_base_tar" --version 2
 
   # Fix root directory permissions (WSL2 exports capture 700; processes see 755 but raw inode is 700)
-  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c 'chmod 755 /'
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c 'chmod 755 /'
 
   echo "Configuring base system..."
-  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c '
     groupadd -g 1000 user 2>/dev/null || true
     id user &>/dev/null || useradd -m -s /bin/bash -u 1000 -g 1000 user
     apt-get install -y sudo 2>/dev/null || true
@@ -477,12 +477,14 @@ default=user
 systemd=true
 [automount]
 enabled=false
+[interop]
+appendWindowsPath=false
 EOF
     grep -q "$(hostname)" /etc/hosts 2>/dev/null || echo "127.0.0.1 $(hostname)" >> /etc/hosts
   '
 
   # Disable needrestart interactive prompts
-  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c '
     mkdir -p /etc/needrestart/conf.d
     printf "\$nrconf{restart} = '"'"'a'"'"';\n" > /etc/needrestart/conf.d/no-prompt.conf
   ' 2>/dev/null || true
@@ -509,7 +511,7 @@ EOF
       '
 
     echo "Installing Docker..."
-    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c '
       install -m 0755 -d /etc/apt/keyrings
       curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
       chmod a+r /etc/apt/keyrings/docker.asc
@@ -523,7 +525,7 @@ EOF
     '
 
     echo "Installing Node.js 22..."
-    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+    wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c '
       curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
       apt-get install -y nodejs
     '
@@ -549,7 +551,7 @@ EOF
   fi
 
   echo "Installing mitmproxy..."
-  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c '
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c '
     python3 -m pip install --break-system-packages --ignore-installed bcrypt mitmproxy 2>/dev/null || \
     python3 -m pip install --ignore-installed bcrypt mitmproxy
   '
@@ -643,7 +645,7 @@ EOF
 
   echo "Exporting template..."
   # Kill user processes before terminating (defensive; sudo -u doesn't create systemd sessions)
-  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root -- bash -c 'pkill -u user 2>/dev/null; loginctl kill-user user 2>/dev/null; true' < /dev/null 2>/dev/null || true
+  wsl.exe -d "$AGENT_VM_WSL_TEMPLATE_DISTRO" -u root --cd / -- bash -c 'pkill -u user 2>/dev/null; loginctl kill-user user 2>/dev/null; true' < /dev/null 2>/dev/null || true
   wsl.exe --terminate "$AGENT_VM_WSL_TEMPLATE_DISTRO" 2>/dev/null || true
 
   # --terminate only REQUESTS shutdown; with systemd=true the distro can take
@@ -1137,8 +1139,8 @@ _claude_vm_start_mitmproxy() {
 
   if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
     local proxy_host; proxy_host="$(_wsl_credential_proxy_host)"
-    wsl.exe -d "$vm_name" -u user -- bash -c 'mkdir -p ~/.mitmproxy'
-    cat "$SCRIPT_DIR/mitmproxy-addon.py" | wsl.exe -d "$vm_name" -u user -- bash -c 'cat > ~/.mitmproxy/addon.py'
+    wsl.exe -d "$vm_name" -u user --cd / -- bash -c 'mkdir -p ~/.mitmproxy'
+    cat "$SCRIPT_DIR/mitmproxy-addon.py" | wsl.exe -d "$vm_name" -u user --cd / -- bash -c 'cat > ~/.mitmproxy/addon.py'
     _wsl_run_script "$vm_name" "user" << 'EOF'
 cat > /tmp/start-mitmproxy.sh << 'LAUNCHER'
 #!/bin/bash
@@ -1738,7 +1740,7 @@ print(','.join(seen))
     # Codex does not honor ~/.claude/CLAUDE.md; it reads ~/.codex/AGENTS.md
     if [ "$agent" = "codex" ] || [ -z "$agent" ]; then
       if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
-        wsl.exe -d "$vm_name" -u user -- bash -c \
+        wsl.exe -d "$vm_name" -u user --cd / -- bash -c \
           'ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"'
       else
         limactl shell "$vm_name" bash -c \
@@ -1749,7 +1751,7 @@ print(','.join(seen))
     # Copilot CLI reads ~/.copilot/copilot-instructions.md
     if [ "$agent" = "copilot" ] || [ -z "$agent" ]; then
       if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
-        wsl.exe -d "$vm_name" -u user -- bash -c \
+        wsl.exe -d "$vm_name" -u user --cd / -- bash -c \
           'mkdir -p "$HOME/.copilot" && ln -sf "$HOME/.claude/CLAUDE.md" "$HOME/.copilot/copilot-instructions.md"'
       else
         limactl shell "$vm_name" bash -c \
@@ -1768,7 +1770,7 @@ print(','.join(seen))
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
     echo "Running project runtime setup..."
     if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
-      wsl.exe -d "$vm_name" -u user -- bash -l < "${host_dir}/.claude-vm.runtime.sh"
+      wsl.exe -d "$vm_name" -u user --cd / -- bash -l <"${host_dir}/.claude-vm.runtime.sh"
     else
       limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
     fi
@@ -2087,9 +2089,11 @@ _claude_vm_check_push_access() {
   local host_dir="$1"
   [ -z "$host_dir" ] && return 1
 
+  # Push to a fully-qualified probe ref so detached HEAD still works.
+  # --dry-run means nothing is actually created on the remote.
   local push_output
-  push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD 2>&1) && return 0
-  # "non-fast-forward" or "up to date" = have push access (server rejected the ref, not the auth)
+  push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD:refs/heads/__claude_vm_probe__ 2>&1) && return 0
+  # Server rejected the ref (not the auth) = have push access
   echo "$push_output" | grep -qiE 'non-fast-forward|up to date|Everything up-to-date|fetch first|\[rejected\]' && return 0
   return 1
 }
@@ -2664,37 +2668,37 @@ _agent_vm_run() {
   if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
     if [ "$agent" = "opencode" ]; then
       echo "Updating OpenCode..."
-      wsl.exe -d "$vm_name" -u user -- bash -lc 'opencode update 2>/dev/null || true'
+      wsl.exe -d "$vm_name" -u user --cd / -- bash -lc 'opencode update 2>/dev/null || true'
     elif [ "$agent" = "codex" ]; then
       echo "Updating Codex..."
-      wsl.exe -d "$vm_name" -u user -- bash -lc \
+      wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
         '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
     elif [ "$agent" = "copilot" ]; then
       echo "Updating Copilot CLI..."
-      wsl.exe -d "$vm_name" -u user -- bash -lc \
+      wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
         '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
     else
       echo "Updating Claude Code..."
-      wsl.exe -d "$vm_name" -u user -- bash -lc 'claude update --yes 2>/dev/null || true'
+      wsl.exe -d "$vm_name" -u user --cd / -- bash -lc 'claude update --yes 2>/dev/null || true'
     fi
 
     if [ "$agent" = "opencode" ]; then
       CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
         "cd '$host_dir' && OPENCODE_CONFIG='${state_dir}/opencode-config/opencode.json' opencode $(printf '%q ' "${args[@]}")"
     elif [ "$agent" = "codex" ]; then
       local codex_env_prefix=""
       [ -n "$_openai_token" ] && codex_env_prefix="OPENAI_API_KEY=dummy-key-auth-handled-by-proxy "
       CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
         "cd '$host_dir' && ${codex_env_prefix}codex --dangerously-bypass-approvals-and-sandbox $(printf '%q ' "${args[@]}")"
     elif [ "$agent" = "copilot" ]; then
-      if ! wsl.exe -d "$vm_name" -u user -- bash -c 'command -v copilot &>/dev/null'; then
+      if ! wsl.exe -d "$vm_name" -u user --cd / -- bash -c 'command -v copilot &>/dev/null'; then
         echo "Note: Copilot CLI not installed in template. Run 'agent-vm setup' to add it." >&2
         _claude_vm_cleanup; trap - EXIT INT TERM; return 1
       fi
       CLIPBOARD_DIR="$state_dir" python3 "$SCRIPT_DIR/clipboard-pty.py" \
-        wsl.exe -d "$vm_name" -u user -- bash -lc \
+        wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
         "cd '$host_dir' && copilot --yolo --model claude-opus-4.6 $(printf '%q ' "${args[@]}")"
     else
       local claude_args=("--model" "opus[1m]" "${args[@]}")
@@ -2979,11 +2983,11 @@ _agent_vm_shell() {
   # ── Update agents and open shell (platform-specific) ─────────────────────
   if [ "$_AGENT_VM_BACKEND" = "wsl2" ]; then
     echo "Updating agents..."
-    wsl.exe -d "$vm_name" -u user -- bash -lc 'claude update --yes 2>/dev/null || true'
-    wsl.exe -d "$vm_name" -u user -- bash -lc 'opencode update 2>/dev/null || true'
-    wsl.exe -d "$vm_name" -u user -- bash -lc \
+    wsl.exe -d "$vm_name" -u user --cd / -- bash -lc 'claude update --yes 2>/dev/null || true'
+    wsl.exe -d "$vm_name" -u user --cd / -- bash -lc 'opencode update 2>/dev/null || true'
+    wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
       '(curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh) >/dev/null 2>&1 || true'
-    wsl.exe -d "$vm_name" -u user -- bash -lc \
+    wsl.exe -d "$vm_name" -u user --cd / -- bash -lc \
       '(curl -fsSL https://gh.io/copilot-install | sed "s|/dev/tty|/dev/stdin|g" | bash < /dev/null) >/dev/null 2>&1 || true'
 
     echo "WSL2 distro: $vm_name | Dir: $host_dir${agent:+ | Agent: $agent}"
