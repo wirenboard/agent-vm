@@ -1302,9 +1302,11 @@ _claude_vm_check_push_access() {
   local host_dir="$1"
   [ -z "$host_dir" ] && return 1
 
+  # Push to a fully-qualified probe ref so detached HEAD still works.
+  # --dry-run means nothing is actually created on the remote.
   local push_output
-  push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD 2>&1) && return 0
-  # "non-fast-forward" or "up to date" = have push access (server rejected the ref, not the auth)
+  push_output=$(git -C "$host_dir" push --dry-run --no-verify origin HEAD:refs/heads/__claude_vm_probe__ 2>&1) && return 0
+  # Server rejected the ref (not the auth) = have push access
   echo "$push_output" | grep -qiE 'non-fast-forward|up to date|Everything up-to-date|fetch first|\[rejected\]' && return 0
   return 1
 }
