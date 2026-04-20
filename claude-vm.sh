@@ -1931,7 +1931,7 @@ _agent_vm_run() {
     limactl shell "$vm_name" bash -lc '(curl -fsSL https://gh.io/copilot-install | bash) >/dev/null 2>&1 || true'
   else
     echo "Updating Claude Code..."
-    limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+    limactl shell "$vm_name" bash -lc 'claude update || true'
   fi
 
   if [ "$agent" = "opencode" ]; then
@@ -2194,7 +2194,7 @@ _agent_vm_shell() {
 
   # Update all agents so they're ready to launch manually
   echo "Updating Claude Code..."
-  limactl shell "$vm_name" bash -lc 'claude update --yes 2>/dev/null || true'
+  limactl shell "$vm_name" bash -lc 'claude update || true'
   echo "Updating OpenCode..."
   limactl shell "$vm_name" bash -lc 'opencode update 2>/dev/null || true'
   echo "Updating Codex..."
