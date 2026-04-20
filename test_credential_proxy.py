@@ -583,11 +583,11 @@ class TestCredentialProxyStartup(unittest.TestCase):
 class TestBuildCredentialRules(unittest.TestCase):
     """Test the _claude_vm_build_credential_rules shell function."""
 
-    def _build_rules(self, openai_token, repos_json, copilot_token="", host_creds=""):
+    def _build_rules(self, openai_token, repos_json, copilot_token="", host_creds="", host_codex=""):
         result = subprocess.run(
             ["bash", "-c",
              f'source claude-vm.sh 2>/dev/null && '
-             f"_claude_vm_build_credential_rules '{openai_token}' '{repos_json}' '{copilot_token}' '{host_creds}'"],
+             f"_claude_vm_build_credential_rules '{openai_token}' '{repos_json}' '{copilot_token}' '{host_creds}' '{host_codex}'"],
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
@@ -684,6 +684,25 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertEqual(rules[2]["domain"], "chatgpt.com")
         self.assertEqual(rules[2]["headers"], {})
         self.assertTrue(rules[2]["use_proxy"])
+
+    def test_host_codex_auth_file_emits_auth_from_file(self):
+        """Host ~/.codex/auth.json (no OPENAI_API_KEY) → api.openai.com + chatgpt.com
+        read their Bearer from the host file per request."""
+        rules = self._build_rules("", "", host_codex="/fake/.codex/auth.json")
+        for domain in ("api.openai.com", "chatgpt.com"):
+            rule = next(r for r in rules if r["domain"] == domain)
+            self.assertNotIn("Authorization", rule["headers"])
+            self.assertEqual(rule["auth_from_file"]["path"], "/fake/.codex/auth.json")
+            self.assertEqual(rule["auth_from_file"]["json_path"], "tokens.access_token")
+            self.assertTrue(rule["use_proxy"])
+
+    def test_explicit_openai_token_wins_over_host_codex_auth(self):
+        """OPENAI_API_KEY set → static Bearer, no auth_from_file."""
+        rules = self._build_rules("sk-openai", "", host_codex="/fake/.codex/auth.json")
+        for domain in ("api.openai.com", "chatgpt.com"):
+            rule = next(r for r in rules if r["domain"] == domain)
+            self.assertEqual(rule["headers"]["Authorization"], "Bearer sk-openai")
+            self.assertNotIn("auth_from_file", rule)
 
     def test_host_claude_credentials_emits_auth_from_file_and_oauth_refresh(self):
         """Host ~/.claude/.credentials.json → api.anthropic.com uses auth_from_file

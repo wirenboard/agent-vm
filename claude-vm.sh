@@ -445,15 +445,19 @@ _claude_vm_install_host_proxy_ca() {
 
 _claude_vm_build_credential_rules() {
   # Build CREDENTIAL_PROXY_RULES JSON from tokens.
-  # Args: openai_token github_repos_json copilot_token host_claude_credentials_file
+  # Args: openai_token github_repos_json copilot_token host_claude_credentials_file host_codex_auth_file
   # github_repos_json: '{"owner/repo": "token", ...}' — per-repo tokens
   # host_claude_credentials_file: if set, the proxy reads the Anthropic
   #   Authorization header from this host file on each request and intercepts
   #   platform.claude.com OAuth refresh by letting host Claude rotate tokens.
+  # host_codex_auth_file: if set (and openai_token empty), api.openai.com +
+  #   chatgpt.com read their Bearer from this host auth.json per request, so
+  #   mid-session rotation by host Codex is picked up automatically.
   local openai_token="$1"
   local github_repos_json="$2"
   local copilot_token="$3"
   local host_claude_credentials_file="${4:-}"
+  local host_codex_auth_file="${5:-}"
 
   python3 -c "
 import base64, json, sys
@@ -462,6 +466,7 @@ openai_token = sys.argv[1]
 repos = json.loads(sys.argv[2]) if sys.argv[2] else {}
 copilot_token = sys.argv[3]
 host_claude_creds = sys.argv[4]
+host_codex_auth = sys.argv[5]
 PLACEHOLDER_ACCESS = '$CLAUDE_VM_PLACEHOLDER_ACCESS_TOKEN'
 PLACEHOLDER_REFRESH = '$CLAUDE_VM_PLACEHOLDER_REFRESH_TOKEN'
 # Always intercept api.anthropic.com so traffic can be upstream-proxied.
@@ -488,19 +493,22 @@ if host_claude_creds:
             'placeholder_refresh_token': PLACEHOLDER_REFRESH,
         },
     })
+openai_auth_from_file = None
 openai_headers = {}
 if openai_token:
     openai_headers['Authorization'] = f'Bearer {openai_token}'
-rules.append({
-    'domain': 'api.openai.com',
-    'headers': openai_headers,
-    'use_proxy': True,
-})
-rules.append({
-    'domain': 'chatgpt.com',
-    'headers': openai_headers,
-    'use_proxy': True,
-})
+elif host_codex_auth:
+    openai_auth_from_file = {
+        'path': host_codex_auth,
+        'json_path': 'tokens.access_token',
+        'header': 'Authorization',
+        'format': 'Bearer {token}',
+    }
+for domain in ('api.openai.com', 'chatgpt.com'):
+    rule = {'domain': domain, 'headers': dict(openai_headers), 'use_proxy': True}
+    if openai_auth_from_file:
+        rule['auth_from_file'] = openai_auth_from_file
+    rules.append(rule)
 for slug, token in repos.items():
     owner, repo = slug.split('/', 1)
     basic = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
@@ -545,7 +553,7 @@ if copilot_token:
                 'headers': copilot_headers,
             })
 print(json.dumps(rules))
-" "$openai_token" "$github_repos_json" "$copilot_token" "$host_claude_credentials_file"
+" "$openai_token" "$github_repos_json" "$copilot_token" "$host_claude_credentials_file" "$host_codex_auth_file"
 }
 
 _claude_vm_start_credential_proxy() {
@@ -1767,10 +1775,12 @@ _agent_vm_run() {
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
+  local _host_codex_auth_file=""
   local _opencode_host_auth_json=""
   local _opencode_openai_auth_json=""
   if [ "$agent" = "codex" ] && [ -z "$_openai_token" ]; then
     if _codex_vm_prepare_host_auth; then
+      _host_codex_auth_file="$(_codex_vm_host_auth_file)"
       echo "Using host Codex ChatGPT auth via credential proxy."
     else
       _codex_proxy_token=""
@@ -1796,7 +1806,7 @@ _agent_vm_run() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file" "$_host_codex_auth_file")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
@@ -2025,6 +2035,7 @@ _agent_vm_shell() {
   local _codex_proxy_token="${_openai_token:-}"
   local _codex_host_auth_json=""
   local _codex_placeholder_auth_json=""
+  local _host_codex_auth_file=""
   local _opencode_host_auth_json=""
   local _opencode_openai_auth_json=""
   if [ -z "$_openai_token" ]; then
@@ -2037,6 +2048,7 @@ _agent_vm_shell() {
       fi
     elif [ -z "$agent" ]; then
       if _codex_vm_prepare_host_auth; then
+        _host_codex_auth_file="$(_codex_vm_host_auth_file)"
         echo "Using host Codex ChatGPT auth via credential proxy."
       else
         _codex_proxy_token=""
@@ -2051,6 +2063,7 @@ _agent_vm_shell() {
       fi
     else
       if _codex_vm_prepare_host_auth; then
+        _host_codex_auth_file="$(_codex_vm_host_auth_file)"
         echo "Using host Codex ChatGPT auth via credential proxy."
       else
         _codex_proxy_token=""
@@ -2070,7 +2083,7 @@ _agent_vm_shell() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file" "$_host_codex_auth_file")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }
