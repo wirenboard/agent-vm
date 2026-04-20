@@ -509,6 +509,16 @@ for domain in ('api.openai.com', 'chatgpt.com'):
     if openai_auth_from_file:
         rule['auth_from_file'] = openai_auth_from_file
     rules.append(rule)
+if host_codex_auth and not openai_token:
+    # MITM Codex's OAuth refresh so host codex (not the proxy) rotates tokens.
+    rules.append({
+        'domain': 'auth.openai.com',
+        'path_prefix': '/oauth/token',
+        'headers': {},
+        'oauth_refresh_codex': {
+            'credentials_file': host_codex_auth,
+        },
+    })
 for slug, token in repos.items():
     owner, repo = slug.split('/', 1)
     basic = base64.b64encode(f'x-access-token:{token}'.encode()).decode()

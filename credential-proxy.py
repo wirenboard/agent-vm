@@ -40,7 +40,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote
 
 MAX_REQUEST_BODY = 32 * 1024 * 1024  # 32 MB
 UPSTREAM_TIMEOUT = 300  # seconds
@@ -126,8 +126,39 @@ def _json_path_get(data, dotted):
     return cur
 
 
+def _jwt_payload(token):
+    """Decode a JWT payload (no signature verification) or return {}."""
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return {}
+        pad = "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+
+def _jwt_exp_seconds(token):
+    exp = _jwt_payload(token).get("exp")
+    try:
+        return int(exp) if exp is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _jwt_forge(payload):
+    """Emit an unsigned JWT (header.payload.placeholder) — host Codex's own
+    placeholder writer uses the same shape and Codex reads it back fine."""
+    def b64(obj):
+        return base64.urlsafe_b64encode(
+            json.dumps(obj, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+    header = {"alg": "RS256", "typ": "JWT"}
+    return f"{b64(header)}.{b64(payload)}.placeholder"
+
+
 # Serializes refresh invocations per credentials file: we never want two
-# `claude -p` probes racing for the same file.
+# refresh probes racing for the same file.
 _refresh_locks = {}
 _refresh_locks_guard = threading.Lock()
 
@@ -141,21 +172,21 @@ def _refresh_lock(path):
         return lock
 
 
-_HOST_CLAUDE_INHERITED_ENV_DROP = {
+_HOST_REFRESH_ENV_DROP = {
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
     "https_proxy", "http_proxy", "no_proxy",
     "CLAUDE_CODE_OAUTH_TOKEN",
 }
 
 
-def _trigger_host_claude_refresh(command, timeout):
-    """Spawn host Claude to force a credential refresh.
+def _trigger_host_refresh(command, timeout):
+    """Spawn a host agent (claude / codex) to force its credential refresh.
 
     The spawned process inherits the user env but with proxy vars stripped so
-    it talks to api.anthropic.com directly, not back to us.
+    it talks to the real upstream, not back to us.
     """
     env = {k: v for k, v in os.environ.items()
-           if k not in _HOST_CLAUDE_INHERITED_ENV_DROP}
+           if k not in _HOST_REFRESH_ENV_DROP}
     debug(f"  oauth_refresh: spawning {command}")
     try:
         result = subprocess.run(
@@ -192,6 +223,7 @@ try:
             "use_proxy": rule.get("use_proxy", False),
             "auth_from_file": rule.get("auth_from_file"),
             "oauth_refresh": rule.get("oauth_refresh"),
+            "oauth_refresh_codex": rule.get("oauth_refresh_codex"),
         }
         _RULES.setdefault(domain, []).append(entry)
     # Sort each domain's rules: longest path_prefix first, None last
@@ -431,6 +463,9 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         if rule and rule.get("oauth_refresh"):
             self._handle_oauth_refresh(rule["oauth_refresh"], body)
             return
+        if rule and rule.get("oauth_refresh_codex"):
+            self._handle_codex_oauth_refresh(rule["oauth_refresh_codex"], body)
+            return
 
         headers = _build_upstream_headers(self.headers, original_host, rule)
 
@@ -606,7 +641,7 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
                 # Re-check: another thread may have refreshed while we waited.
                 oauth = _current_oauth()
                 if _expiry_ms(oauth) <= int(time.time() * 1000) + expiry_grace_ms:
-                    ok = _trigger_host_claude_refresh(refresh_command, refresh_timeout)
+                    ok = _trigger_host_refresh(refresh_command, refresh_timeout)
                     oauth = _current_oauth()
                     if not ok or _expiry_ms(oauth) <= int(time.time() * 1000):
                         debug("  oauth_refresh: host refresh did not update credentials")
@@ -631,6 +666,102 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
         debug(f"  oauth_refresh: returned placeholder tokens, expires_in={expires_in}s")
+
+    def _handle_codex_oauth_refresh(self, cfg, body):
+        """MITM for auth.openai.com/oauth/token.
+
+        The request body is application/x-www-form-urlencoded (Codex convention,
+        not JSON). We read JWT `exp` from host's tokens.access_token; if stale,
+        spawn host `codex exec` which does the real rotation and rewrites the
+        file. Response is OAuth-shaped JSON with forged placeholder JWTs whose
+        claims mirror the host's (account_id, plan_type, email, exp) so the VM
+        Codex writes a valid-looking auth.json — real tokens stay on the host.
+        """
+        creds_path = cfg["credentials_file"]
+        expiry_grace_ms = int(cfg.get("expiry_grace_ms", 60_000))
+        refresh_command = cfg.get(
+            "refresh_command", ["codex", "exec",
+                                "--skip-git-repo-check",
+                                "--dangerously-bypass-approvals-and-sandbox",
+                                "--color", "never",
+                                "Reply with exactly OK and nothing else."])
+        refresh_timeout = int(cfg.get("refresh_timeout", 120))
+        client_id = cfg.get("audience", "app_EMoamEEZ73f0CkXaXp7hrann")
+        placeholder_refresh = cfg.get(
+            "placeholder_refresh_token",
+            "placeholder-refresh-token-injected-by-proxy")
+
+        try:
+            params = dict(parse_qsl((body or b"").decode("utf-8"), keep_blank_values=True))
+        except UnicodeDecodeError:
+            params = {}
+        if params.get("grant_type") not in (None, "refresh_token"):
+            debug(f"  oauth_refresh_codex: unsupported grant_type {params.get('grant_type')!r}")
+            self.send_error_response(400, "unsupported grant_type")
+            return
+
+        def _host_access_jwt():
+            creds = _read_credentials_file(creds_path) or {}
+            return _json_path_get(creds, "tokens.access_token") or ""
+
+        now_ms = lambda: int(time.time() * 1000)
+        if _jwt_exp_seconds(_host_access_jwt()) * 1000 <= now_ms() + expiry_grace_ms:
+            with _refresh_lock(creds_path):
+                if _jwt_exp_seconds(_host_access_jwt()) * 1000 <= now_ms() + expiry_grace_ms:
+                    ok = _trigger_host_refresh(refresh_command, refresh_timeout)
+                    if not ok or _jwt_exp_seconds(_host_access_jwt()) * 1000 <= now_ms():
+                        debug("  oauth_refresh_codex: host refresh did not update credentials")
+                        self.send_error_response(502, "host refresh failed")
+                        return
+
+        creds = _read_credentials_file(creds_path) or {}
+        tokens = creds.get("tokens") or {}
+        access_payload = _jwt_payload(tokens.get("access_token"))
+        id_payload = _jwt_payload(tokens.get("id_token"))
+        auth_claims = (access_payload.get("https://api.openai.com/auth")
+                       or id_payload.get("https://api.openai.com/auth") or {})
+        account_id = (tokens.get("account_id")
+                      or auth_claims.get("chatgpt_account_id"))
+        plan_type = auth_claims.get("chatgpt_plan_type")
+        email = (id_payload.get("email")
+                 or (id_payload.get("https://api.openai.com/profile") or {}).get("email"))
+        exp = int(access_payload.get("exp") or 0)
+        iat = max(0, exp - 3600)
+        shared_auth = {"chatgpt_account_id": account_id, "chatgpt_plan_type": plan_type}
+
+        vm_id_payload = {
+            "iss": "https://auth.openai.com",
+            "aud": [client_id],
+            "iat": iat, "exp": exp,
+            "https://api.openai.com/auth": shared_auth,
+        }
+        if email:
+            vm_id_payload["email"] = email
+        vm_access_payload = {
+            "iss": "https://auth.openai.com",
+            "aud": ["https://api.openai.com/v1"],
+            "iat": iat, "nbf": iat, "exp": exp,
+            "scp": access_payload.get("scp") or [
+                "openid", "profile", "email", "offline_access"],
+            "https://api.openai.com/auth": shared_auth,
+        }
+
+        expires_in = max(1, exp - int(time.time()))
+        response_body = {
+            "token_type": "Bearer",
+            "access_token": _jwt_forge(vm_access_payload),
+            "id_token": _jwt_forge(vm_id_payload),
+            "refresh_token": placeholder_refresh,
+            "expires_in": expires_in,
+        }
+        encoded = json.dumps(response_body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+        debug(f"  oauth_refresh_codex: returned forged JWTs, expires_in={expires_in}s")
 
     do_GET = do_request
     do_POST = do_request

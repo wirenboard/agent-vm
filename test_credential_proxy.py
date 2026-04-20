@@ -1095,6 +1095,164 @@ class TestCredentialProxyHostClaudeCredentials(unittest.TestCase):
         finally:
             _stop_proxy(proc)
 
+    def _write_codex_auth(self, path, access_exp_s=None, account_id="acct-123",
+                          plan_type="plus", email="a@b.com",
+                          refresh_token="rt-real"):
+        import time as _t, base64 as _b64, json as _j
+        if access_exp_s is None:
+            access_exp_s = int(_t.time() + 3600)
+        def _enc(obj):
+            return _b64.urlsafe_b64encode(
+                _j.dumps(obj, separators=(",", ":")).encode()
+            ).decode().rstrip("=")
+        def _forge(payload):
+            return f"{_enc({'alg': 'RS256', 'typ': 'JWT'})}.{_enc(payload)}.realsig"
+        auth_claims = {"chatgpt_account_id": account_id, "chatgpt_plan_type": plan_type}
+        id_tok = _forge({"iss": "https://auth.openai.com",
+                         "aud": ["app_EMoamEEZ73f0CkXaXp7hrann"],
+                         "exp": access_exp_s, "email": email,
+                         "https://api.openai.com/auth": auth_claims})
+        access_tok = _forge({"iss": "https://auth.openai.com",
+                             "aud": ["https://api.openai.com/v1"],
+                             "exp": access_exp_s,
+                             "scp": ["openid", "profile", "email", "offline_access"],
+                             "https://api.openai.com/auth": auth_claims})
+        with open(path, "w") as f:
+            _j.dump({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": id_tok,
+                    "access_token": access_tok,
+                    "refresh_token": refresh_token,
+                    "account_id": account_id,
+                },
+                "last_refresh": None,
+            }, f)
+
+    def test_codex_oauth_refresh_valid_jwt_short_circuits(self):
+        """Valid host JWT → short-circuit, no refresh_command spawn."""
+        import time as _t, base64 as _b64, json as _j
+        creds = self._creds_path()
+        future = int(_t.time() + 1800)
+        self._write_codex_auth(creds, access_exp_s=future)
+        sentinel = os.path.join(self.tmpdir, f"codex-did-refresh-{os.urandom(4).hex()}")
+        self.addCleanup(lambda: os.path.exists(sentinel) and os.unlink(sentinel))
+        rules = [{
+            "domain": "auth.openai.com",
+            "path_prefix": "/oauth/token",
+            "oauth_refresh_codex": {
+                "credentials_file": creds,
+                "refresh_command": ["sh", "-c", f"touch {sentinel}; exit 0"],
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "auth.openai.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            body = b"grant_type=refresh_token&refresh_token=placeholder&client_id=app_EMoamEEZ73f0CkXaXp7hrann&scope=openid+profile+email+offline_access"
+            status, _, data = _proxy_request(port, "POST", "/oauth/token", headers, body)
+            self.assertEqual(status, 200)
+            payload = json.loads(data)
+            # Fresh forged JWTs, not the real signatures from the host.
+            self.assertTrue(payload["access_token"].endswith(".placeholder"))
+            self.assertTrue(payload["id_token"].endswith(".placeholder"))
+            self.assertEqual(payload["refresh_token"], "placeholder-refresh-token-injected-by-proxy")
+            self.assertEqual(payload["token_type"], "Bearer")
+            self.assertGreater(payload["expires_in"], 60)
+            # Claims from host propagate into forged access_token.
+            access_claims = _j.loads(_b64.urlsafe_b64decode(
+                payload["access_token"].split(".")[1] + "==="))
+            auth = access_claims["https://api.openai.com/auth"]
+            self.assertEqual(auth["chatgpt_account_id"], "acct-123")
+            self.assertEqual(auth["chatgpt_plan_type"], "plus")
+            self.assertFalse(os.path.exists(sentinel),
+                             "refresh_command ran even though host JWT was valid")
+        finally:
+            _stop_proxy(proc)
+
+    def test_codex_oauth_refresh_expired_jwt_spawns(self):
+        """Expired host JWT → spawn refresh_command, then forge new JWTs from the rotated file."""
+        import time as _t
+        creds = self._creds_path()
+        expired = int(_t.time() - 60)
+        self._write_codex_auth(creds, access_exp_s=expired)
+        stub = os.path.join(self.tmpdir, f"codex-refresh-{os.urandom(4).hex()}.py")
+        with open(stub, "w") as f:
+            f.write(
+                "import base64, json, time\n"
+                f"path = {creds!r}\n"
+                "def enc(o): return base64.urlsafe_b64encode(json.dumps(o,separators=(',',':')).encode()).decode().rstrip('=')\n"
+                "def forge(p): return f\"{enc({'alg':'RS256','typ':'JWT'})}.{enc(p)}.realsig\"\n"
+                "with open(path) as g: data = json.load(g)\n"
+                "exp = int(time.time() + 3600)\n"
+                "auth = {'chatgpt_account_id': 'acct-rotated', 'chatgpt_plan_type': 'pro'}\n"
+                "data['tokens']['access_token'] = forge({'exp':exp, 'https://api.openai.com/auth':auth})\n"
+                "data['tokens']['id_token'] = forge({'exp':exp, 'https://api.openai.com/auth':auth, 'email':'rot@x.io'})\n"
+                "data['tokens']['refresh_token'] = 'rt-rotated'\n"
+                "open(path,'w').write(json.dumps(data))\n"
+            )
+        self.addCleanup(lambda: os.path.exists(stub) and os.unlink(stub))
+        rules = [{
+            "domain": "auth.openai.com",
+            "path_prefix": "/oauth/token",
+            "oauth_refresh_codex": {
+                "credentials_file": creds,
+                "refresh_command": [sys.executable, stub],
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "auth.openai.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            body = b"grant_type=refresh_token&refresh_token=placeholder"
+            status, _, data = _proxy_request(port, "POST", "/oauth/token", headers, body)
+            self.assertEqual(status, 200)
+            payload = json.loads(data)
+            # Host file was rewritten by the stub; forged response mirrors new claims.
+            with open(creds) as f:
+                new = json.load(f)
+            self.assertEqual(new["tokens"]["refresh_token"], "rt-rotated")
+            self.assertTrue(payload["access_token"].endswith(".placeholder"))
+            self.assertGreater(payload["expires_in"], 60)
+        finally:
+            _stop_proxy(proc)
+
+    def test_codex_oauth_refresh_command_failure_returns_502(self):
+        """refresh_command fails to update the file → 502."""
+        import time as _t
+        creds = self._creds_path()
+        self._write_codex_auth(creds, access_exp_s=int(_t.time() - 60))
+        rules = [{
+            "domain": "auth.openai.com",
+            "path_prefix": "/oauth/token",
+            "oauth_refresh_codex": {
+                "credentials_file": creds,
+                "refresh_command": ["sh", "-c", "exit 1"],
+                "refresh_timeout": 5,
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "auth.openai.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            body = b"grant_type=refresh_token&refresh_token=placeholder"
+            status, _, _ = _proxy_request(port, "POST", "/oauth/token", headers, body)
+            self.assertEqual(status, 502)
+        finally:
+            _stop_proxy(proc)
+
     def test_oauth_refresh_command_failure_returns_502(self):
         """If refresh_command fails to update the file, VM sees an upstream error."""
         import time as _t

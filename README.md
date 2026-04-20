@@ -241,6 +241,15 @@ When your host has `~/.claude/.credentials.json` (from a normal Claude Code logi
 
 This means token rotation "just works" across multiple concurrent VMs, and real tokens never enter any VM.
 
+### OpenAI auth via host Codex credentials
+
+Same pattern for Codex (and OpenCode when using host ChatGPT auth). When `OPENAI_API_KEY` is unset and host `~/.codex/auth.json` contains a valid ChatGPT login, the proxy:
+
+- Reads `tokens.access_token` from the host file on every `api.openai.com` / `chatgpt.com` request and injects it as the Bearer.
+- MITMs `auth.openai.com/oauth/token`: decodes the host JWT's `exp` claim; if still valid, synthesizes a response with forged placeholder JWTs whose claims (`chatgpt_account_id`, `chatgpt_plan_type`, `email`, `exp`) mirror the host's. Otherwise spawns `codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "Reply with OK"` on the host — host Codex does the real rotation, the proxy re-reads and forges fresh placeholders.
+
+VM Codex updates its own `auth.json` from the forged response but never sees a real `access_token` / `refresh_token`.
+
 ### Configuration
 
 | Env var | Description | Default |

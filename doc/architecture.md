@@ -227,26 +227,33 @@ upstream, прокси читает `credentials_file` хоста:
 
 **Причина:** Клиенты (Claude SDK, git) имеют свою логику повторов. Двойные retry создают каскадные проблемы.
 
-### ADR-7: Хост-Claude — единственный писатель `credentials.json`
+### ADR-7: Хост-агент — единственный писатель файла учётных данных
 
-**Контекст:** VM-Claude должен иметь возможность рефрешить OAuth-токен, но не должен
-видеть ни реальный access, ни реальный refresh. При этом на хосте одновременно может
-работать пользовательский Claude, который тоже владеет тем же файлом.
+**Контекст:** VM-агент (Claude или Codex) должен рефрешить OAuth-токен, но не должен
+видеть ни реальный access, ни реальный refresh. На хосте параллельно может работать
+пользовательский агент, который тоже владеет тем же файлом.
 
 **Решение:** Прокси обрабатывает refresh-запросы VM **без обращения к upstream** — вместо
-этого он запускает локальный `claude -p "say hi and exit" --model sonnet`. Хост-Claude
-выполняет свою обычную логику ротации и сам пишет обновлённый файл. Прокси затем
-перечитывает файл и возвращает VM placeholder-токены с реальным `expires_in`.
+этого он запускает локального агента (`claude -p ...` для Anthropic, `codex exec ...`
+для OpenAI). Хост-агент выполняет свою обычную логику ротации и сам пишет обновлённый
+файл. Прокси затем перечитывает файл и возвращает VM placeholder-токены с реальным
+`expires_in`.
 
 **Почему так:**
-- **Один писатель** — исключает конфликт между прокси и хост-Claude при одновременной
+- **Один писатель** — исключает конфликт между прокси и хост-агентом при одновременной
   ротации.
-- **Логика ротации не дублируется** — если Anthropic изменит формат refresh-ответа,
-  обновление хост-Claude автоматически покроет и VM.
+- **Логика ротации не дублируется** — если поставщик изменит формат refresh-ответа,
+  обновление хост-агента автоматически покроет и VM.
 - **Никаких утечек** — прокси читает реальные токены только в памяти, файлом владеет хост.
 
-**Альтернатива:** Прокси сам делает HTTP-запрос к `platform.claude.com` и переписывает файл.
-Отвергнуто — усложняет инвариант "у файла один писатель" и дублирует код OAuth.
+**Для Codex дополнительно:** `auth.json` содержит JWT-токены. Прокси подделывает свежие
+placeholder-JWT с корректными claim'ами (`chatgpt_account_id`, `plan_type`, `email`, `exp`),
+подписанные литералом `.placeholder`. Codex внутри VM принимает их (подпись проверяется
+только сервером), но реальные JWT остаются только в файле хоста.
+
+**Альтернатива:** Прокси сам делает HTTP-запрос к `platform.claude.com` /
+`auth.openai.com` и переписывает файл. Отвергнуто — усложняет инвариант "у файла один
+писатель" и дублирует код OAuth.
 
 ### ADR-6: Per-instance секрет для изоляции ВМ
 
@@ -272,7 +279,7 @@ upstream, прокси читает `credentials_file` хоста:
 
 ## 8. Тестирование
 
-55 автоматических тестов (`test_credential_proxy.py`):
+60 автоматических тестов (`test_credential_proxy.py`):
 
 - **TestCredentialProxy** (11) — инъекция заголовков, HTTP-методы, пути, дубликаты
 - **TestCredentialProxyErrors** (4) — 400/413/502 ошибки
@@ -285,12 +292,13 @@ upstream, прокси читает `credentials_file` хоста:
 - **TestCredentialProxyUpstreamProxy** (1) — per-rule маршрутизация через AI_HTTPS_PROXY
 - **TestCredentialProxyConnectTunnel** (1) — CONNECT-туннель с авторизацией upstream proxy
 - **TestCredentialProxyExtraCACerts** (2) — загрузка дополнительных CA-сертификатов
-- **TestCredentialProxyHostClaudeCredentials** (4) — `auth_from_file` читает per-request;
-  `oauth_refresh` при валидном токене не запускает `refresh_command`; при просроченном —
-  запускает и перечитывает файл; отказ команды → 502
-- **TestBuildCredentialRules** (9) — генерация per-repo правил из токенов (включая
-  always-emit api.anthropic.com и `auth_from_file` + `oauth_refresh` при хостовом
-  credentials-файле)
+- **TestCredentialProxyHostClaudeCredentials** (7) — `auth_from_file` читает per-request;
+  `oauth_refresh` (Claude) при валидном токене не запускает `refresh_command`; при
+  просроченном — запускает и перечитывает файл; отказ → 502; `oauth_refresh_codex`
+  аналогично (JWT-expiry check, форма form-encoded, подделка JWT-ответа)
+- **TestBuildCredentialRules** (11) — генерация per-repo правил из токенов (включая
+  always-emit api.anthropic.com, `auth_from_file` + `oauth_refresh` при хостовом
+  Claude-файле, и Codex `auth_from_file` + OPENAI_API_KEY precedence)
 - **TestCodexHostAuthHelpers** (3) — чтение/валидация хостовых Codex auth
 - **TestMitmproxyAddon** (6) — перезапись flow, секрет, блокировка доменов
 
