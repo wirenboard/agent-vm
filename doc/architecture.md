@@ -32,20 +32,24 @@
 ## 3. Контекст системы
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Хост                                                            │
-│                                                                 │
-│  Токены ──► credential-proxy.py ──────► api.anthropic.com       │
-│             (127.0.0.1:PORT)            github.com              │
-│                  ▲                      api.github.com          │
-│                  │ HTTP                                         │
-│ ─ ─ ─ ─ ─- ─ ─ ─ │ -----─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │
-│ Lima VM          │                                              │
-│                  │                                              │
-│  Claude ──► mitmdump ────────────► pypi.org, npm и др.          │
-│  git       (HTTPS_PROXY)          (passthrough, без MITM)       |
-│  gh                                                             │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Хост                                                                 │
+│                                                                      │
+│  ~/.claude/.credentials.json ◄─── claude -p (refresh)                │
+│         │                              ▲                             │
+│         │ чтение per request           │ spawn при истечении         │
+│         ▼                              │                             │
+│     credential-proxy.py ──────────► api.anthropic.com                │
+│      (127.0.0.1:PORT)               platform.claude.com (oauth)      │
+│           ▲                         github.com, api.github.com       │
+│           │ HTTP                                                     │
+│ ─ ─ ─ ─ ─ │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │
+│ Lima VM   │                                                          │
+│           │                                                          │
+│  Claude ──► mitmdump ────────────► pypi.org, npm и др.               │
+│  git     (HTTPS_PROXY)            (passthrough, без MITM)            │
+│  gh                                                                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 4. Стратегия решения
@@ -71,7 +75,16 @@
 **Конфигурация** (`CREDENTIAL_PROXY_RULES` env):
 ```json
 [
-  {"domain": "api.anthropic.com", "headers": {"Authorization": "Bearer sk-..."}, "use_proxy": true},
+  {"domain": "api.anthropic.com",
+   "auth_from_file": {"path": "~/.claude/.credentials.json",
+                       "json_path": "claudeAiOauth.accessToken",
+                       "header": "Authorization", "format": "Bearer {token}"},
+   "use_proxy": true},
+  {"domain": "platform.claude.com", "path_prefix": "/v1/oauth/token",
+   "oauth_refresh": {"credentials_file": "~/.claude/.credentials.json",
+                     "placeholder_access_token": "sk-ant-oat01-placeholder-proxy-managed",
+                     "placeholder_refresh_token": "sk-ant-ort01-placeholder-proxy-managed",
+                     "refresh_command": ["claude", "-p", "say hi and exit", "--model", "sonnet"]}},
   {"domain": "github.com", "path_prefix": "/org1/repo1", "headers": {"Authorization": "Basic <base64-token1>"}},
   {"domain": "github.com", "path_prefix": "/org2/repo2", "headers": {"Authorization": "Basic <base64-token2>"}},
   {"domain": "github.com", "headers": {"Authorization": "Basic <base64-fallback>"}},
@@ -84,6 +97,28 @@
 Опциональное поле `path_prefix` позволяет разные токены для разных репозиториев.
 Правила сортируются по длине префикса (longest match first), правила без префикса — fallback.
 Поле `use_proxy` маршрутизирует запрос через `AI_HTTPS_PROXY` (upstream proxy для AI API).
+
+**Источники заголовков авторизации:**
+- `headers` — статические значения из конфигурации (например, Basic для GitHub);
+- `auth_from_file` — значение считывается из JSON-файла на хосте при каждом запросе
+  (путь к полю указан через `json_path`); используется для Anthropic — токен берётся
+  из `~/.claude/.credentials.json` хоста, поэтому VM видит актуальный Bearer и после
+  ротации без перезапуска.
+
+**OAuth refresh MITM (`oauth_refresh`):**
+Перехватывает POST к `platform.claude.com/v1/oauth/token`. Вместо того чтобы ходить на
+upstream, прокси читает `credentials_file` хоста:
+1. Если `claudeAiOauth.expiresAt > now + 60s` — возвращает VM фиктивные токены
+   (`placeholder_access_token` / `placeholder_refresh_token`) и реальный остаток времени
+   (`expires_in`).
+2. Иначе запускает `refresh_command` (по умолчанию `claude -p "say hi and exit" --model sonnet`),
+   дожидается окончания (timeout 120s), перечитывает файл, возвращает placeholders.
+3. Если команда не обновила файл — отвечает 502.
+
+Прокси **никогда не пишет** файл `credentials.json` — хост-Claude остаётся единственным
+писателем, поэтому логика ротации полностью совпадает с логикой хоста. На уровне процесса
+используется per-file `threading.Lock`, чтобы одновременно не запускать несколько
+`claude -p` для одного файла.
 
 **Поток обработки запроса:**
 1. Получить HTTP-запрос от mitmproxy
@@ -114,11 +149,16 @@
 ### 5.3. Интеграция в claude-vm.sh
 
 **Последовательность запуска:**
-1. Получить токены (Anthropic из `CLAUDE_VM_PROXY_ACCESS_TOKEN`, GitHub App через device auth)
+1. Получить токены:
+   - Anthropic: проверить наличие валидного `~/.claude/.credentials.json` хоста;
+   - GitHub App через device auth.
 2. Собрать `CREDENTIAL_PROXY_RULES` JSON (пропускается, если нет токенов)
 3. Запустить `credential-proxy.py` на хосте → получить порт (пропускается, если правила пусты)
 4. Клонировать и загрузить ВМ
-5. Записать `CLAUDE_CODE_OAUTH_TOKEN` env var (реальный токен или placeholder, если задан `AI_HTTPS_PROXY`)
+5. Настроить учётные данные Claude Code внутри ВМ:
+   - если используется хостовый файл — записать placeholder `~/.claude/.credentials.json`
+     (реальный `expiresAt` из хостового файла, подменные токены);
+   - иначе — `CLAUDE_CODE_OAUTH_TOKEN=placeholder` при `AI_HTTPS_PROXY`.
 6. Сгенерировать CA-сертификат mitmproxy, установить в доверенные
 7. Установить прокси env vars через `/etc/profile.d/credential-proxy.sh`
 8. Запустить mitmdump с аддоном через `systemd-run --user`
@@ -130,10 +170,15 @@
 Перед запуском device auth flow для каждого репозитория (основного и подмодулей) проверяется наличие write-доступа через `git push --dry-run --no-verify origin HEAD`. Работает с любым типом хост-аутентификации (SSH-ключи, HTTPS-токены). Успешный exit code или отказ "non-fast-forward" / "up to date" означают наличие push-доступа. Репозитории без write-доступа пропускаются — device auth flow не запускается.
 
 **Условный запуск:**
-- `CLAUDE_VM_PROXY_ACCESS_TOKEN` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (реальный токен остаётся на хосте, proxy подменяет Authorization)
-- `CLAUDE_VM_PROXY_ACCESS_TOKEN` не задан, но `AI_HTTPS_PROXY` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder` (трафик маршрутизируется через upstream proxy)
-- Ни `CLAUDE_VM_PROXY_ACCESS_TOKEN`, ни `AI_HTTPS_PROXY` не заданы → `CLAUDE_CODE_OAUTH_TOKEN` не создаётся
-- Нет ни одного токена (ни Anthropic, ни GitHub) и нет `AI_HTTPS_PROXY` → credential-proxy и mitmproxy не запускаются, ВМ работает без прокси
+- Хостовый `~/.claude/.credentials.json` валиден → правила `auth_from_file`
+  (api.anthropic.com) + `oauth_refresh` (platform.claude.com); в ВМ пишется placeholder
+  `~/.claude/.credentials.json`; `CLAUDE_CODE_OAUTH_TOKEN` не создаётся, чтобы Claude
+  использовал файл и проходил стандартный OAuth refresh через прокси.
+- Хостового файла нет, но `AI_HTTPS_PROXY` задан → `CLAUDE_CODE_OAUTH_TOKEN=placeholder`
+  (трафик маршрутизируется через upstream proxy).
+- Ничего из перечисленного → `CLAUDE_CODE_OAUTH_TOKEN` не создаётся.
+- Нет ни одного токена (ни Anthropic, ни GitHub) и нет `AI_HTTPS_PROXY` → credential-proxy
+  и mitmproxy не запускаются, ВМ работает без прокси.
 
 ## 6. Решения об архитектуре
 
@@ -182,6 +227,27 @@
 
 **Причина:** Клиенты (Claude SDK, git) имеют свою логику повторов. Двойные retry создают каскадные проблемы.
 
+### ADR-7: Хост-Claude — единственный писатель `credentials.json`
+
+**Контекст:** VM-Claude должен иметь возможность рефрешить OAuth-токен, но не должен
+видеть ни реальный access, ни реальный refresh. При этом на хосте одновременно может
+работать пользовательский Claude, который тоже владеет тем же файлом.
+
+**Решение:** Прокси обрабатывает refresh-запросы VM **без обращения к upstream** — вместо
+этого он запускает локальный `claude -p "say hi and exit" --model sonnet`. Хост-Claude
+выполняет свою обычную логику ротации и сам пишет обновлённый файл. Прокси затем
+перечитывает файл и возвращает VM placeholder-токены с реальным `expires_in`.
+
+**Почему так:**
+- **Один писатель** — исключает конфликт между прокси и хост-Claude при одновременной
+  ротации.
+- **Логика ротации не дублируется** — если Anthropic изменит формат refresh-ответа,
+  обновление хост-Claude автоматически покроет и VM.
+- **Никаких утечек** — прокси читает реальные токены только в памяти, файлом владеет хост.
+
+**Альтернатива:** Прокси сам делает HTTP-запрос к `platform.claude.com` и переписывает файл.
+Отвергнуто — усложняет инвариант "у файла один писатель" и дублирует код OAuth.
+
 ### ADR-6: Per-instance секрет для изоляции ВМ
 
 **Угроза:** На одном хосте несколько ВМ с разными наборами репозиториев. ВМ-1 может обратиться к credential-proxy ВМ-2 через `host.lima.internal:PORT` и получить токены чужих репозиториев.
@@ -206,19 +272,26 @@
 
 ## 8. Тестирование
 
-47 автоматических тестов (`test_credential_proxy.py`):
+55 автоматических тестов (`test_credential_proxy.py`):
 
 - **TestCredentialProxy** (11) — инъекция заголовков, HTTP-методы, пути, дубликаты
 - **TestCredentialProxyErrors** (4) — 400/413/502 ошибки
 - **TestCredentialProxySecret** (4) — Proxy-Authorization проверка, 403 при несовпадении, strip перед upstream
 - **TestCredentialProxyUnmatched** (1) — домены без правил
 - **TestCredentialProxyStreaming** (1) — chunked-ответы
+- **TestCredentialProxyWebSocket** (1) — websocket upgrade tunnel
 - **TestCredentialProxyPathMatching** (4) — per-repo маршрутизация по path_prefix
 - **TestCredentialProxyStartup** (3) — запуск, некорректный JSON, SIGTERM
 - **TestCredentialProxyUpstreamProxy** (1) — per-rule маршрутизация через AI_HTTPS_PROXY
 - **TestCredentialProxyConnectTunnel** (1) — CONNECT-туннель с авторизацией upstream proxy
 - **TestCredentialProxyExtraCACerts** (2) — загрузка дополнительных CA-сертификатов
-- **TestBuildCredentialRules** (9) — генерация per-repo правил из токенов (включая always-emit api.anthropic.com)
+- **TestCredentialProxyHostClaudeCredentials** (4) — `auth_from_file` читает per-request;
+  `oauth_refresh` при валидном токене не запускает `refresh_command`; при просроченном —
+  запускает и перечитывает файл; отказ команды → 502
+- **TestBuildCredentialRules** (9) — генерация per-repo правил из токенов (включая
+  always-emit api.anthropic.com и `auth_from_file` + `oauth_refresh` при хостовом
+  credentials-файле)
+- **TestCodexHostAuthHelpers** (3) — чтение/валидация хостовых Codex auth
 - **TestMitmproxyAddon** (6) — перезапись flow, секрет, блокировка доменов
 
 Запуск: `python3 -m pytest test_credential_proxy.py -v`

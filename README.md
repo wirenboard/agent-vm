@@ -229,11 +229,22 @@ A two-layer proxy chain keeps all API credentials out of the VM:
 
 The VM only ever sees placeholder tokens. Real credentials live in the host process's memory. A per-instance shared secret (via standard `Proxy-Authorization`) prevents cross-VM credential theft.
 
+### Anthropic auth via host Claude credentials
+
+When your host has `~/.claude/.credentials.json` (from a normal Claude Code login), agent-vm uses it as the single source of truth for Anthropic auth:
+
+- A placeholder `~/.claude/.credentials.json` is written inside the VM with the host's real `expiresAt` but fake access/refresh tokens.
+- The credential proxy reads the host file on every `api.anthropic.com` request and swaps in the real Bearer token.
+- When the VM's Claude Code decides to refresh (POST to `platform.claude.com/v1/oauth/token`), the proxy intercepts it:
+  - If the host token is still valid, it short-circuits and returns placeholders with the real remaining lifetime.
+  - Otherwise, it spawns `claude -p "say hi and exit" --model sonnet` on the host so host Claude performs the rotation and writes the new tokens to its own file. The proxy never writes the credentials file itself — host Claude remains the sole writer.
+
+This means token rotation "just works" across multiple concurrent VMs, and real tokens never enter any VM.
+
 ### Configuration
 
 | Env var | Description | Default |
 |---------|-------------|---------|
-| `CLAUDE_VM_PROXY_ACCESS_TOKEN` | Anthropic API token to inject | — |
 | `OPENAI_API_KEY` | OpenAI API token to inject for Codex / `api.openai.com` | — |
 | `AI_HTTPS_PROXY` | Upstream proxy for AI API traffic only (e.g. `http://user:pass@host:8082`) | — |
 | `AI_SSL_CERT_FILE` | Extra CA cert PEM for `AI_HTTPS_PROXY` | — |

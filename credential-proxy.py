@@ -26,6 +26,7 @@ Optional env vars:
 """
 
 import base64
+import fcntl
 import http.client
 import http.server
 import json
@@ -33,9 +34,10 @@ import os
 import select
 import signal
 import socket
-import ssl
-import sys
 import socketserver
+import ssl
+import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse, unquote
@@ -95,13 +97,91 @@ def redact(value, show=8):
     return value[:show] + "..."
 
 
-# Parse credential rules from env
-# Each rule: {"domain": "...", "headers": {...}, "path_prefix": "/optional/prefix",
-#             "use_proxy": true}
-# Multiple rules per domain are supported; longest matching path_prefix wins.
-# Rules without path_prefix match any path on that domain (fallback).
-# Rules with "use_proxy": true route through AI_HTTPS_PROXY.
-_RULES = {}  # domain -> [{"headers": {...}, "path_prefix": str|None, "use_proxy": bool}, ...]
+def _read_credentials_file(path):
+    """Read and parse a credentials JSON file under an advisory shared lock.
+
+    flock(LOCK_SH) already permits concurrent in-process readers; no extra
+    threading.Lock needed. The shared lock blocks only while host Claude
+    holds LOCK_EX to rewrite the file — i.e. exactly when we want readers
+    to wait for the new tokens.
+    """
+    try:
+        with open(path, "r") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except (OSError, json.JSONDecodeError) as e:
+        debug(f"  credentials read failed: {path}: {e}")
+        return None
+
+
+def _json_path_get(data, dotted):
+    cur = data
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+# Serializes refresh invocations per credentials file: we never want two
+# `claude -p` probes racing for the same file.
+_refresh_locks = {}
+_refresh_locks_guard = threading.Lock()
+
+
+def _refresh_lock(path):
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[path] = lock
+        return lock
+
+
+_HOST_CLAUDE_INHERITED_ENV_DROP = {
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "https_proxy", "http_proxy", "no_proxy",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+}
+
+
+def _trigger_host_claude_refresh(command, timeout):
+    """Spawn host Claude to force a credential refresh.
+
+    The spawned process inherits the user env but with proxy vars stripped so
+    it talks to api.anthropic.com directly, not back to us.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in _HOST_CLAUDE_INHERITED_ENV_DROP}
+    debug(f"  oauth_refresh: spawning {command}")
+    try:
+        result = subprocess.run(
+            command, env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False,
+        )
+        if result.returncode != 0:
+            debug(f"  oauth_refresh: refresh command rc={result.returncode}: "
+                  f"{result.stdout[:500]!r}")
+            return False
+        debug(f"  oauth_refresh: refresh command succeeded")
+        return True
+    except subprocess.TimeoutExpired:
+        debug(f"  oauth_refresh: refresh command timed out after {timeout}s")
+        return False
+    except (FileNotFoundError, OSError) as e:
+        debug(f"  oauth_refresh: refresh command failed to launch: {e}")
+        return False
+
+
+# Parse credential rules from env. See _handle_oauth_refresh() and
+# _build_upstream_headers() for the supported rule fields (headers, path_prefix,
+# use_proxy, auth_from_file, oauth_refresh).
+_RULES = {}
 _rules_json = os.environ.get("CREDENTIAL_PROXY_RULES", "[]")
 try:
     for rule in json.loads(_rules_json):
@@ -110,6 +190,8 @@ try:
             "headers": rule.get("headers", {}),
             "path_prefix": rule.get("path_prefix"),
             "use_proxy": rule.get("use_proxy", False),
+            "auth_from_file": rule.get("auth_from_file"),
+            "oauth_refresh": rule.get("oauth_refresh"),
         }
         _RULES.setdefault(domain, []).append(entry)
     # Sort each domain's rules: longest path_prefix first, None last
@@ -154,18 +236,33 @@ def _build_upstream_headers(request_headers, original_host, rule):
 
     headers["Host"] = original_host
 
+    def _set_header(name, value):
+        to_remove = []
+        for existing_key in headers:
+            if existing_key.lower() == name.lower():
+                to_remove.append(existing_key)
+        for key in to_remove:
+            del headers[key]
+            header_keys_lower.pop(key.lower(), None)
+        headers[name] = value
+        header_keys_lower[name.lower()] = name
+
     if rule:
         for header_name, header_value in rule["headers"].items():
-            to_remove = []
-            for existing_key in headers:
-                if existing_key.lower() == header_name.lower():
-                    to_remove.append(existing_key)
-            for key in to_remove:
-                del headers[key]
-                header_keys_lower.pop(key.lower(), None)
-            headers[header_name] = header_value
-            header_keys_lower[header_name.lower()] = header_name
+            _set_header(header_name, header_value)
             debug(f"  injected {header_name}: {redact(header_value)}")
+
+        auth_src = rule.get("auth_from_file")
+        if auth_src:
+            creds = _read_credentials_file(auth_src["path"])
+            token = _json_path_get(creds or {}, auth_src["json_path"])
+            if token:
+                header_name = auth_src["header"]
+                header_value = auth_src["format"].replace("{token}", token)
+                _set_header(header_name, header_value)
+                debug(f"  injected {header_name} from {auth_src['path']}: {redact(header_value)}")
+            else:
+                debug(f"  auth_from_file missing token at {auth_src['json_path']} in {auth_src['path']}")
 
     if DEBUG:
         for key, value in headers.items():
@@ -330,6 +427,11 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         rule = _match_rule(original_host, self.path)
         if not rule:
             debug(f"  no credential rule for {original_host}, forwarding as-is")
+
+        if rule and rule.get("oauth_refresh"):
+            self._handle_oauth_refresh(rule["oauth_refresh"], body)
+            return
+
         headers = _build_upstream_headers(self.headers, original_host, rule)
 
         # Connect to upstream (route through AI proxy if rule says so)
@@ -459,6 +561,76 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_oauth_refresh(self, cfg, body):
+        """Synthesize an OAuth refresh response by consulting the host file.
+
+        If the host's access token is still valid, return it (as placeholders
+        plus the real remaining lifetime). Otherwise, spawn host Claude to
+        perform the actual OAuth refresh (host Claude writes the file), then
+        re-read and return the fresh window — again as placeholders.
+        """
+        creds_path = cfg["credentials_file"]
+        json_path = cfg.get("json_path", "claudeAiOauth")
+        expiry_grace_ms = int(cfg.get("expiry_grace_ms", 60_000))
+        placeholder_access = cfg.get(
+            "placeholder_access_token", "sk-ant-oat01-placeholder-proxy-managed")
+        placeholder_refresh = cfg.get(
+            "placeholder_refresh_token", "sk-ant-ort01-placeholder-proxy-managed")
+        refresh_command = cfg.get(
+            "refresh_command", ["claude", "-p", "say hi and exit", "--model", "sonnet"])
+        refresh_timeout = int(cfg.get("refresh_timeout", 120))
+
+        try:
+            body_json = json.loads(body) if body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body_json = {}
+        if body_json.get("grant_type") not in (None, "refresh_token"):
+            debug(f"  oauth_refresh: unsupported grant_type {body_json.get('grant_type')!r}")
+            self.send_error_response(400, "unsupported grant_type")
+            return
+
+        def _current_oauth():
+            creds = _read_credentials_file(creds_path) or {}
+            return _json_path_get(creds, json_path) or {}
+
+        def _expiry_ms(oauth):
+            try:
+                return int(oauth.get("expiresAt") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        oauth = _current_oauth()
+        if _expiry_ms(oauth) <= int(time.time() * 1000) + expiry_grace_ms:
+            with _refresh_lock(creds_path):
+                # Re-check: another thread may have refreshed while we waited.
+                oauth = _current_oauth()
+                if _expiry_ms(oauth) <= int(time.time() * 1000) + expiry_grace_ms:
+                    ok = _trigger_host_claude_refresh(refresh_command, refresh_timeout)
+                    oauth = _current_oauth()
+                    if not ok or _expiry_ms(oauth) <= int(time.time() * 1000):
+                        debug("  oauth_refresh: host refresh did not update credentials")
+                        self.send_error_response(502, "host refresh failed")
+                        return
+
+        expires_in = max(1, (_expiry_ms(oauth) - int(time.time() * 1000)) // 1000)
+        scopes = oauth.get("scopes") or []
+        response_body = {
+            "token_type": "Bearer",
+            "access_token": placeholder_access,
+            "refresh_token": placeholder_refresh,
+            "expires_in": int(expires_in),
+        }
+        if scopes:
+            response_body["scope"] = " ".join(scopes)
+        encoded = json.dumps(response_body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+        debug(f"  oauth_refresh: returned placeholder tokens, expires_in={expires_in}s")
 
     do_GET = do_request
     do_POST = do_request

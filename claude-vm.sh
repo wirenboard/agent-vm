@@ -445,30 +445,49 @@ _claude_vm_install_host_proxy_ca() {
 
 _claude_vm_build_credential_rules() {
   # Build CREDENTIAL_PROXY_RULES JSON from tokens.
-  # Args: anthropic_token openai_token github_repos_json copilot_token
+  # Args: openai_token github_repos_json copilot_token host_claude_credentials_file
   # github_repos_json: '{"owner/repo": "token", ...}' — per-repo tokens
-  local anthropic_token="$1"
-  local openai_token="$2"
-  local github_repos_json="$3"
-  local copilot_token="$4"
+  # host_claude_credentials_file: if set, the proxy reads the Anthropic
+  #   Authorization header from this host file on each request and intercepts
+  #   platform.claude.com OAuth refresh by letting host Claude rotate tokens.
+  local openai_token="$1"
+  local github_repos_json="$2"
+  local copilot_token="$3"
+  local host_claude_credentials_file="${4:-}"
 
   python3 -c "
 import base64, json, sys
 rules = []
-anthropic_token = sys.argv[1]
-openai_token = sys.argv[2]
-repos = json.loads(sys.argv[3]) if sys.argv[3] else {}
-copilot_token = sys.argv[4]
-# Always intercept api.anthropic.com (for upstream proxy routing via use_proxy).
-# Inject Authorization only if a token is provided.
-anthropic_headers = {}
-if anthropic_token:
-    anthropic_headers['Authorization'] = f'Bearer {anthropic_token}'
-rules.append({
-    'domain': 'api.anthropic.com',
-    'headers': anthropic_headers,
-    'use_proxy': True,
-})
+openai_token = sys.argv[1]
+repos = json.loads(sys.argv[2]) if sys.argv[2] else {}
+copilot_token = sys.argv[3]
+host_claude_creds = sys.argv[4]
+PLACEHOLDER_ACCESS = '$CLAUDE_VM_PLACEHOLDER_ACCESS_TOKEN'
+PLACEHOLDER_REFRESH = '$CLAUDE_VM_PLACEHOLDER_REFRESH_TOKEN'
+# Always intercept api.anthropic.com so traffic can be upstream-proxied.
+# If host creds are available, also intercept platform.claude.com's OAuth
+# refresh endpoint — see doc/architecture.md ADR-7.
+anthropic_rule = {'domain': 'api.anthropic.com', 'headers': {}, 'use_proxy': True}
+if host_claude_creds:
+    anthropic_rule['auth_from_file'] = {
+        'path': host_claude_creds,
+        'json_path': 'claudeAiOauth.accessToken',
+        'header': 'Authorization',
+        'format': 'Bearer {token}',
+    }
+rules.append(anthropic_rule)
+if host_claude_creds:
+    rules.append({
+        'domain': 'platform.claude.com',
+        'path_prefix': '/v1/oauth/token',
+        'headers': {},
+        'oauth_refresh': {
+            'credentials_file': host_claude_creds,
+            'json_path': 'claudeAiOauth',
+            'placeholder_access_token': PLACEHOLDER_ACCESS,
+            'placeholder_refresh_token': PLACEHOLDER_REFRESH,
+        },
+    })
 openai_headers = {}
 if openai_token:
     openai_headers['Authorization'] = f'Bearer {openai_token}'
@@ -526,7 +545,7 @@ if copilot_token:
                 'headers': copilot_headers,
             })
 print(json.dumps(rules))
-" "$anthropic_token" "$openai_token" "$github_repos_json" "$copilot_token"
+" "$openai_token" "$github_repos_json" "$copilot_token" "$host_claude_credentials_file"
 }
 
 _claude_vm_start_credential_proxy() {
@@ -1007,7 +1026,7 @@ _claude_vm_post_boot_setup() {
   # Shared post-boot setup for both claude-vm and claude-vm-shell.
   # Uses variables from the calling function's scope:
   #   vm_name, host_dir, state_dir, agent, use_github,
-  #   _anthropic_token, _openai_token, _codex_proxy_token, _copilot_token,
+  #   _host_claude_credentials_file, _openai_token, _codex_proxy_token, _copilot_token,
   #   _codex_placeholder_auth_json, _credential_rules, _credential_proxy_port,
   #   _credential_proxy_secret, _claude_vm_github_repos_json
   # Sets: _oauth_token, _codex_home, _intercepted_domains
@@ -1017,12 +1036,15 @@ _claude_vm_post_boot_setup() {
   _codex_home=""
 
   if [ "$agent" = "claude" ] || [ "$agent" = "opencode" ] || [ -z "$agent" ]; then
-    # Write a placeholder oauth token so Claude Code attempts API requests.
-    # The real auth header is injected by the host credential proxy —
-    # never expose the actual token inside the VM.
-    _oauth_token="${_anthropic_token:+placeholder}"
-    _oauth_token="${_oauth_token:-${AI_HTTPS_PROXY:+placeholder}}"
-    _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
+    # Either mirror the host credentials file (proxy MITMs refresh) or fall
+    # back to a placeholder env var so Claude still makes API calls via
+    # AI_HTTPS_PROXY. Real tokens never enter the VM either way.
+    if [ -n "${_host_claude_credentials_file:-}" ]; then
+      _claude_vm_write_placeholder_credentials "$vm_name" "$_host_claude_credentials_file"
+    else
+      _oauth_token="${AI_HTTPS_PROXY:+placeholder}"
+      _claude_vm_write_oauth_token "$vm_name" "$_oauth_token"
+    fi
     _claude_vm_setup_session_persistence "$vm_name" "$state_dir"
     _claude_vm_ensure_onboarding_config "$vm_name" "$host_dir"
   fi
@@ -1098,6 +1120,9 @@ _claude_vm_print_config() {
     [ ${#_oauth_token} -gt 16 ] && _truncated="${_truncated}..."
     echo "VM env: CLAUDE_CODE_OAUTH_TOKEN=${_truncated}"
   fi
+  if [ -n "${_host_claude_credentials_file:-}" ]; then
+    echo "VM auth: placeholder ~/.claude/.credentials.json; host file rotates tokens on refresh"
+  fi
   if [ -n "${_openai_token:-}" ]; then
     echo "VM env: OPENAI_API_KEY=dummy-key-auth-handled-by-proxy"
   fi
@@ -1132,6 +1157,68 @@ _claude_vm_write_oauth_token() {
 export CLAUDE_CODE_OAUTH_TOKEN=$token
 EOF
     sudo chmod 644 /etc/profile.d/claude-oauth.sh
+  "
+}
+
+# Placeholder tokens written into the VM's ~/.claude/.credentials.json.
+# The credential proxy rewrites them on the wire, so they never need to be real.
+CLAUDE_VM_PLACEHOLDER_ACCESS_TOKEN="sk-ant-oat01-placeholder-proxy-managed"
+CLAUDE_VM_PLACEHOLDER_REFRESH_TOKEN="sk-ant-ort01-placeholder-proxy-managed"
+
+_claude_vm_detect_host_claude_credentials() {
+  # Print the host's ~/.claude/.credentials.json path to stdout if it exists
+  # and has a complete claudeAiOauth block; announce on stderr. Empty stdout
+  # means "no host creds" and the caller should fall back to AI_HTTPS_PROXY
+  # (or run without Anthropic auth).
+  local path="$HOME/.claude/.credentials.json"
+  [ -r "$path" ] || return 0
+  if python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    oauth = data.get('claudeAiOauth') or {}
+    if not (oauth.get('accessToken') and oauth.get('refreshToken') and oauth.get('expiresAt')):
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+" "$path" 2>/dev/null; then
+    echo "$path"
+    echo "Using host Claude credentials via credential proxy MITM (token rotation stays on host)." >&2
+  fi
+}
+
+_claude_vm_write_placeholder_credentials() {
+  # Write a placeholder ~/.claude/.credentials.json into the VM. Claude Code
+  # will read expiresAt to decide when to refresh, so we mirror the host value;
+  # everything else is a fixed placeholder that the credential proxy rewrites.
+  local vm_name="$1"
+  local host_creds="$2"
+  local payload
+  payload=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    host = json.load(f)
+ho = host.get('claudeAiOauth') or {}
+out = {
+  'claudeAiOauth': {
+    'accessToken': sys.argv[2],
+    'refreshToken': sys.argv[3],
+    'expiresAt': ho.get('expiresAt', 0),
+    'scopes': ho.get('scopes', []),
+  }
+}
+for k in ('subscriptionType', 'rateLimitTier'):
+    if k in ho:
+        out['claudeAiOauth'][k] = ho[k]
+print(json.dumps(out))
+" "$host_creds" "$CLAUDE_VM_PLACEHOLDER_ACCESS_TOKEN" "$CLAUDE_VM_PLACEHOLDER_REFRESH_TOKEN") || return 1
+  limactl shell "$vm_name" bash -c "
+    mkdir -p \$HOME/.claude
+    cat > \$HOME/.claude/.credentials.json <<'CREDS'
+$payload
+CREDS
+    chmod 600 \$HOME/.claude/.credentials.json
   "
 }
 
@@ -1557,7 +1644,7 @@ _opencode_vm_setup_auth() {
   local _anthropic_auth_json=""
   local _openai_api_auth_json=""
   local _openai_oauth_auth_json="${_opencode_openai_auth_json:-}"
-  if [ -n "${_anthropic_token:-}" ]; then
+  if [ -n "${_host_claude_credentials_file:-}" ]; then
     _anthropic_auth_json='{"type":"api","key":"dummy-key-auth-handled-by-proxy"}'
   fi
   if [ -z "$_openai_oauth_auth_json" ] && { [ -n "${_openai_token:-}" ] || [ -n "${_codex_proxy_token:-}" ]; }; then
@@ -1670,8 +1757,11 @@ _agent_vm_run() {
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
-  # Get Anthropic token
-  local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
+  # Anthropic auth: use host ~/.claude/.credentials.json if available; the
+  # credential proxy MITMs both the Authorization header and OAuth refresh so
+  # real tokens never reach the VM.
+  local _host_claude_credentials_file
+  _host_claude_credentials_file="$(_claude_vm_detect_host_claude_credentials)"
   local _openai_token="${OPENAI_API_KEY:-}"
   local _copilot_token=""
   local _codex_proxy_token="${_openai_token:-}"
@@ -1706,7 +1796,7 @@ _agent_vm_run() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_cleanup; trap - EXIT INT TERM; return 1; }
@@ -1925,8 +2015,11 @@ _agent_vm_shell() {
   }
   trap _claude_vm_shell_cleanup EXIT INT TERM
 
-  # Get Anthropic token
-  local _anthropic_token="${CLAUDE_VM_PROXY_ACCESS_TOKEN:-}"
+  # Anthropic auth: use host ~/.claude/.credentials.json if available; the
+  # credential proxy MITMs both the Authorization header and OAuth refresh so
+  # real tokens never reach the VM.
+  local _host_claude_credentials_file
+  _host_claude_credentials_file="$(_claude_vm_detect_host_claude_credentials)"
   local _openai_token="${OPENAI_API_KEY:-}"
   local _copilot_token=""
   local _codex_proxy_token="${_openai_token:-}"
@@ -1977,7 +2070,7 @@ _agent_vm_shell() {
 
   # Build credential rules and start unified proxy (if any credentials configured)
   local _credential_rules
-  _credential_rules=$(_claude_vm_build_credential_rules "$_anthropic_token" "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token")
+  _credential_rules=$(_claude_vm_build_credential_rules "$_codex_proxy_token" "$_claude_vm_github_repos_json" "$_copilot_token" "$_host_claude_credentials_file")
   local _credential_proxy_port=""
   if [ "$_credential_rules" != "[]" ]; then
     _claude_vm_start_credential_proxy "$_credential_rules" || { _claude_vm_shell_cleanup; trap - EXIT INT TERM; return 1; }

@@ -583,11 +583,11 @@ class TestCredentialProxyStartup(unittest.TestCase):
 class TestBuildCredentialRules(unittest.TestCase):
     """Test the _claude_vm_build_credential_rules shell function."""
 
-    def _build_rules(self, anthropic_token, openai_token, repos_json):
+    def _build_rules(self, openai_token, repos_json, copilot_token="", host_creds=""):
         result = subprocess.run(
             ["bash", "-c",
              f'source claude-vm.sh 2>/dev/null && '
-             f"_claude_vm_build_credential_rules '{anthropic_token}' '{openai_token}' '{repos_json}'"],
+             f"_claude_vm_build_credential_rules '{openai_token}' '{repos_json}' '{copilot_token}' '{host_creds}'"],
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
@@ -596,21 +596,18 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_single_repo(self):
         """Single repo produces Anthropic/OpenAI/ChatGPT + per-repo rules + fallback."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", "", repos)
-        # 1 anthropic + 1 openai + 1 chatgpt + 2 per-repo
-        # + 2 fallback = 7
+        rules = self._build_rules("", repos)
+        # 1 anthropic + 1 openai + 1 chatgpt + 2 per-repo + 2 fallback = 7
         self.assertEqual(len(rules), 7)
-        # Per-repo rules have path_prefix
         repo_rules = [r for r in rules if r.get("path_prefix")]
         self.assertEqual(len(repo_rules), 2)
 
     def test_multi_repo(self):
         """Multiple repos produce per-repo rules with different tokens."""
         repos = json.dumps({"org1/repo1": "token1", "org2/repo2": "token2"})
-        rules = self._build_rules("", "", repos)
+        rules = self._build_rules("", repos)
         # 1 anthropic + 1 openai + 1 chatgpt + 2 repos * 2 rules each + 2 fallback = 9
         self.assertEqual(len(rules), 9)
-        # Check different path prefixes
         git_rules = [r for r in rules if r["domain"] == "github.com" and r.get("path_prefix")]
         prefixes = [r["path_prefix"] for r in git_rules]
         self.assertIn("/org1/repo1", prefixes)
@@ -619,7 +616,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_multi_repo_different_tokens(self):
         """Each repo gets its own token injected."""
         repos = json.dumps({"org1/repo1": "token_AAA", "org2/repo2": "token_BBB"})
-        rules = self._build_rules("", "", repos)
+        rules = self._build_rules("", repos)
         api_rules = {r["path_prefix"]: r for r in rules
                      if r["domain"] == "api.github.com" and r.get("path_prefix")}
         self.assertEqual(api_rules["/repos/org1/repo1"]["headers"]["Authorization"],
@@ -627,37 +624,9 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertEqual(api_rules["/repos/org2/repo2"]["headers"]["Authorization"],
                          "token token_BBB")
 
-    def test_both_tokens(self):
-        """Anthropic/OpenAI/GitHub tokens produce correct rules."""
-        repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("sk-ant-test", "sk-openai-test", repos)
-        # 1 anthropic + 1 openai + 1 chatgpt + 2 per-repo + 2 fallback = 7
-        self.assertEqual(len(rules), 7)
-        domains = [r["domain"] for r in rules]
-        self.assertIn("api.anthropic.com", domains)
-        self.assertIn("api.openai.com", domains)
-        self.assertIn("chatgpt.com", domains)
-        self.assertIn("github.com", domains)
-        self.assertIn("api.github.com", domains)
-
-    def test_anthropic_only(self):
-        """Anthropic-only auth still includes OpenAI and ChatGPT routing rules."""
-        rules = self._build_rules("sk-ant-test", "", "")
-        self.assertEqual(len(rules), 3)
-        self.assertEqual(rules[0]["domain"], "api.anthropic.com")
-        self.assertEqual(rules[0]["headers"]["Authorization"], "Bearer sk-ant-test")
-        self.assertNotIn("anthropic-beta", rules[0]["headers"])
-        self.assertTrue(rules[0]["use_proxy"])
-        self.assertEqual(rules[1]["domain"], "api.openai.com")
-        self.assertEqual(rules[1]["headers"], {})
-        self.assertTrue(rules[1]["use_proxy"])
-        self.assertEqual(rules[2]["domain"], "chatgpt.com")
-        self.assertEqual(rules[2]["headers"], {})
-        self.assertTrue(rules[2]["use_proxy"])
-
     def test_openai_only(self):
         """OpenAI-only auth produces OpenAI/ChatGPT bearer rules plus Anthropic routing."""
-        rules = self._build_rules("", "sk-openai-test", "")
+        rules = self._build_rules("sk-openai-test", "")
         self.assertEqual(len(rules), 3)
         self.assertEqual(rules[0]["domain"], "api.anthropic.com")
         self.assertEqual(rules[0]["headers"], {})
@@ -672,7 +641,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_github_basic_auth_encoding(self):
         """GitHub token is base64-encoded as Basic auth for git."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", "", repos)
+        rules = self._build_rules("", repos)
         github_rule = next(r for r in rules
                            if r["domain"] == "github.com" and r.get("path_prefix"))
         auth = github_rule["headers"]["Authorization"]
@@ -684,7 +653,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_github_api_token_auth(self):
         """api.github.com uses token auth."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", "", repos)
+        rules = self._build_rules("", repos)
         api_rule = next(r for r in rules
                         if r["domain"] == "api.github.com" and r.get("path_prefix"))
         self.assertEqual(api_rule["headers"]["Authorization"], "token ghu_test")
@@ -692,7 +661,7 @@ class TestBuildCredentialRules(unittest.TestCase):
     def test_fallback_rules(self):
         """Domain-level fallback rules have no path_prefix."""
         repos = json.dumps({"owner/repo": "ghu_test"})
-        rules = self._build_rules("", "", repos)
+        rules = self._build_rules("", repos)
         fallback = [r for r in rules if not r.get("path_prefix")]
         # 1 anthropic + 1 openai + 1 chatgpt + 2 github fallback = 5
         self.assertEqual(len(fallback), 5)
@@ -704,7 +673,7 @@ class TestBuildCredentialRules(unittest.TestCase):
 
     def test_no_tokens(self):
         """No tokens still produce Anthropic/OpenAI/ChatGPT rules for proxy routing."""
-        rules = self._build_rules("", "", "")
+        rules = self._build_rules("", "")
         self.assertEqual(len(rules), 3)
         self.assertEqual(rules[0]["domain"], "api.anthropic.com")
         self.assertEqual(rules[0]["headers"], {})
@@ -715,6 +684,21 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertEqual(rules[2]["domain"], "chatgpt.com")
         self.assertEqual(rules[2]["headers"], {})
         self.assertTrue(rules[2]["use_proxy"])
+
+    def test_host_claude_credentials_emits_auth_from_file_and_oauth_refresh(self):
+        """Host ~/.claude/.credentials.json → api.anthropic.com uses auth_from_file
+        and a platform.claude.com oauth_refresh rule is emitted."""
+        rules = self._build_rules("", "", host_creds="/fake/.claude/.credentials.json")
+        anthropic = next(r for r in rules if r["domain"] == "api.anthropic.com")
+        self.assertNotIn("Authorization", anthropic["headers"])
+        self.assertEqual(anthropic["auth_from_file"]["path"], "/fake/.claude/.credentials.json")
+        self.assertEqual(anthropic["auth_from_file"]["header"], "Authorization")
+        platform = next(r for r in rules if r["domain"] == "platform.claude.com")
+        self.assertEqual(platform["path_prefix"], "/v1/oauth/token")
+        refresh = platform["oauth_refresh"]
+        self.assertEqual(refresh["credentials_file"], "/fake/.claude/.credentials.json")
+        self.assertTrue(refresh["placeholder_access_token"].startswith("sk-ant-oat01-"))
+        self.assertTrue(refresh["placeholder_refresh_token"].startswith("sk-ant-ort01-"))
 
 
 class TestCodexHostAuthHelpers(unittest.TestCase):
@@ -926,6 +910,201 @@ class TestCredentialProxyPathMatching(unittest.TestCase):
         status, _, data = self._request("/user")
         echo = json.loads(data)
         self.assertEqual(echo["headers"]["Authorization"], "token fallback-token")
+
+
+class TestCredentialProxyHostClaudeCredentials(unittest.TestCase):
+    """Tests for auth_from_file and oauth_refresh — the host-Claude MITM flow."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream_server, cls.upstream_port = _start_mock_upstream(EchoHandler)
+        cls.tmpdir = os.path.realpath(os.path.join(os.getcwd(), "_tmp_host_creds_test"))
+        os.makedirs(cls.tmpdir, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.upstream_server.shutdown()
+        import shutil
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _creds_path(self):
+        path = os.path.join(self.tmpdir, f"creds-{os.urandom(4).hex()}.json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _write_creds(self, path, access="sk-ant-oat01-real", refresh="sk-ant-ort01-real",
+                     expires_at_ms=None):
+        if expires_at_ms is None:
+            expires_at_ms = int((__import__("time").time() + 3600) * 1000)
+        with open(path, "w") as f:
+            json.dump({
+                "claudeAiOauth": {
+                    "accessToken": access,
+                    "refreshToken": refresh,
+                    "expiresAt": expires_at_ms,
+                    "scopes": ["user:inference"],
+                    "subscriptionType": "max",
+                }
+            }, f)
+
+    def test_auth_from_file_injects_bearer(self):
+        """Authorization header is pulled from the host credentials file per request."""
+        creds = self._creds_path()
+        self._write_creds(creds, access="sk-ant-oat01-first")
+        rules = [{
+            "domain": "127.0.0.1",
+            "auth_from_file": {
+                "path": creds,
+                "json_path": "claudeAiOauth.accessToken",
+                "header": "Authorization",
+                "format": "Bearer {token}",
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "127.0.0.1",
+                "X-Original-Port": str(self.upstream_port),
+                "X-Original-Scheme": "http",
+            }
+            status, _, data = _proxy_request(port, "GET", "/", headers)
+            self.assertEqual(status, 200)
+            echo = json.loads(data)
+            self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-first")
+
+            # Rewrite the file — next request must pick up the new token.
+            self._write_creds(creds, access="sk-ant-oat01-rotated")
+            status, _, data = _proxy_request(port, "GET", "/", headers)
+            echo = json.loads(data)
+            self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-rotated")
+        finally:
+            _stop_proxy(proc)
+
+    def test_oauth_refresh_valid_token_short_circuits(self):
+        """When the host token is still valid, proxy returns placeholders without spawning."""
+        import time as _t
+        creds = self._creds_path()
+        future_ms = int((_t.time() + 1800) * 1000)
+        self._write_creds(creds, expires_at_ms=future_ms)
+        # A command that would fail loudly if it ran — proves we did NOT spawn it.
+        sentinel = os.path.join(self.tmpdir, f"did-refresh-{os.urandom(4).hex()}")
+        self.addCleanup(lambda: os.path.exists(sentinel) and os.unlink(sentinel))
+        refresh_cmd = ["sh", "-c", f"touch {sentinel}; exit 0"]
+        rules = [{
+            "domain": "platform.claude.com",
+            "path_prefix": "/v1/oauth/token",
+            "oauth_refresh": {
+                "credentials_file": creds,
+                "refresh_command": refresh_cmd,
+                "placeholder_access_token": "PLACEHOLDER_ACCESS",
+                "placeholder_refresh_token": "PLACEHOLDER_REFRESH",
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "platform.claude.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/json",
+            }
+            body = json.dumps({
+                "grant_type": "refresh_token",
+                "refresh_token": "sk-ant-ort01-placeholder-proxy-managed",
+            }).encode()
+            status, _, data = _proxy_request(port, "POST", "/v1/oauth/token", headers, body)
+            self.assertEqual(status, 200)
+            payload = json.loads(data)
+            self.assertEqual(payload["access_token"], "PLACEHOLDER_ACCESS")
+            self.assertEqual(payload["refresh_token"], "PLACEHOLDER_REFRESH")
+            self.assertGreater(payload["expires_in"], 60)
+            self.assertFalse(os.path.exists(sentinel),
+                             "refresh command ran even though host token was valid")
+        finally:
+            _stop_proxy(proc)
+
+    def test_oauth_refresh_expired_token_spawns_refresh(self):
+        """When the host token is expired, proxy spawns refresh_command and re-reads file."""
+        import time as _t
+        creds = self._creds_path()
+        expired_ms = int((_t.time() - 60) * 1000)
+        self._write_creds(creds, access="old", refresh="old-refresh", expires_at_ms=expired_ms)
+
+        # A stub refresh command that "rotates" the file the way host Claude would.
+        stub = os.path.join(self.tmpdir, f"refresh-stub-{os.urandom(4).hex()}.py")
+        with open(stub, "w") as f:
+            f.write(
+                "import json, sys, time\n"
+                f"path = {creds!r}\n"
+                "with open(path) as g: data = json.load(g)\n"
+                "data['claudeAiOauth']['accessToken'] = 'sk-ant-oat01-new'\n"
+                "data['claudeAiOauth']['refreshToken'] = 'sk-ant-ort01-new'\n"
+                "data['claudeAiOauth']['expiresAt'] = int((time.time() + 3600) * 1000)\n"
+                "open(path, 'w').write(json.dumps(data))\n"
+            )
+        self.addCleanup(lambda: os.path.exists(stub) and os.unlink(stub))
+        rules = [{
+            "domain": "platform.claude.com",
+            "path_prefix": "/v1/oauth/token",
+            "oauth_refresh": {
+                "credentials_file": creds,
+                "refresh_command": [sys.executable, stub],
+                "placeholder_access_token": "PLACEHOLDER_ACCESS",
+                "placeholder_refresh_token": "PLACEHOLDER_REFRESH",
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "platform.claude.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/json",
+            }
+            body = json.dumps({"grant_type": "refresh_token",
+                               "refresh_token": "placeholder"}).encode()
+            status, _, data = _proxy_request(port, "POST", "/v1/oauth/token", headers, body)
+            self.assertEqual(status, 200)
+            payload = json.loads(data)
+            self.assertEqual(payload["access_token"], "PLACEHOLDER_ACCESS")
+            self.assertGreater(payload["expires_in"], 60)
+            # Host file must have been rewritten by the stub — proxy never writes it.
+            with open(creds) as f:
+                new = json.load(f)
+            self.assertEqual(new["claudeAiOauth"]["accessToken"], "sk-ant-oat01-new")
+            self.assertEqual(new["claudeAiOauth"]["refreshToken"], "sk-ant-ort01-new")
+        finally:
+            _stop_proxy(proc)
+
+    def test_oauth_refresh_command_failure_returns_502(self):
+        """If refresh_command fails to update the file, VM sees an upstream error."""
+        import time as _t
+        creds = self._creds_path()
+        self._write_creds(creds, expires_at_ms=int((_t.time() - 60) * 1000))
+        rules = [{
+            "domain": "platform.claude.com",
+            "path_prefix": "/v1/oauth/token",
+            "oauth_refresh": {
+                "credentials_file": creds,
+                "refresh_command": ["sh", "-c", "exit 1"],
+                "placeholder_access_token": "PA",
+                "placeholder_refresh_token": "PR",
+                "refresh_timeout": 5,
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "platform.claude.com",
+                "X-Original-Port": "443",
+                "X-Original-Scheme": "https",
+                "Content-Type": "application/json",
+            }
+            body = json.dumps({"grant_type": "refresh_token", "refresh_token": "x"}).encode()
+            status, _, _ = _proxy_request(port, "POST", "/v1/oauth/token", headers, body)
+            self.assertEqual(status, 502)
+        finally:
+            _stop_proxy(proc)
 
 
 class TestMitmproxyAddon(unittest.TestCase):
