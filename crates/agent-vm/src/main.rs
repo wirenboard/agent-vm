@@ -3,6 +3,7 @@
 mod image_check;
 mod pull;
 mod pull_progress;
+mod pulled_marker;
 mod run;
 mod session;
 mod setup;

@@ -13,7 +13,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use microsandbox::Image;
 
 /// What we learned about the image relative to the registry.
 pub enum UpdateState {
@@ -31,16 +30,13 @@ pub enum UpdateState {
     },
 }
 
-/// Compare the local image cache against the registry. Returns `Ok(None)`
-/// when we can't decide (registry unreachable, malformed reference, etc.).
+/// Compare the marker for the last successful pull against the registry.
+/// Returns `Ok(None)` when we can't decide (registry unreachable,
+/// malformed reference, etc.).
 pub async fn check_for_update(image_ref: &str) -> Result<Option<UpdateState>> {
-    let cached = cached_manifest_digest(image_ref).await;
-    let Some(parsed) = ParsedRef::parse(image_ref) else {
+    let cached = crate::pulled_marker::read(image_ref);
+    let Some(remote) = fetch_remote_digest(image_ref).await else {
         return Ok(None);
-    };
-    let remote = match remote_manifest_digest(&parsed).await {
-        Ok(Some(d)) => d,
-        Ok(None) | Err(_) => return Ok(None),
     };
     let state = match cached {
         None => UpdateState::NotCached,
@@ -53,9 +49,11 @@ pub async fn check_for_update(image_ref: &str) -> Result<Option<UpdateState>> {
     Ok(Some(state))
 }
 
-async fn cached_manifest_digest(image_ref: &str) -> Option<String> {
-    let handle = Image::get(image_ref).await.ok()?;
-    handle.manifest_digest().map(|s| s.to_string())
+/// Best-effort fetch of the per-platform manifest digest. Returns None
+/// on any failure so callers can decide what to do with the silence.
+pub async fn fetch_remote_digest(image_ref: &str) -> Option<String> {
+    let parsed = ParsedRef::parse(image_ref)?;
+    remote_manifest_digest(&parsed).await.ok().flatten()
 }
 
 async fn remote_manifest_digest(parsed: &ParsedRef) -> Result<Option<String>> {
