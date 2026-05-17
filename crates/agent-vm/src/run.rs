@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
@@ -87,6 +87,14 @@ impl Agent {
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Sandbox memory in GiB.
+    #[arg(long, env = "AGENT_VM_MEMORY_GIB", default_value_t = 2)]
+    memory: u32,
+
+    /// vCPU count for the sandbox.
+    #[arg(long, env = "AGENT_VM_CPUS", default_value_t = 2)]
+    cpus: u8,
+
     /// Args forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -106,11 +114,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
 
     let image = env::var("AGENT_VM_IMAGE_TAG")
         .unwrap_or_else(|_| "localhost:5000/agent-vm:latest".to_string());
-    let memory_mib: u32 = parse_env_u32("AGENT_VM_MEMORY_MIB", 2048)?;
-    let cpus_u32: u32 = parse_env_u32("AGENT_VM_CPUS", 2)?;
-    let cpus: u8 = cpus_u32
-        .try_into()
-        .with_context(|| format!("AGENT_VM_CPUS={cpus_u32} exceeds u8::MAX"))?;
+    let memory_mib: u32 = args
+        .memory
+        .checked_mul(1024)
+        .context("--memory in GiB overflows u32 MiB")?;
+    let cpus = args.cpus;
 
     // Mount the host project at the *same* absolute path inside the guest so
     // that anything the agent emits (compiler errors, stack traces, git
@@ -365,17 +373,3 @@ async fn notify_if_update_available(image: &str) {
     }
 }
 
-fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
-    match env::var(name) {
-        Ok(s) => s
-            .parse()
-            .with_context(|| format!("{name} must be a positive integer, got {s:?}")),
-        Err(_) => Ok(default),
-    }
-    .and_then(|v| {
-        if v == 0 {
-            bail!("{name} must be > 0");
-        }
-        Ok(v)
-    })
-}
