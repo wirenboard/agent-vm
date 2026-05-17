@@ -33,6 +33,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     run_build_script()?;
 
+    // We just pushed a new manifest under the same tag; explicitly pull
+    // it into microsandbox's cache so subsequent launches (which use
+    // PullPolicy::IfMissing) see the latest layers without having to
+    // re-pull at first-use time.
+    println!("==> Pulling the freshly pushed image into the microsandbox cache");
+    crate::pull::pull_image(&image).await?;
+
     if !args.no_verify {
         verify_image(&image).await?;
     }
@@ -67,14 +74,12 @@ fn build_script_path() -> Result<PathBuf> {
 async fn verify_image(image: &str) -> Result<()> {
     println!("==> Verifying {image}");
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
-    // Pull policy: Always — we just rebuilt + pushed under the same tag,
-    // so the cached manifest is by definition stale. Without this the
-    // verify step boots the *previous* image and quietly attests that an
-    // old version still works.
+    // The pull step above already pulled the new manifest, so IfMissing
+    // is fine here.
     let config = Sandbox::builder("agent-vm-setup-verify")
         .image(image)
         .registry(|r| r.insecure())
-        .pull_policy(PullPolicy::Always)
+        .pull_policy(PullPolicy::IfMissing)
         .cpus(1)
         .memory(512)
         .replace()

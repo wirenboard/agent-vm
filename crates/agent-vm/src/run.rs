@@ -132,16 +132,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "/workspace".to_string()
     };
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
-    // PullPolicy::Always: microsandbox's default IfMissing keys its layer
-    // cache by reference, so re-running `agent-vm setup` (which rebuilds
-    // and re-pushes to the same :latest tag) would otherwise boot from the
-    // stale cached manifest. Always re-checks the manifest at the
-    // registry; cached layers whose digests still match are reused, so
-    // the cost is one round-trip + a few bytes when nothing changed.
+    // PullPolicy::IfMissing keeps the slow part (pull + materialize) off
+    // every launch. We separately HEAD the manifest at the registry via
+    // image_check::check_for_update and print a banner if there's a newer
+    // image available — the user runs `agent-vm pull` explicitly to
+    // fetch it.
+    notify_if_update_available(image.as_str()).await;
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
         .registry(|r| r.insecure())
-        .pull_policy(PullPolicy::Always)
+        .pull_policy(PullPolicy::IfMissing)
         .cpus(cpus)
         .memory(memory_mib)
         .workdir(project_guest_path.clone())
@@ -244,6 +244,23 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     Ok(exit)
+}
+
+async fn notify_if_update_available(image: &str) {
+    use crate::image_check::{UpdateState, check_for_update};
+    match check_for_update(image).await {
+        Ok(Some(UpdateState::UpdateAvailable { cached, remote })) => {
+            eprintln!(
+                "==> A newer image is available in the registry (cached {cached}, registry {remote})"
+            );
+            eprintln!(
+                "==> Run `agent-vm pull` to fetch it. Continuing with the cached image."
+            );
+        }
+        // UpToDate / NotCached: nothing to say.
+        // None / Err: registry unreachable etc. — stay quiet.
+        _ => {}
+    }
 }
 
 fn parse_env_u32(name: &str, default: u32) -> Result<u32> {

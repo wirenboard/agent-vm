@@ -1,5 +1,7 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod image_check;
+mod pull;
 mod pull_progress;
 mod run;
 mod session;
@@ -20,16 +22,19 @@ enum Cmd {
     /// Build (and verify) the agent-vm base image.
     Setup(setup::Args),
 
-    /// Launch Claude Code in a sandbox mounted at /workspace.
+    /// Pull the latest image from the registry into the microsandbox cache.
+    Pull(pull::Args),
+
+    /// Launch Claude Code in a sandbox mounted at the project's host path.
     Claude(run::Args),
 
-    /// Launch Codex CLI in a sandbox mounted at /workspace.
+    /// Launch Codex CLI in a sandbox mounted at the project's host path.
     Codex(run::Args),
 
-    /// Launch OpenCode in a sandbox mounted at /workspace.
+    /// Launch OpenCode in a sandbox mounted at the project's host path.
     Opencode(run::Args),
 
-    /// Open a bash shell in a sandbox mounted at /workspace.
+    /// Open a bash shell in a sandbox mounted at the project's host path.
     Shell(run::Args),
 }
 
@@ -39,6 +44,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Setup(args) => setup::run(args).await,
+        Cmd::Pull(args) => pull::run(args).await,
         Cmd::Claude(args) => exit_with(run::launch(run::Agent::Claude, args).await?),
         Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
         Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
