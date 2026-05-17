@@ -1,5 +1,0 @@
-#!/bin/bash
-# Wrapper for ccusage that includes all agent-vm session directories
-agent_vm_dirs=$(find "$HOME/.local/state/agent-vm" -maxdepth 2 -name "claude-sessions" -type d 2>/dev/null | paste -sd,)
-export CLAUDE_CONFIG_DIR="$HOME/.claude,$HOME/.config/claude${agent_vm_dirs:+,$agent_vm_dirs}"
-exec npx ccusage@latest "$@"

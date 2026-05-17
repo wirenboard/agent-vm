@@ -1,3 +1,8 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
 .DS_Store
+
+# Project-local agent hook (carries over from the original agent-vm layout).
 .claude-vm.runtime.sh
-github-git-proxy.log
+.agent-vm.runtime.sh

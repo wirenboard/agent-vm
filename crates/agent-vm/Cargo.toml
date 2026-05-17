@@ -1,0 +1,15 @@
+[package]
+name = "agent-vm"
+description = "Sandboxed VMs for AI coding agents, built on microsandbox."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agent-vm"
+path = "src/main.rs"
+
+[dependencies]
+microsandbox = { path = "../../vendor/microsandbox/crates/microsandbox" }
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
