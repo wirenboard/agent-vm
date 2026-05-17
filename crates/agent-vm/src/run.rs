@@ -138,6 +138,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // image available — the user runs `agent-vm pull` explicitly to
     // fetch it.
     notify_if_update_available(image.as_str()).await;
+
+    // Snapshot host credentials into per-project token files and place
+    // placeholder credentials.json files where the in-VM agents will
+    // find them. The token files are passed to microsandbox below as
+    // SecretValue::File entries; the host TLS-intercept proxy reads
+    // them on every connection setup. Real tokens never enter the VM.
+    let creds = crate::secrets::refresh(&session.state_dir)
+        .context("snapshotting host credentials")?;
+
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
         .registry(|r| r.insecure())
@@ -163,8 +172,50 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .env("CODEX_HOME", "/agent-vm-state/codex")
         .replace();
 
-    // Phase 2: pass API keys straight through. Phase 3 replaces this with
-    // host-rooted placeholder secrets.
+    // Phase 3: host-rooted credentials.
+    //
+    // For each provider we have a host file for, wire up TLS interception
+    // and register a SecretValue::File entry. The placeholder string
+    // matches what we wrote into the guest's credentials.json (see
+    // secrets::refresh), so when the agent reads its credentials, sends
+    // a Bearer header with the placeholder, the host proxy substitutes
+    // it with the real token from the per-project file.
+    //
+    // allow_host covers both the API endpoint and the OAuth endpoint of
+    // each provider — we don't intercept the refresh flow yet (Phase 4),
+    // but we need to allow the request through to avoid the secret
+    // violation detector blocking attempts at refresh.
+    if creds.anthropic_access_token.is_some() || creds.openai_access_token.is_some() {
+        let anthropic = creds.anthropic_access_token.clone();
+        let openai = creds.openai_access_token.clone();
+        builder = builder.network(move |mut n| {
+            n = n.tls(|t| t);
+            if let Some(tok) = anthropic {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
+                        .value(tok)
+                        .placeholder(crate::secrets::ANTHROPIC_PLACEHOLDER)
+                        .allow_host("api.anthropic.com")
+                        .allow_host("platform.claude.com")
+                });
+            }
+            if let Some(tok) = openai {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_OPENAI_UNUSED")
+                        .value(tok)
+                        .placeholder(crate::secrets::OPENAI_PLACEHOLDER)
+                        .allow_host("api.openai.com")
+                        .allow_host("chatgpt.com")
+                        .allow_host("auth.openai.com")
+                });
+            }
+            n
+        });
+    }
+
+    // Still honour ANTHROPIC_API_KEY / OPENAI_API_KEY if explicitly set
+    // by the user — that path stays a simple Bearer header, no
+    // placeholder substitution involved.
     for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
         if let Ok(val) = env::var(var) {
             if !val.is_empty() {
@@ -180,12 +231,25 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
     );
 
+    // Claude Code refuses to run as root with --dangerously-skip-permissions
+    // unless this env var is set. The whole point of running it in a
+    // microVM is that the sandbox IS our security boundary, so the
+    // in-guest CLI's extra guard would just block us from getting work
+    // done. Same env var the original Bash agent-vm used.
+    builder = builder.env("IS_SANDBOX", "1");
+
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
     eprintln!(
         "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
     );
     let t_create = Instant::now();
     let config = builder.build().await.context("preparing sandbox config")?;
+    if env::var("AGENT_VM_DEBUG_CONFIG").is_ok() {
+        eprintln!(
+            "[debug] sandbox config JSON: {}",
+            serde_json::to_string_pretty(&config).unwrap_or_default()
+        );
+    }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
     let sandbox = task

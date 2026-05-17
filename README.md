@@ -24,8 +24,12 @@ until v1 of the rewrite ships.
 - Phase 2.x (RUST_LOG, host-path mounting, pull progress bar,
   `agent-vm pull` + update-available banner, registry auto-recovery):
   done.
-- Phase 3 (host-rooted secrets via microsandbox TLS intercept): **next**.
-- Phase 4 (token-refresh semantics): pending.
+- Phase 3 (host-rooted secrets via microsandbox TLS intercept): done.
+  Real Claude/Codex tokens stay on the host; the in-VM agent only sees
+  placeholders. See ARCHITECTURE.md "Phase 3" for the two-layer
+  placeholder dance.
+- Phase 4 (token-refresh semantics + `msb` rebuild for
+  `SecretValue::File`): **next**.
 - Phase 5 (fast-launch via detached mode): deferred — see PLAN.md;
   snapshots don't help launch time, detached mode is a product-shape
   decision.

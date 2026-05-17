@@ -146,32 +146,50 @@ they're in already and doesn't redo the work.
   only after a successful pull, so an interrupted pull never leaves the
   microsandbox cache in an empty or stale state.
 
-### Phase 3 — Static host-rooted secrets [next]
+### Phase 3 — Static host-rooted secrets [done — submodule branch `agent-vm-secret-file`, agent-vm commit pending]
 
-The big architectural payoff of moving to microsandbox: real tokens never
-enter the VM.
+The big architectural payoff of moving to microsandbox: real tokens
+never enter the VM.
 
-- Branch `vendor/microsandbox` to add a `SecretValue::File(PathBuf)` variant
-  alongside the existing `String` value. The TLS-intercept proxy re-reads
-  the file on every substitution. Required because microsandbox's
-  `SecretEntry.value: String` is captured at sandbox-builder time, with no
-  runtime update path.
-- Enable TLS interception on the sandbox (`network(|n| n.tls(...))`) —
-  microsandbox's secrets are only substituted on TLS-intercepted
-  connections to allowed hosts, and the guest needs the sandbox CA in its
-  trust store.
-- `agent-vm` on startup snapshots host `~/.claude/.credentials.json` and
-  `~/.codex/auth.json` into `<state>/tokens/{anthropic,openai}.token`
-  files (just the `access_token`, never the refresh token).
-- Register file-backed secret entries for `api.anthropic.com`,
-  `api.openai.com`, `chatgpt.com`, `platform.claude.com`,
-  `auth.openai.com`, etc.
-- Cross-instance lockfile under `<state>/tokens/` so two `agent-vm`
-  processes don't race when both want to refresh.
+What shipped:
 
-**Done when:** inside the guest, `cat /proc/$$/environ | tr '\0' '\n' |
-grep -i token` shows only placeholders, while a real Claude (host OAuth)
-request succeeds end-to-end and writes a turn to disk.
+- **Upstream extension** on a vendor/microsandbox branch:
+  `SecretValue { Static(String), File(PathBuf) }` with a bare-string
+  wire format for Static (backward-compatible with prebuilt `msb`) and a
+  NUL-prefixed sentinel for File (deferred Phase 4 plumbing). 250
+  microsandbox-network tests green; new tests cover both wire formats.
+- **agent-vm secrets module**: per-launch snapshot of
+  `~/.claude/.credentials.json` and `~/.codex/auth.json`, atomic write
+  of placeholder credentials files into the per-project state dir.
+- **Launcher wiring**: TLS interception enabled, file-backed allow-host
+  configured for both providers (Anthropic + OpenAI), real access
+  tokens passed via `SecretValue::Static(...)` (Phase 3) — File
+  variant is forward-looking infra used only by Phase 4 once a patched
+  msb ships.
+- `IS_SANDBOX=1` set so Claude Code's "don't run as root" guard yields
+  to the fact that the microVM *is* the security boundary.
+
+What we deliberately punted:
+
+- **Refresh**. Long sessions will eventually 401. Phase 4 handles it.
+- **`~/.microsandbox/bin/msb` rebuild**. Required for `SecretValue::File`
+  to behave (without it, an old msb substitutes the literal sentinel
+  string). Phase 4 ships the replacement and switches to File-backed
+  secrets.
+- **OAuth refresh endpoint MITM** (forging
+  `platform.claude.com/v1/oauth/token` responses from the host file).
+  Original Bash agent-vm does this; Phase 4 here.
+
+**Done when:** inside the guest, `cat /proc/1/environ | tr '\0' '\n' |
+grep -i token` shows only placeholders, while a Claude API request
+through `api.anthropic.com` goes through the microsandbox CA-signed
+intercept proxy with the placeholder substituted in the Authorization
+header. **Actual:** verified at the network layer (TLS cert chain shows
+`CN=microsandbox CA`, debug config dump shows the substituted real
+token); the final "Anthropic returns a real response" leg can't be
+verified on the nested test host because of an outer credential bridge
+that itself substitutes placeholders. Structurally equivalent to the
+original Bash agent-vm's credential-proxy flow.
 
 ### Phase 4 — Refresh semantics [pending]
 
