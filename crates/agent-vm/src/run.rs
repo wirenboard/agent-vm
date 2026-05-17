@@ -201,7 +201,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let agent_args = args.agent_args;
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
-        eprintln!("==> Attaching to {cmd} (Ctrl-P Ctrl-Q to detach)");
+        eprintln!("==> Attaching to {cmd}");
         sandbox
             .attach(cmd, agent_args)
             .await
