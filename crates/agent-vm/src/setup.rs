@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
-use microsandbox::Sandbox;
+use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -67,9 +67,14 @@ fn build_script_path() -> Result<PathBuf> {
 async fn verify_image(image: &str) -> Result<()> {
     println!("==> Verifying {image}");
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
+    // Pull policy: Always — we just rebuilt + pushed under the same tag,
+    // so the cached manifest is by definition stale. Without this the
+    // verify step boots the *previous* image and quietly attests that an
+    // old version still works.
     let sandbox = Sandbox::builder("agent-vm-setup-verify")
         .image(image)
         .registry(|r| r.insecure())
+        .pull_policy(PullPolicy::Always)
         .cpus(1)
         .memory(512)
         .replace()
