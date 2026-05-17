@@ -68,6 +68,11 @@ pub fn openai_token_path(state_dir: &Path) -> PathBuf {
 pub fn refresh(state_dir: &Path) -> Result<CredsState> {
     std::fs::create_dir_all(state_dir.join("tokens"))?;
 
+    // First-run bypasses, run regardless of whether the user has host
+    // credentials for the provider. Without these the in-VM agent
+    // blocks on a terminal-style wizard at first launch.
+    write_agent_config_defaults(state_dir)?;
+
     let anthropic_token_file = refresh_anthropic(state_dir).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
         None
@@ -81,6 +86,28 @@ pub fn refresh(state_dir: &Path) -> Result<CredsState> {
         anthropic_token_file,
         openai_token_file,
     })
+}
+
+/// Drop the per-agent bypass files (Claude's onboarding flags + Codex's
+/// trust/approval settings) into the per-project state dir. Idempotent
+/// across launches; merges instead of overwrites so user tweaks
+/// survive.
+fn write_agent_config_defaults(state_dir: &Path) -> Result<()> {
+    let claude_dir = state_dir.join("claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    write_default_claude_settings(&claude_dir.join("settings.json"))?;
+    // ~/.claude.json is the per-user onboarding-state file Claude
+    // Code checks for the "first launch" theme picker. It sits at
+    // $HOME root (not inside .claude/), so the symlinked state dir
+    // doesn't catch it — we instead persist it in our state dir and
+    // run.rs symlinks /root/.claude.json → /agent-vm-state/claude.json.
+    write_default_claude_root_state(&state_dir.join("claude.json"))?;
+
+    let codex_dir = state_dir.join("codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    write_default_codex_config(&codex_dir.join("config.toml"))?;
+
+    Ok(())
 }
 
 fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
@@ -125,6 +152,28 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     )?;
 
     Ok(Some(token_file))
+}
+
+fn write_default_claude_settings(path: &Path) -> Result<()> {
+    // Read what's there (if anything), force-set the onboarding-bypass
+    // fields, write back. Merging instead of overwriting means a user
+    // who tweaked some other setting inside the sandbox keeps their
+    // change; force-setting `hasCompletedOnboarding` covers the case
+    // where Claude wrote a partial settings.json mid-wizard.
+    let mut settings: Value = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = settings.as_object_mut().context("settings.json is not an object")?;
+    obj.entry("theme".to_string())
+        .or_insert(Value::String("dark".into()));
+    obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
+    obj.insert("skipDangerousModePermissionPrompt".into(), Value::Bool(true));
+    obj.entry("effortLevel".to_string())
+        .or_insert(Value::String("xhigh".into()));
+    atomic_write(path, serde_json::to_vec(&settings)?.as_slice(), 0o644)?;
+    Ok(())
 }
 
 fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
@@ -180,4 +229,37 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
     )?;
 
     Ok(Some(token_file))
+}
+
+fn write_default_claude_root_state(path: &Path) -> Result<()> {
+    // Merge-on-existing to preserve user-side updates (project entries
+    // etc.) but force-set the onboarding flag every launch.
+    let mut state: Value = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = state.as_object_mut().context("~/.claude.json is not an object")?;
+    obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
+    obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
+    atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
+    Ok(())
+}
+
+fn write_default_codex_config(path: &Path) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut f = match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o644)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let body = "sandbox_mode = \"danger-full-access\"\n\
+                approval_policy = \"never\"\n";
+    f.write_all(body.as_bytes())?;
+    Ok(())
 }

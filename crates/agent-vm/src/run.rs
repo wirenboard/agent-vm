@@ -164,6 +164,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             p.mkdir("/root/.local", None)
                 .mkdir("/root/.local/share", None)
                 .symlink("/agent-vm-state/claude", "/root/.claude", true)
+                // Onboarding-state file lives at $HOME root, not in
+                // .claude/. Without persistence the in-VM Claude
+                // re-runs the theme picker every launch.
+                .symlink("/agent-vm-state/claude.json", "/root/.claude.json", true)
                 .symlink(
                     "/agent-vm-state/opencode",
                     "/root/.local/share/opencode",
