@@ -192,27 +192,39 @@ agent-vm to actually do the swap.
 **Done when:** a multi-hour session crosses a token rotation without the
 agent seeing an auth error and without manual intervention.
 
-### Phase 5 — Snapshot-based fast launch [pending — perf win]
+### Phase 5 — Fast-launch (deferred — wrong instrument for the job)
 
-Surfaced during Phase 2.x profiling and discussed with the user when they
-asked why `agent-vm pull` was so slow. Every `agent-vm shell` currently
-spends ~1.0 s booting the libkrun kernel + initing the guest agent;
-microsandbox has a snapshot/restore API that should drop that to ~100 ms
-*and* skip the EROFS materialize step on a re-pull.
+Originally framed around `Sandbox::from_snapshot(...)` on the assumption
+that microsandbox snapshots checkpoint VM memory (à la Firecracker's
+snapshot/restore). Confirmed reading
+`vendor/microsandbox/crates/microsandbox/lib/snapshot/mod.rs` that they
+do **not**: a snapshot captures the stopped sandbox's writable upper
+filesystem layer plus the metadata that pins the immutable lower
+(image). Booting `from_snapshot` still goes through the full libkrun
+kernel boot (~1.0 s) — the snapshot only saves the EROFS materialize
+step on a re-pull, which we already pay only on explicit `agent-vm pull`
+(rare). So filesystem snapshots are the wrong instrument for cutting
+launch time.
 
-- One-shot snapshot generation: `agent-vm setup` (or a new `agent-vm
-  snapshot`) boots the image once, lets it reach a quiet steady state,
-  takes a snapshot, and stashes it under `<microsandbox-home>/snapshots/`.
-- Launcher: if a snapshot exists, use `Sandbox::builder(...).from_snapshot
-  (snapshot_path)` instead of `.image(...)`. Falls back to cold boot if
-  the snapshot is missing or wrong-digest.
-- Re-snapshot whenever `agent-vm pull` lands a new manifest (snapshots are
-  pinned to a specific image digest by microsandbox).
-- Bake the per-agent symlinks + state mount point into the snapshot so
-  the launcher doesn't need to re-apply patches each invocation.
+The real lever for fast launches is **detached mode**: boot a sandbox
+once per project, leave it running, attach for each subsequent
+`agent-vm <agent>` invocation. Microsandbox exposes
+`create_detached`, `start_detached`, and `Sandbox::get(name)` already.
+Round-trip drops from ~1.5 s to ~10–50 ms but pulls in:
 
-**Done when:** `time agent-vm shell -- -c true` is well under 500 ms in
-the steady state.
+- New lifecycle subcommands (`agent-vm ps`, `agent-vm stop`,
+  `agent-vm restart`).
+- A reuse strategy for per-project sandbox names (we already have
+  `agent-vm-<hash>`; just need `.replace()` to flip to "attach if
+  exists, create-detached otherwise").
+- Idle-timeout cleanup so abandoned sandboxes don't squat memory.
+- A policy decision: does state inside the VM (`/tmp`, `/var/log`)
+  persist between agent invocations? Today every launch is a fresh
+  VM, so this is a behaviour change.
+
+Deferred pending a clear product call. The architectural payoff of
+microsandbox is keeping tokens out of the VM (Phase 3), and current
+1.5 s launch is acceptable.
 
 ### Phase 6 — Distribution + polish + docs [pending]
 

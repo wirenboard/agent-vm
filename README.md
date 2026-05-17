@@ -26,7 +26,9 @@ until v1 of the rewrite ships.
   done.
 - Phase 3 (host-rooted secrets via microsandbox TLS intercept): **next**.
 - Phase 4 (token-refresh semantics): pending.
-- Phase 5 (snapshot-based fast launch): pending.
+- Phase 5 (fast-launch via detached mode): deferred — see PLAN.md;
+  snapshots don't help launch time, detached mode is a product-shape
+  decision.
 - Phase 6 (distribution + polish + docs): pending.
 
 ## Building
