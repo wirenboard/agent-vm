@@ -9,6 +9,7 @@ use std::{
     env,
     io::IsTerminal as _,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -172,16 +173,22 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
     );
 
+    let profile = env::var("AGENT_VM_PROFILE").is_ok();
     eprintln!(
         "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
     );
+    let t_create = Instant::now();
     let sandbox = builder
         .create()
         .await
         .context("creating sandbox")?;
+    if profile {
+        eprintln!("[profile] create: {:?}", t_create.elapsed());
+    }
 
     let cmd = agent.command();
     let agent_args = args.agent_args;
+    let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
         eprintln!("==> Attaching to {cmd} (Ctrl-P Ctrl-Q to detach)");
         sandbox
@@ -209,9 +216,21 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         output.status().code
     };
 
+    if profile {
+        eprintln!("[profile] run:    {:?}", t_run.elapsed());
+    }
+
     eprintln!("==> Stopping sandbox");
+    let t_stop = Instant::now();
     sandbox.stop_and_wait().await.ok();
+    if profile {
+        eprintln!("[profile] stop:   {:?}", t_stop.elapsed());
+    }
+    let t_remove = Instant::now();
     Sandbox::remove(&session.sandbox_name).await.ok();
+    if profile {
+        eprintln!("[profile] remove: {:?}", t_remove.elapsed());
+    }
 
     Ok(exit)
 }
