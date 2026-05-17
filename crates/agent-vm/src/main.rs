@@ -1,5 +1,6 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod pull_progress;
 mod run;
 mod session;
 mod setup;

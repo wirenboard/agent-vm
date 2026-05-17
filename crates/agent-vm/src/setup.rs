@@ -71,16 +71,23 @@ async fn verify_image(image: &str) -> Result<()> {
     // so the cached manifest is by definition stale. Without this the
     // verify step boots the *previous* image and quietly attests that an
     // old version still works.
-    let sandbox = Sandbox::builder("agent-vm-setup-verify")
+    let config = Sandbox::builder("agent-vm-setup-verify")
         .image(image)
         .registry(|r| r.insecure())
         .pull_policy(PullPolicy::Always)
         .cpus(1)
         .memory(512)
         .replace()
-        .create()
+        .build()
         .await
+        .context("preparing verify config")?;
+    let (progress, task) = Sandbox::create_with_pull_progress(config);
+    let render_task = tokio::spawn(crate::pull_progress::render(progress));
+    let sandbox = task
+        .await
+        .context("create-with-pull-progress join")?
         .context("booting verify sandbox")?;
+    render_task.await.ok();
 
     println!("==> Running claude/opencode/codex --version inside the sandbox");
     let out = sandbox

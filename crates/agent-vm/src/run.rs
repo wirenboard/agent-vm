@@ -185,10 +185,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
     );
     let t_create = Instant::now();
-    let sandbox = builder
-        .create()
+    let config = builder.build().await.context("preparing sandbox config")?;
+    let (progress, task) = Sandbox::create_with_pull_progress(config);
+    let render_task = tokio::spawn(crate::pull_progress::render(progress));
+    let sandbox = task
         .await
+        .context("create-with-pull-progress join")?
         .context("creating sandbox")?;
+    render_task.await.ok();
     if profile {
         eprintln!("[profile] create: {:?}", t_create.elapsed());
     }
