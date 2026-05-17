@@ -234,7 +234,7 @@ The VM only ever sees placeholder tokens. Real credentials live in the host proc
 When your host has `~/.claude/.credentials.json` (from a normal Claude Code login), agent-vm uses it as the single source of truth for Anthropic auth:
 
 - A placeholder `~/.claude/.credentials.json` is written inside the VM with the host's real `expiresAt` but fake access/refresh tokens.
-- The credential proxy reads the host file on every `api.anthropic.com` request and swaps in the real Bearer token.
+- The credential proxy reads the host file on every `api.anthropic.com` request and swaps in the real Bearer token — but only when the VM presented that placeholder bearer (or no `Authorization` at all). If Claude Code set the header itself with a different value — e.g. the remote-control bridge polling `/v1/environments/.../work/*` with its `environment_secret` (which carries `org:external_poll_sessions`, a scope the user OAuth token lacks) — that value is forwarded untouched.
 - When the VM's Claude Code decides to refresh (POST to `platform.claude.com/v1/oauth/token`), the proxy intercepts it:
   - If the host token is still valid, it short-circuits and returns placeholders with the real remaining lifetime.
   - Otherwise, it spawns `claude -p "say hi and exit" --model sonnet` on the host so host Claude performs the rotation and writes the new tokens to its own file. The proxy never writes the credentials file itself — host Claude remains the sole writer.

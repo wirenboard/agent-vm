@@ -251,6 +251,14 @@ placeholder-JWT с корректными claim'ами (`chatgpt_account_id`, `p
 подписанные литералом `.placeholder`. Codex внутри VM принимает их (подпись проверяется
 только сервером), но реальные JWT остаются только в файле хоста.
 
+**Инъекция только placeholder'а (`auth_from_file.overwrite_only`):** для `api.anthropic.com`
+прокси переписывает `Authorization` **только** если ВМ прислала тот placeholder-bearer,
+которым она была провижинена (или заголовок отсутствует). Если Claude Code сам выставил
+заголовок другим значением — например, remote-control bridge ходит в
+`/v1/environments/.../work/poll` с `environment_secret`, у которого есть scope
+`org:external_poll_sessions` (его нет у пользовательского OAuth-токена), — это значение
+проходит без изменений, иначе bridge получает 403 и завершается внутри ВМ.
+
 **Альтернатива:** Прокси сам делает HTTP-запрос к `platform.claude.com` /
 `auth.openai.com` и переписывает файл. Отвергнуто — усложняет инвариант "у файла один
 писатель" и дублирует код OAuth.

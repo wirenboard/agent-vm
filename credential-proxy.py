@@ -46,6 +46,11 @@ MAX_REQUEST_BODY = 32 * 1024 * 1024  # 32 MB
 UPSTREAM_TIMEOUT = 300  # seconds
 INBOUND_TIMEOUT = 60   # seconds
 WEBSOCKET_IDLE_TIMEOUT = 300  # seconds
+# Server-Sent Events long-polls (e.g. the Claude Code worker event channel)
+# are idle by design — applying UPSTREAM_TIMEOUT as a socket read timeout would
+# tear the channel down every few minutes. Use a much larger bound so a truly
+# dead connection still gets reaped, but normal idle periods don't trip it.
+EVENT_STREAM_IDLE_TIMEOUT = 3600  # seconds
 
 PROXY_SECRET = os.environ.get("CREDENTIAL_PROXY_SECRET", "")
 DEBUG = os.environ.get("CREDENTIAL_PROXY_DEBUG", "0") == "1"
@@ -286,15 +291,34 @@ def _build_upstream_headers(request_headers, original_host, rule):
 
         auth_src = rule.get("auth_from_file")
         if auth_src:
-            creds = _read_credentials_file(auth_src["path"])
-            token = _json_path_get(creds or {}, auth_src["json_path"])
-            if token:
-                header_name = auth_src["header"]
-                header_value = auth_src["format"].replace("{token}", token)
-                _set_header(header_name, header_value)
-                debug(f"  injected {header_name} from {auth_src['path']}: {redact(header_value)}")
+            header_name = auth_src["header"]
+            # The VM ships a fixed placeholder credential and we rewrite it on
+            # the wire. But some clients set this header themselves with a value
+            # we must not clobber — notably Claude Code's remote-control bridge,
+            # which authenticates /v1/environments/.../work/* with the
+            # environment_secret it got at registration (that secret carries
+            # org:external_poll_sessions; the user OAuth token does not). So if
+            # "overwrite_only" is configured, only replace the header when its
+            # inbound value is absent/empty or one of those known placeholders;
+            # otherwise pass the client's value through untouched. Without
+            # "overwrite_only" the header is always replaced (legacy behaviour).
+            overwrite_only = auth_src.get("overwrite_only")
+            current = next(
+                (headers[k] for k in headers if k.lower() == header_name.lower()),
+                None,
+            )
+            if overwrite_only is not None and current and current not in overwrite_only:
+                debug(f"  auth_from_file: kept client-set {header_name} "
+                      f"({redact(current)}) — not a proxy-managed placeholder")
             else:
-                debug(f"  auth_from_file missing token at {auth_src['json_path']} in {auth_src['path']}")
+                creds = _read_credentials_file(auth_src["path"])
+                token = _json_path_get(creds or {}, auth_src["json_path"])
+                if token:
+                    header_value = auth_src["format"].replace("{token}", token)
+                    _set_header(header_name, header_value)
+                    debug(f"  injected {header_name} from {auth_src['path']}: {redact(header_value)}")
+                else:
+                    debug(f"  auth_from_file missing token at {auth_src['json_path']} in {auth_src['path']}")
 
     if DEBUG:
         for key, value in headers.items():
@@ -530,17 +554,33 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_response(502, f"Failed to connect to {original_host}")
             return
 
-        # Detect streaming (chunked transfer)
+        # Detect streaming: chunked transfer-encoding, or a Server-Sent Events
+        # response (text/event-stream is a deliberately-idle long-poll, e.g. the
+        # Claude Code worker event channel that delivers web-typed prompts).
         is_streaming = False
+        is_event_stream = False
         upstream_headers = upstream.getheaders()
         for key, value in upstream_headers:
-            if key.lower() == "transfer-encoding":
+            lower_key = key.lower()
+            if lower_key == "transfer-encoding":
                 is_streaming = True
-                break
+            elif lower_key == "content-type" and "text/event-stream" in value.lower():
+                is_streaming = True
+                is_event_stream = True
 
-        debug(f"<<< {upstream.status} {'streaming' if is_streaming else 'complete'} ({latency_ms:.0f}ms)")
+        debug(f"<<< {upstream.status} {'event-stream' if is_event_stream else 'streaming' if is_streaming else 'complete'} ({latency_ms:.0f}ms)")
 
         if is_streaming:
+            # A streaming response (SSE long-poll, slow token stream, …) can sit
+            # idle far longer than UPSTREAM_TIMEOUT between bytes; that timeout
+            # is meant for connection setup, not for an open stream. Relax the
+            # upstream read timeout so we don't tear the stream — and the client,
+            # which then reconnects — down every few minutes.
+            if getattr(conn, "sock", None) is not None:
+                try:
+                    conn.sock.settimeout(EVENT_STREAM_IDLE_TIMEOUT)
+                except OSError:
+                    pass
             # Streaming: re-chunk the decoded body
             self.send_response(upstream.status)
             for key, value in upstream_headers:
@@ -556,7 +596,11 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             total_bytes = 0
             try:
                 while True:
-                    data = upstream.read(8192)
+                    # read1(): forward each batch of bytes as it arrives instead
+                    # of waiting for an 8 KiB buffer to fill — essential for
+                    # Server-Sent Events, which dribble small events with long
+                    # gaps in between.
+                    data = upstream.read1(8192)
                     if not data:
                         break
                     total_bytes += len(data)
@@ -570,6 +614,10 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
                 debug(f"  streamed {total_bytes} bytes ({elapsed_ms:.0f}ms total)")
             except (BrokenPipeError, ConnectionResetError) as e:
                 debug(f"  stream broken: {e} after {total_bytes} bytes")
+            except OSError as e:
+                # socket.timeout (TimeoutError) and other socket errors land
+                # here; headers are already sent, so just log and close.
+                debug(f"  stream interrupted: {type(e).__name__}: {e} after {total_bytes} bytes")
             finally:
                 conn.close()
         else:

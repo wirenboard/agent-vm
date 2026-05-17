@@ -56,3 +56,14 @@ def request(flow: http.HTTPFlow) -> None:
     flow.request.scheme = "http"
     flow.request.host = PROXY_HOST
     flow.request.port = PROXY_PORT
+
+
+def responseheaders(flow: http.HTTPFlow) -> None:
+    # Stream Server-Sent Events straight through to the client. mitmproxy
+    # buffers response bodies under `stream_large_bodies` by default; doing
+    # that to an SSE long-poll (e.g. the Claude Code worker event channel that
+    # carries web-typed prompts into the VM) holds the connection open forever
+    # with nothing reaching the client, so the client times out and retries.
+    ctype = flow.response.headers.get("content-type", "")
+    if "text/event-stream" in ctype.lower():
+        flow.response.stream = True

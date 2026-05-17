@@ -126,6 +126,36 @@ class ChunkedHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+# Coordinates the SSE streaming test: the mock upstream sends the first event,
+# waits for the client to confirm it received it, then sends the second one.
+_sse_first_received = threading.Event()
+
+
+class EventStreamHandler(http.server.BaseHTTPRequestHandler):
+    """Mock upstream: a text/event-stream response sent in two installments.
+
+    The response carries no Content-Length and is not chunked, so it is only
+    recognisable as streaming via its Content-Type. The second event is held
+    back until the client confirms it got the first — if the proxy buffered the
+    whole body before forwarding, this deadlocks and the test times out.
+    """
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        _sse_first_received.clear()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(b"event: first\ndata: 1\n\n")
+        self.wfile.flush()
+        _sse_first_received.wait(timeout=10)
+        self.wfile.write(b"event: second\ndata: 2\n\n")
+        self.wfile.flush()
+
+
 class ErrorHandler(http.server.BaseHTTPRequestHandler):
     """Mock upstream: returns 500."""
 
@@ -480,6 +510,51 @@ class TestCredentialProxyStreaming(unittest.TestCase):
         self.assertIn("chunk-2", body)
 
 
+class TestCredentialProxyEventStream(unittest.TestCase):
+    """Tests Server-Sent Events (text/event-stream) pass through unbuffered."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream_server, cls.upstream_port = _start_mock_upstream(EventStreamHandler)
+        cls.rules = [{"domain": "127.0.0.1", "headers": {}}]
+        cls.proxy_proc, cls.proxy_port = _start_credential_proxy(cls.rules)
+
+    @classmethod
+    def tearDownClass(cls):
+        _stop_proxy(cls.proxy_proc)
+        cls.upstream_server.shutdown()
+
+    def test_event_stream_not_buffered(self):
+        """SSE events reach the client incrementally, not all at once on close."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("GET", "/events", headers={
+            "X-Original-Host": "127.0.0.1",
+            "X-Original-Port": str(self.upstream_port),
+            "X-Original-Scheme": "http",
+        })
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("text/event-stream", resp.getheader("Content-Type", ""))
+
+        # First event must arrive before the upstream is allowed to send the
+        # second one — i.e. the proxy forwards bytes as they arrive instead of
+        # waiting to fill a buffer. read1() returns whatever's available rather
+        # than blocking for a fixed byte count.
+        first = b""
+        while b"\n\n" not in first:
+            chunk = resp.read1(256)
+            self.assertTrue(chunk, "stream closed before first event")
+            first += chunk
+        self.assertIn(b"event: first", first)
+        self.assertNotIn(b"event: second", first)
+
+        _sse_first_received.set()
+
+        rest = resp.read()
+        self.assertIn(b"event: second", rest)
+        conn.close()
+
+
 class TestCredentialProxyWebSocket(unittest.TestCase):
     """Tests websocket upgrade forwarding with header injection."""
 
@@ -712,6 +787,12 @@ class TestBuildCredentialRules(unittest.TestCase):
         self.assertNotIn("Authorization", anthropic["headers"])
         self.assertEqual(anthropic["auth_from_file"]["path"], "/fake/.claude/.credentials.json")
         self.assertEqual(anthropic["auth_from_file"]["header"], "Authorization")
+        # Only the provisioned placeholder bearer may be rewritten; a
+        # client-set value (the remote-control bridge's environment_secret) is
+        # passed through.
+        overwrite_only = anthropic["auth_from_file"]["overwrite_only"]
+        self.assertTrue(any(v.startswith("Bearer sk-ant-oat01-") for v in overwrite_only))
+        self.assertIn("Bearer placeholder", overwrite_only)
         platform = next(r for r in rules if r["domain"] == "platform.claude.com")
         self.assertEqual(platform["path_prefix"], "/v1/oauth/token")
         refresh = platform["oauth_refresh"]
@@ -996,6 +1077,103 @@ class TestCredentialProxyHostClaudeCredentials(unittest.TestCase):
             status, _, data = _proxy_request(port, "GET", "/", headers)
             echo = json.loads(data)
             self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-rotated")
+        finally:
+            _stop_proxy(proc)
+
+    def test_auth_from_file_no_overwrite_only_always_replaces(self):
+        """Without overwrite_only, a client-set Authorization is still replaced."""
+        creds = self._creds_path()
+        self._write_creds(creds, access="sk-ant-oat01-real")
+        rules = [{
+            "domain": "127.0.0.1",
+            "auth_from_file": {
+                "path": creds,
+                "json_path": "claudeAiOauth.accessToken",
+                "header": "Authorization",
+                "format": "Bearer {token}",
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "127.0.0.1",
+                "X-Original-Port": str(self.upstream_port),
+                "X-Original-Scheme": "http",
+                "Authorization": "Bearer client-supplied",
+            }
+            status, _, data = _proxy_request(port, "GET", "/", headers)
+            self.assertEqual(status, 200)
+            echo = json.loads(data)
+            self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-real")
+        finally:
+            _stop_proxy(proc)
+
+    def test_auth_from_file_overwrite_only_rewrites_placeholder(self):
+        """A placeholder bearer listed in overwrite_only is rewritten with the real token."""
+        creds = self._creds_path()
+        self._write_creds(creds, access="sk-ant-oat01-real")
+        rules = [{
+            "domain": "127.0.0.1",
+            "auth_from_file": {
+                "path": creds,
+                "json_path": "claudeAiOauth.accessToken",
+                "header": "Authorization",
+                "format": "Bearer {token}",
+                "overwrite_only": ["Bearer sk-ant-oat01-placeholder", "Bearer placeholder"],
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            base = {
+                "X-Original-Host": "127.0.0.1",
+                "X-Original-Port": str(self.upstream_port),
+                "X-Original-Scheme": "http",
+            }
+            for placeholder in ("Bearer sk-ant-oat01-placeholder", "Bearer placeholder"):
+                status, _, data = _proxy_request(
+                    port, "GET", "/", {**base, "Authorization": placeholder})
+                self.assertEqual(status, 200)
+                echo = json.loads(data)
+                self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-real",
+                                 f"placeholder {placeholder!r} not rewritten")
+            # Absent header is also (re)populated.
+            status, _, data = _proxy_request(port, "GET", "/", base)
+            echo = json.loads(data)
+            self.assertEqual(echo["headers"]["Authorization"], "Bearer sk-ant-oat01-real")
+        finally:
+            _stop_proxy(proc)
+
+    def test_auth_from_file_overwrite_only_passes_through_other_bearer(self):
+        """A client-set bearer that is NOT a managed placeholder is left untouched.
+
+        This is the remote-control bridge case: it authenticates
+        /v1/environments/.../work/poll with its environment_secret, which the
+        proxy must not clobber with the user OAuth token.
+        """
+        creds = self._creds_path()
+        self._write_creds(creds, access="sk-ant-oat01-real")
+        rules = [{
+            "domain": "127.0.0.1",
+            "auth_from_file": {
+                "path": creds,
+                "json_path": "claudeAiOauth.accessToken",
+                "header": "Authorization",
+                "format": "Bearer {token}",
+                "overwrite_only": ["Bearer sk-ant-oat01-placeholder", "Bearer placeholder"],
+            },
+        }]
+        proc, port = _start_credential_proxy(rules)
+        try:
+            headers = {
+                "X-Original-Host": "127.0.0.1",
+                "X-Original-Port": str(self.upstream_port),
+                "X-Original-Scheme": "http",
+                "Authorization": "Bearer environment-secret-xyz",
+            }
+            status, _, data = _proxy_request(port, "GET", "/v1/environments/env_1/work/poll", headers)
+            self.assertEqual(status, 200)
+            echo = json.loads(data)
+            self.assertEqual(echo["headers"]["Authorization"], "Bearer environment-secret-xyz")
         finally:
             _stop_proxy(proc)
 

@@ -479,6 +479,16 @@ if host_claude_creds:
         'json_path': 'claudeAiOauth.accessToken',
         'header': 'Authorization',
         'format': 'Bearer {token}',
+        # Only rewrite the placeholder bearer the VM was provisioned with.
+        # Claude Code's remote-control bridge sets Authorization itself on
+        # /v1/environments/.../work/* — with an environment_secret that has
+        # org:external_poll_sessions, which the user OAuth token lacks — so a
+        # non-placeholder value the client sends must be passed through, or the
+        # bridge 403s and self-terminates inside the VM.
+        'overwrite_only': [
+            f'Bearer {PLACEHOLDER_ACCESS}',
+            'Bearer placeholder',
+        ],
     }
 rules.append(anthropic_rule)
 if host_claude_creds:
