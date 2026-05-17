@@ -34,6 +34,7 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Setup(args) => setup::run(args).await,
@@ -42,6 +43,20 @@ async fn main() -> Result<()> {
         Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
         Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
     }
+}
+
+/// Wire `tracing` so `RUST_LOG=agent_vm=debug,microsandbox=info` works.
+/// Default level is `warn` — keeps normal output clean, but anything from
+/// the microsandbox stack surfaces when you ask for it.
+fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .compact()
+        .init();
 }
 
 fn exit_with(code: i32) -> Result<()> {
