@@ -5,13 +5,54 @@
 //! `OPENAI_API_KEY`); host-rooted refresh-able credentials land in
 //! Phase 3/4.
 
-use std::{env, io::IsTerminal as _};
+use std::{
+    env,
+    io::IsTerminal as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
 use microsandbox::Sandbox;
 
 use crate::session::ProjectSession;
+
+/// Paths that the guest will tmpfs-mount at boot, wiping anything our
+/// `patch` builder baked into the rootfs underneath them. We refuse to mirror
+/// a host project rooted here and fall back to `/workspace` instead.
+const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
+
+fn guest_path_is_safe(project: &Path) -> bool {
+    let s = match project.to_str() {
+        Some(s) => s,
+        None => return false,
+    };
+    !TMPFS_GUEST_PREFIXES
+        .iter()
+        .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+}
+
+/// Absolute directories that must exist inside the guest rootfs before
+/// microsandbox can mount the project at its host path. Returns paths from
+/// shallowest to deepest, e.g. for `/home/boger/work/foo`:
+/// `["/home", "/home/boger", "/home/boger/work", "/home/boger/work/foo"]`.
+/// The leaf is included because microsandbox validates `workdir` against the
+/// rootfs at create time, *before* the bind mount is materialized — without
+/// the empty mount point dir it errors with "workdir does not exist in
+/// guest". The bind mount then overlays this empty dir with the host's
+/// project contents at boot.
+fn mkdir_chain(project: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut acc = PathBuf::new();
+    for c in project.components() {
+        acc.push(c.as_os_str());
+        let s = acc.to_string_lossy().to_string();
+        if s != "/" && !s.is_empty() {
+            out.push(s);
+        }
+    }
+    out
+}
 
 /// Which entry point to attach inside the sandbox.
 #[derive(Clone, Copy)]
@@ -60,22 +101,48 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .try_into()
         .with_context(|| format!("AGENT_VM_CPUS={cpus_u32} exceeds u8::MAX"))?;
 
-    // microsandbox VMs cap the number of virtio devices via libkrun's IRQ
-    // pool; each bind mount is one device on top of the OCI rootfs's two
-    // (EROFS lower + ext4 upper). We therefore bind a single host directory
-    // for all per-agent state and either symlink the agent's expected home
-    // (claude, opencode) or redirect via an env var (codex). Codex needs the
-    // env-var path because its CLI binary lives under /root/.codex/packages,
-    // which a symlink would shadow.
+    // Mount the host project at the *same* absolute path inside the guest so
+    // that anything the agent emits (compiler errors, stack traces, git
+    // output, file:line references) names a path that's interpretable on the
+    // host. The agent-vm-state mount is internal and stays at a fixed path.
+    //
+    // Exception: paths under tmpfs mount points (typically /tmp, /run,
+    // /dev/shm) can't be mirrored, because the guest tmpfs-mounts those at
+    // boot — that wipes any mount point our `patch` builder baked into the
+    // rootfs. Fall back to /workspace and tell the user once.
+    //
+    // microsandbox VMs also cap the number of virtio devices via libkrun's
+    // IRQ pool; each bind mount is one device on top of the OCI rootfs's two
+    // (EROFS lower + ext4 upper). We therefore bind a *single* host
+    // directory for all per-agent state and either symlink the agent's
+    // expected home (claude, opencode) or redirect via an env var (codex).
+    // Codex needs the env-var path because its CLI binary lives under
+    // /root/.codex/packages, which a symlink would shadow.
+    let host_path = session
+        .project_dir
+        .to_str()
+        .context("project path contains non-UTF-8 bytes; not supported")?;
+    let project_guest_path = if guest_path_is_safe(&session.project_dir) {
+        host_path.to_string()
+    } else {
+        eprintln!(
+            "==> Project path {host_path} is under a tmpfs mount; mounting at /workspace instead"
+        );
+        "/workspace".to_string()
+    };
+    let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
         .registry(|r| r.insecure())
         .cpus(cpus)
         .memory(memory_mib)
-        .workdir("/workspace")
-        .volume("/workspace", |m| m.bind(&session.project_dir))
+        .workdir(project_guest_path.clone())
+        .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
         .volume("/agent-vm-state", |m| m.bind(&session.state_dir))
-        .patch(|p| {
+        .patch(|mut p| {
+            for parent in patch_builder_steps.drain(..) {
+                p = p.mkdir(parent, None);
+            }
             p.mkdir("/root/.local", None)
                 .mkdir("/root/.local/share", None)
                 .symlink("/agent-vm-state/claude", "/root/.claude", true)
@@ -128,7 +195,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("==> Running {cmd} in sandbox (no TTY; output appears after exit)");
         use tokio::io::AsyncWriteExt as _;
         let output = sandbox
-            .exec_with(cmd, |e| e.args(agent_args).cwd("/workspace"))
+            .exec_with(cmd, |e| {
+                e.args(agent_args).cwd(project_guest_path.clone())
+            })
             .await
             .with_context(|| format!("running {cmd} in sandbox"))?;
         let mut stdout = tokio::io::stdout();
