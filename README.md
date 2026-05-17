@@ -21,7 +21,13 @@ until v1 of the rewrite ships.
 - Phase 1 (base OCI image + `agent-vm setup`): done.
 - Phase 2 (launcher MVP — `claude`/`codex`/`opencode`/`shell`): done; live
   API smoke deferred to Phase 3.
-- Phase 3 (host-rooted secrets via microsandbox TLS intercept): pending.
+- Phase 2.x (RUST_LOG, host-path mounting, pull progress bar,
+  `agent-vm pull` + update-available banner, registry auto-recovery):
+  done.
+- Phase 3 (host-rooted secrets via microsandbox TLS intercept): **next**.
+- Phase 4 (token-refresh semantics): pending.
+- Phase 5 (snapshot-based fast launch): pending.
+- Phase 6 (distribution + polish + docs): pending.
 
 ## Building
 
