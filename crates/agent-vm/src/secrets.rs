@@ -65,13 +65,13 @@ pub fn openai_token_path(state_dir: &Path) -> PathBuf {
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretValue::File config.
-pub fn refresh(state_dir: &Path) -> Result<CredsState> {
+pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState> {
     std::fs::create_dir_all(state_dir.join("tokens"))?;
 
     // First-run bypasses, run regardless of whether the user has host
     // credentials for the provider. Without these the in-VM agent
     // blocks on a terminal-style wizard at first launch.
-    write_agent_config_defaults(state_dir)?;
+    write_agent_config_defaults(state_dir, project_guest_path)?;
 
     let anthropic_token_file = refresh_anthropic(state_dir).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
@@ -92,16 +92,17 @@ pub fn refresh(state_dir: &Path) -> Result<CredsState> {
 /// trust/approval settings) into the per-project state dir. Idempotent
 /// across launches; merges instead of overwrites so user tweaks
 /// survive.
-fn write_agent_config_defaults(state_dir: &Path) -> Result<()> {
+fn write_agent_config_defaults(state_dir: &Path, project_guest_path: &str) -> Result<()> {
     let claude_dir = state_dir.join("claude");
     std::fs::create_dir_all(&claude_dir)?;
     write_default_claude_settings(&claude_dir.join("settings.json"))?;
     // ~/.claude.json is the per-user onboarding-state file Claude
-    // Code checks for the "first launch" theme picker. It sits at
-    // $HOME root (not inside .claude/), so the symlinked state dir
-    // doesn't catch it — we instead persist it in our state dir and
-    // run.rs symlinks /root/.claude.json → /agent-vm-state/claude.json.
-    write_default_claude_root_state(&state_dir.join("claude.json"))?;
+    // Code checks for the "first launch" theme picker AND the
+    // per-project "trust this folder?" prompt. It sits at $HOME root
+    // (not inside .claude/), so the symlinked state dir doesn't catch
+    // it — we instead persist it in our state dir and run.rs symlinks
+    // /root/.claude.json → /agent-vm-state/claude.json.
+    write_default_claude_root_state(&state_dir.join("claude.json"), project_guest_path)?;
 
     let codex_dir = state_dir.join("codex");
     std::fs::create_dir_all(&codex_dir)?;
@@ -231,9 +232,10 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(token_file))
 }
 
-fn write_default_claude_root_state(path: &Path) -> Result<()> {
+fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Result<()> {
     // Merge-on-existing to preserve user-side updates (project entries
-    // etc.) but force-set the onboarding flag every launch.
+    // etc.) but force-set the onboarding + per-folder trust flags
+    // every launch.
     let mut state: Value = match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
@@ -242,6 +244,30 @@ fn write_default_claude_root_state(path: &Path) -> Result<()> {
     let obj = state.as_object_mut().context("~/.claude.json is not an object")?;
     obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
     obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
+
+    // Pre-approve the project folder. Without this the in-VM Claude
+    // shows the "do you trust the files in this folder?" prompt on
+    // first launch in each new project. The keys here mirror what
+    // Claude Code itself writes once a user clicks "yes".
+    let projects = obj
+        .entry("projects".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("~/.claude.json projects is not an object")?;
+    let project = projects
+        .entry(project_guest_path.to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("~/.claude.json projects.<path> is not an object")?;
+    project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+    project.insert(
+        "hasCompletedProjectOnboarding".into(),
+        Value::Bool(true),
+    );
+    project
+        .entry("history".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+
     atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
     Ok(())
 }

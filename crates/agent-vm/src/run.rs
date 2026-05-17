@@ -73,6 +73,16 @@ impl Agent {
             Agent::Shell => "bash",
         }
     }
+
+    /// Flags we always pass before the user's own args. The microVM is
+    /// the security boundary, so the in-VM agent's "are you sure?"
+    /// prompts add no protection and break agent-mode flows.
+    fn default_args(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["--dangerously-skip-permissions"],
+            Agent::Codex | Agent::Opencode | Agent::Shell => &[],
+        }
+    }
 }
 
 #[derive(ClapArgs)]
@@ -145,7 +155,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // SecretValue::File entries; the proxy re-reads them on every
     // connection setup, so a host-side rotation propagates without
     // restarting the sandbox.
-    let creds = crate::secrets::refresh(&session.state_dir)
+    //
+    // Passing the in-guest project path lets us pre-approve it in
+    // Claude's per-folder trust list (~/.claude.json `projects.<path>.
+    // hasTrustDialogAccepted = true`), suppressing the "do you trust
+    // this folder?" wizard on first launch in each project.
+    let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path)
         .context("snapshotting host credentials")?;
 
     let mut builder = Sandbox::builder(&session.sandbox_name)
@@ -277,7 +292,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     let cmd = agent.command();
-    let agent_args = args.agent_args;
+    // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
+    // for Claude) unless the user already provided them.
+    let mut agent_args: Vec<String> = agent
+        .default_args()
+        .iter()
+        .filter(|d| !args.agent_args.iter().any(|u| u == *d))
+        .map(|s| s.to_string())
+        .collect();
+    agent_args.extend(args.agent_args);
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
         eprintln!("==> Attaching to {cmd}");
