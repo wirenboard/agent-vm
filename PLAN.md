@@ -194,21 +194,47 @@ original Bash agent-vm's credential-proxy flow.
 ### Phase 4 — Refresh semantics [pending]
 
 Tokens rotate; long-running sandbox sessions must survive that without
-re-attaching. Phase 3 makes the access token swappable; this phase teaches
-agent-vm to actually do the swap.
+re-attaching. Phase 3 makes the access token swappable in principle;
+this phase teaches agent-vm to actually do the swap, with the simplest
+moving parts that work.
 
-- inotify (Linux) / kqueue (macOS) watcher on host creds files: when host
-  Claude/Codex rotates tokens externally (the user runs `claude` on the
-  host, etc.), we re-snapshot to the file microsandbox watches.
-- Proactive expiry watch: when the access token is < 5 minutes from
-  expiry and no host activity has refreshed it, spawn `claude -p "ping"
-  --model sonnet` / `codex exec --skip-git-repo-check "Reply OK"` on the
-  host so the host-side CLI rotates the file.
-- Single-flight per credential; cross-instance lockfile so concurrent
-  `agent-vm` instances don't all kick off a refresh at once.
+Design:
 
-**Done when:** a multi-hour session crosses a token rotation without the
-agent seeing an auth error and without manual intervention.
+- **Rebuild `~/.microsandbox/bin/msb` from our fork** so
+  `SecretValue::File` actually re-reads the host token file on every
+  connection-setup. With this in place, the proxy always picks up the
+  current host file content without any host-side daemon.
+- **MITM the OAuth refresh endpoint** (`platform.claude.com/v1/oauth/
+  token`, `auth.openai.com/oauth/token`). When the in-VM agent tries
+  to refresh:
+  1. agent-vm spawns a host-side `claude -p "ping" --model sonnet` /
+     `codex exec --skip-git-repo-check "Reply OK"` to trigger the
+     host CLI to rotate its credential file (this is what the
+     original Bash agent-vm does).
+  2. Re-reads the host file.
+  3. Synthesizes the refresh-endpoint response from the host's new
+     `accessToken` / `expiresAt`, but with placeholder strings for
+     the body's `access_token` field — so the in-VM agent's local
+     credentials file is updated to a placeholder, not the real
+     token. Same shape as the rest of the substitution flow.
+  4. The next API request from the in-VM agent uses the new
+     placeholder, which `SecretValue::File` swaps for the real
+     newly-rotated token. No restart, no manual intervention.
+- **Single-flight** for the host-CLI invocation so two concurrent
+  in-VM refresh attempts don't fire two host-side `claude -p`
+  processes at once.
+
+What we **don't** need (per discussion): a proactive "token nearing
+expiry" timer. The guest's own refresh attempt at 401-time is the
+trigger, and the MITM handles it. If the user already ran `claude` on
+the host between refreshes and the host file is fresh, the in-VM
+substitution picks it up on the next request without any of this
+machinery firing — `SecretValue::File` is the whole story for the
+externally-rotated case.
+
+**Done when:** a multi-hour session crosses a token rotation
+end-to-end without the agent seeing an auth error and without manual
+intervention.
 
 ### Phase 5 — Fast-launch (deferred — wrong instrument for the job)
 
