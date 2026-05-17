@@ -18,6 +18,8 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::host_paths::{atomic_write, state_root};
+
 pub fn read(image_ref: &str) -> Option<String> {
     let path = marker_path(image_ref)?;
     fs::read_to_string(&path)
@@ -33,25 +35,11 @@ pub fn write(image_ref: &str, digest: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, digest).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path).with_context(|| format!("renaming {}", path.display()))?;
-    Ok(())
+    atomic_write(&path, digest.as_bytes(), 0o644)
 }
 
 fn marker_path(image_ref: &str) -> Option<PathBuf> {
     Some(state_root()?.join("pulled-digests").join(hash(image_ref)))
-}
-
-fn state_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("AGENT_VM_STATE_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(dir).join("agent-vm"));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/state/agent-vm"))
 }
 
 fn hash(s: &str) -> String {

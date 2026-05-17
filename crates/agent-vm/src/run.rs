@@ -142,8 +142,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Snapshot host credentials into per-project token files and place
     // placeholder credentials.json files where the in-VM agents will
     // find them. The token files are passed to microsandbox below as
-    // SecretValue::File entries; the host TLS-intercept proxy reads
-    // them on every connection setup. Real tokens never enter the VM.
+    // SecretValue::File entries; the proxy re-reads them on every
+    // connection setup, so a host-side rotation propagates without
+    // restarting the sandbox.
     let creds = crate::secrets::refresh(&session.state_dir)
         .context("snapshotting host credentials")?;
 
@@ -172,25 +173,21 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .env("CODEX_HOME", "/agent-vm-state/codex")
         .replace();
 
-    // Phase 3: host-rooted credentials.
+    // For each provider with a host credential file, register a
+    // SecretValue::File secret keyed on the placeholder string the
+    // guest will send, then register the OAuth refresh endpoint as a
+    // hook target so a 401-then-refresh attempt round-trips through a
+    // real host-side rotation (see `intercept_hook`).
     //
-    // For each provider we have a host file for, wire up TLS interception
-    // and register a SecretValue::File entry. The placeholder string
-    // matches what we wrote into the guest's credentials.json (see
-    // secrets::refresh), so when the agent reads its credentials, sends
-    // a Bearer header with the placeholder, the host proxy substitutes
-    // it with the real token from the per-project file.
-    //
-    // allow_host covers both the API endpoint and the OAuth endpoint of
-    // each provider — we don't intercept the refresh flow yet (Phase 4),
-    // but we need to allow the request through to avoid the secret
-    // violation detector blocking attempts at refresh.
+    // allow_host covers both the API endpoint and the OAuth endpoint;
+    // the OAuth host has to be allowed for the placeholder to leave
+    // the VM at all (microsandbox's violation detector would block it
+    // otherwise), even though substitution there is a no-op because
+    // the body's refresh_token is a placeholder, not a header.
     if creds.anthropic_token_file.is_some() || creds.openai_token_file.is_some() {
+        use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
-        // Hook command: this very binary in "_intercept-hook" mode.
-        // microsandbox spawns it per matched request with the request
-        // bytes on stdin and reads the response from stdout.
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
         builder = builder.network(move |mut n| {
@@ -199,36 +196,31 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
                         .value(file)
-                        .placeholder(crate::secrets::ANTHROPIC_PLACEHOLDER)
-                        .allow_host("api.anthropic.com")
-                        .allow_host("platform.claude.com")
+                        .placeholder(ANTHROPIC_ACCESS_PLACEHOLDER)
+                        .allow_host(ANTHROPIC_API_HOST)
+                        .allow_host(ANTHROPIC_OAUTH_HOST)
                 });
             }
             if let Some(file) = openai {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_OPENAI_UNUSED")
                         .value(file)
-                        .placeholder(crate::secrets::OPENAI_PLACEHOLDER)
-                        .allow_host("api.openai.com")
-                        .allow_host("chatgpt.com")
-                        .allow_host("auth.openai.com")
+                        .placeholder(OPENAI_ACCESS_PLACEHOLDER)
+                        .allow_host(OPENAI_API_HOST)
+                        .allow_host(OPENAI_CHATGPT_HOST)
+                        .allow_host(OPENAI_OAUTH_HOST)
                 });
             }
-            // Interceptor hook: spawn `agent-vm _intercept-hook
-            // --state-dir <dir>` and let it answer OAuth refresh
-            // requests. See crate::intercept_hook for the response
-            // synthesis logic.
-            n = n.intercept(|i| {
+            n.intercept(|i| {
                 i.hook([
                     self_path.to_string_lossy().to_string(),
                     "_intercept-hook".to_string(),
                     "--state-dir".to_string(),
                     state_dir.to_string_lossy().to_string(),
                 ])
-                .rule("platform.claude.com", "POST", "/v1/oauth/token")
-                .rule("auth.openai.com", "POST", "/oauth/token")
-            });
-            n
+                .rule(ANTHROPIC_OAUTH_HOST, "POST", ANTHROPIC_OAUTH_TOKEN_PATH)
+                .rule(OPENAI_OAUTH_HOST, "POST", OPENAI_OAUTH_TOKEN_PATH)
+            })
         });
     }
 

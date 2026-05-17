@@ -1,5 +1,6 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod host_paths;
 mod image_check;
 mod intercept_hook;
 mod msb_install;

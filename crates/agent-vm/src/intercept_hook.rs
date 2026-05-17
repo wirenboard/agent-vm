@@ -31,29 +31,32 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use serde_json::{Value, json};
+
+use crate::host_paths::{atomic_write, host_claude_creds_path, host_codex_auth_path};
+use crate::secrets;
 
 #[derive(ClapArgs)]
 pub struct Args {
     /// Per-project state directory (same one used by the launcher).
-    /// We need it to know where to read host credentials and where
-    /// to write the freshly-rotated token file.
+    /// We need it to know where to write the freshly-rotated token file.
     #[arg(long)]
     state_dir: PathBuf,
+
+    /// SNI of the intercepted connection. Provided by microsandbox via
+    /// the `MSB_INTERCEPT_SNI` env var the proxy sets on the hook.
+    #[arg(env = "MSB_INTERCEPT_SNI")]
+    sni: String,
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let sni = std::env::var("MSB_INTERCEPT_SNI")
-        .context("MSB_INTERCEPT_SNI not set; this command is invoked by msb's interceptor")?;
-
     let mut request = Vec::new();
     std::io::stdin()
         .read_to_end(&mut request)
         .context("reading request from stdin")?;
 
-    // Sanity check that this is what we expect.
     if !looks_like_oauth_refresh(&request) {
         // Forward an opaque server error so the in-VM agent at least
         // gets a comprehensible failure rather than a hang. We don't
@@ -66,13 +69,10 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let response = match sni.as_str() {
-        "platform.claude.com" => refresh_anthropic(&args.state_dir)?,
-        "auth.openai.com" => refresh_openai(&args.state_dir)?,
-        other => error_response(
-            500,
-            &format!("agent-vm hook has no logic for SNI {other}"),
-        ),
+    let response = match args.sni.as_str() {
+        secrets::ANTHROPIC_OAUTH_HOST => refresh_anthropic(&args.state_dir)?,
+        secrets::OPENAI_OAUTH_HOST => refresh_openai(&args.state_dir)?,
+        other => error_response(500, &format!("agent-vm hook has no logic for SNI {other}")),
     };
     write_response(&response)?;
     Ok(())
@@ -85,15 +85,10 @@ fn write_response(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Trigger host-side Claude refresh, re-read the host file, rewrite
-/// the per-project token file, and synthesize the OAuth refresh JSON
-/// response that the in-VM Claude expects.
 fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
-    // Trigger refresh on the host.
     trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
 
-    // Re-read the (now-rotated) host file.
-    let host_path = host_claude_creds_path()?;
+    let host_path = host_claude_creds_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
         .with_context(|| format!("reading {}", host_path.display()))?;
     let json: Value = serde_json::from_str(&raw)
@@ -107,25 +102,21 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
         .context("rotated host claudeAiOauth missing accessToken")?;
     let expires_at = oauth.get("expiresAt").cloned().unwrap_or(json!(0));
 
-    // Update the per-project token file so the proxy's next
-    // SecretValue::File read picks up the new bearer.
-    let token_file = crate::secrets::anthropic_token_path(state_dir);
+    let token_file = secrets::anthropic_token_path(state_dir);
     if let Some(parent) = token_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
     atomic_write(&token_file, new_access.as_bytes(), 0o600)?;
 
-    // Synthesize the OAuth refresh response. Claude's refresh endpoint
-    // returns a body like:
-    //   {"access_token":"...", "refresh_token":"...", "expires_in":...}
-    // The in-VM Claude writes that into its credentials.json. We put
-    // placeholders in both token fields so the next request goes
-    // through the substitution path.
-    let expires_in = derive_expires_in(&expires_at);
+    // The in-VM Claude writes the refresh response into its local
+    // credentials.json. Returning placeholders in both token fields
+    // means the next API request gets routed through the substitution
+    // path again, where the proxy swaps for the freshly-rotated bearer
+    // it just read from the token file above.
     let body = json!({
-        "access_token": crate::secrets::ANTHROPIC_PLACEHOLDER,
-        "refresh_token": "MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1",
-        "expires_in": expires_in,
+        "access_token": secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
+        "refresh_token": secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
+        "expires_in": derive_expires_in(&expires_at),
         "token_type": "Bearer",
         "scope": oauth.get("scopes").cloned().unwrap_or(json!([])),
     });
@@ -143,7 +134,7 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
         ],
     )?;
 
-    let host_path = host_codex_auth_path()?;
+    let host_path = host_codex_auth_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
         .with_context(|| format!("reading {}", host_path.display()))?;
     let json: Value = serde_json::from_str(&raw)
@@ -155,18 +146,16 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
         .or_else(|| json.get("OPENAI_API_KEY").and_then(|v| v.as_str()))
         .context("rotated host codex auth missing tokens.access_token or OPENAI_API_KEY")?;
 
-    let token_file = crate::secrets::openai_token_path(state_dir);
+    let token_file = secrets::openai_token_path(state_dir);
     if let Some(parent) = token_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
     atomic_write(&token_file, new_access.as_bytes(), 0o600)?;
 
-    // OpenAI's refresh response shape varies; this is a minimal one
-    // good enough for codex to write its auth.json.
     let body = json!({
-        "access_token": crate::secrets::OPENAI_PLACEHOLDER,
-        "refresh_token": "MSB_PLACEHOLDER_OPENAI_REFRESH_TOKEN_v1",
-        "id_token": "MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1",
+        "access_token": secrets::OPENAI_ACCESS_PLACEHOLDER,
+        "refresh_token": secrets::OPENAI_REFRESH_PLACEHOLDER,
+        "id_token": secrets::OPENAI_ID_PLACEHOLDER,
         "expires_in": 3600,
         "token_type": "Bearer",
     });
@@ -182,7 +171,7 @@ fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
         .output()
         .with_context(|| format!("spawning host {cmd}"))?;
     if !out.status.success() {
-        bail!(
+        anyhow::bail!(
             "host {cmd} failed (status {}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
@@ -191,23 +180,10 @@ fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn host_claude_creds_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".claude/.credentials.json"))
-}
-
-fn host_codex_auth_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".codex/auth.json"))
-}
-
 fn looks_like_oauth_refresh(req: &[u8]) -> bool {
-    let s = match std::str::from_utf8(req) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let first_line = s.lines().next().unwrap_or("");
-    first_line.starts_with("POST ")
+    std::str::from_utf8(req)
+        .map(|s| s.lines().next().unwrap_or("").starts_with("POST "))
+        .unwrap_or(false)
 }
 
 fn derive_expires_in(expires_at_field: &Value) -> i64 {
@@ -220,45 +196,30 @@ fn derive_expires_in(expires_at_field: &Value) -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let diff_secs = (expires_at_ms - now_ms) / 1000;
-    if diff_secs <= 0 { 3600 } else { diff_secs }
+    let diff = (expires_at_ms - now_ms) / 1000;
+    if diff <= 0 { 3600 } else { diff }
 }
 
 fn http_200_json(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 128);
-    out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
-    out.extend_from_slice(b"Content-Type: application/json\r\n");
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n");
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
-    out
+    build_response(200, "OK", body)
 }
 
 fn error_response(code: u16, msg: &str) -> Vec<u8> {
     let body = format!("{{\"error\":{}}}", json!(msg));
-    let mut out = Vec::with_capacity(body.len() + 128);
-    out.extend_from_slice(format!("HTTP/1.1 {code} Server Error\r\n").as_bytes());
-    out.extend_from_slice(b"Content-Type: application/json\r\n");
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n");
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body.as_bytes());
-    out
+    build_response(code, "Server Error", body.as_bytes())
 }
 
-fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("agent-vm-hook-tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
-        f.write_all(data)?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+fn build_response(code: u16, reason: &str, body: &[u8]) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+    out
 }
