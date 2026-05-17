@@ -40,6 +40,10 @@ ensure_registry() {
 # `docker start` returns when the container has launched, but registry:2's
 # HTTP listener takes another ~100ms to bind. A push fired immediately after
 # loses that race with ECONNREFUSED, so poll until the v2 API answers.
+#
+# On failure, dump the container's port bindings and recent logs so the
+# user can tell whether the registry process crashed, was bound to the
+# wrong port, or never started — instead of just a bare timeout.
 wait_for_registry() {
     local i
     for i in $(seq 1 50); do
@@ -48,7 +52,21 @@ wait_for_registry() {
         fi
         sleep 0.2
     done
-    echo "Registry did not become reachable on 127.0.0.1:${REGISTRY_PORT} after 10s" >&2
+    {
+        echo "Registry did not become reachable on 127.0.0.1:${REGISTRY_PORT} after 10s."
+        echo "Container state:"
+        docker ps -a --filter "name=${REGISTRY_NAME}" \
+            --format '  status={{.Status}}  ports={{.Ports}}' 2>/dev/null || true
+        echo "Port bindings:"
+        docker inspect "${REGISTRY_NAME}" \
+            --format '  {{json .NetworkSettings.Ports}}' 2>/dev/null || true
+        echo "Last 30 lines of container logs:"
+        docker logs --tail 30 "${REGISTRY_NAME}" 2>&1 | sed 's/^/  /' || true
+        echo
+        echo "If the port mapping is wrong (a stale container from a prior session),"
+        echo "delete it and rerun setup:"
+        echo "    docker rm -f ${REGISTRY_NAME} && agent-vm setup"
+    } >&2
     return 1
 }
 
