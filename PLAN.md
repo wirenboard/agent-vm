@@ -85,19 +85,31 @@ teardown with the alpine image cached.
 reports the three agent versions. Result: Claude 2.1.143, OpenCode 1.15.3,
 codex-cli 0.130.0.
 
-### Phase 2 — Launcher MVP [pending]
+### Phase 2 — Launcher MVP [done — wiring complete; live API smoke deferred to Phase 3]
 
 - clap-based subcommand parser: `setup | claude | codex | opencode | shell`.
 - Project hash + state dir helper (`${XDG_STATE_HOME:-~/.local/state}/agent-vm
   /<hash>/`).
 - Mount `cwd` at `/workspace` inside the sandbox.
-- Symlink session dirs from the persisted state dir into the guest home.
-- `attach_shell` for interactive agents.
-- Credentials: env-var only (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) so we can
-  test the launcher end-to-end without the refresh machinery.
+- Persist `~/.claude` and `~/.local/share/opencode` via rootfs-patched
+  symlinks into a single `/agent-vm-state` bind mount; redirect `~/.codex`
+  via `CODEX_HOME` (its binary lives under that path, so a symlink would
+  shadow it). One bind for project, one for state — total two virtio mounts
+  on top of the OCI rootfs, well under libkrun's IRQ cap.
+- TTY-conditional dispatch: `attach()` when stdin is a real terminal,
+  `exec_with(...)` otherwise (handles pipes, redirects, smoke tests under
+  `sg`/`sudo -c`, CI).
+- Credentials: env-var only (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) so the
+  launcher is independent of the refresh machinery.
 
 **Done when:** `cd repo && agent-vm claude -p "say hi"` returns a real Claude
 response from inside the sandbox.
+
+**Actual outcome:** All wiring verified via `agent-vm shell` (workspace
+round-trip, persistence across reboots, agent CLIs resolvable on PATH,
+CODEX_HOME redirect, env propagation). The live API smoke was deferred — see
+ARCHITECTURE.md "What Phase 2 deliberately doesn't do". Phase 3's host-OAuth
+work closes the gap naturally.
 
 ### Phase 3 — Static host-rooted secrets [pending]
 

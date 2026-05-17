@@ -19,7 +19,9 @@ until v1 of the rewrite ships.
 
 - Phase 0 (scaffolding): done.
 - Phase 1 (base OCI image + `agent-vm setup`): done.
-- Phase 2 (launcher MVP): pending.
+- Phase 2 (launcher MVP — `claude`/`codex`/`opencode`/`shell`): done; live
+  API smoke deferred to Phase 3.
+- Phase 3 (host-rooted secrets via microsandbox TLS intercept): pending.
 
 ## Building
 
@@ -38,6 +40,23 @@ cargo build -p agent-vm
 Requires Docker on the host. A `registry:2` container named
 `agent-vm-registry` will be created on first run and bound to
 `127.0.0.1:5000`.
+
+## Running an agent
+
+```bash
+cd your/project
+agent-vm claude        # or codex / opencode / shell
+agent-vm claude -- -p "fix the lint errors"  # forward args to the agent
+
+# Smoke / scripted use:
+agent-vm shell -- -c 'ls /workspace && claude --version'
+```
+
+The first arg after the subcommand is treated as input to the agent. Use
+`--` if any forwarded arg starts with `-` (otherwise clap will try to claim
+it). Project state lives in `~/.local/state/agent-vm/<hash>/` and survives
+between launches. Phase 2 supports auth via the `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY` env vars only; the OAuth-refresh path lands in Phase 3.
 
 Actually running a sandbox requires the microsandbox runtime prerequisites
 (Linux with KVM, or macOS Apple Silicon). See microsandbox's
