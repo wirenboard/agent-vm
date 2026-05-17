@@ -21,13 +21,11 @@ RUN apt-get update \
         jq \
         bash \
         python3 python3-pip \
-        ripgrep fd-find \
- && rm -rf /var/lib/apt/lists/*
+        ripgrep fd-find
 
 # Node.js 22 from NodeSource — needed for Claude Code, OpenCode, MCP servers.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends nodejs
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
