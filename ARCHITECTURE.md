@@ -435,3 +435,162 @@ credential-proxy works.
   `platform.claude.com/v1/oauth/token` and `auth.openai.com/oauth/token`
   endpoints and forge responses from re-reads of the host file. That's
   Phase 4.
+
+## Phase 4 — OAuth refresh: file-backed secrets + interceptor hook
+
+Phase 3 left a 401-then-die failure mode: when the captured access
+token expires mid-session the in-VM agent gets 401 from the API, tries
+to refresh against the OAuth endpoint with the placeholder refresh
+token, and gets 401 again. The user has to exit and re-launch.
+
+Phase 4 closes the loop end-to-end. Two upstream microsandbox
+extensions plus an agent-vm subprocess handle it.
+
+### Pieces
+
+```
+vendor/microsandbox/  (branch: agent-vm-secret-file)
+└── crates/network/lib/
+    ├── secrets/config.rs       # SecretValue::File (from Phase 3) is now actually used
+    └── intercept/              # new: per-route request-interceptor hook
+        ├── config.rs           #   InterceptConfig (rules + hook command)
+        └── handler.rs          #   per-connection state machine
+
+crates/agent-vm/src/
+├── msb_install.rs              # new: build patched msb from vendor; point MSB_PATH at it
+├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
+├── secrets.rs                  # switched from Static(token) to File(<state>/tokens/{anthropic,openai})
+└── run.rs                      # registers the interceptor with two rules
+```
+
+### Patched `msb` shipped via `MSB_PATH`
+
+`agent-vm setup` now runs
+`cargo build --release -p microsandbox-cli --bin msb` in
+`vendor/microsandbox` and leaves the artifact at
+`vendor/microsandbox/target/release/msb`. At startup, every agent-vm
+invocation sets `MSB_PATH` to that path (top of microsandbox's
+resolution ladder), so the patched binary is what actually runs the
+VM. The user's `~/.microsandbox/bin/msb` is never touched and
+upstream-installed tooling on the same host keeps using its own
+prebuilt.
+
+The real msb binary lives in the `microsandbox-cli` crate; the
+`microsandbox` crate has a separate `microsandbox` binary that's
+just a 5-line shim forwarding to `~/.microsandbox/bin/msb`. Building
+the wrong target produces a 389 KB shim that boots silently then
+hangs at VM init — about 30 minutes of debugging into a
+no-VMM-symbols-in-the-binary surprise. Recorded here so the next
+person doesn't redo it.
+
+### `SecretValue::File`
+
+Phase 3's per-launch snapshot becomes a per-launch *file write*. We
+write the host's `accessToken` to `<state>/tokens/anthropic` (and
+`.../openai`) with 0600 perms via atomic-write-then-rename. The
+launcher passes the file path to microsandbox as a `SecretValue::File`.
+
+The patched msb's TLS-intercept proxy calls `SecretValue::resolve()`
+at *connection-setup* time — every new TCP connection re-reads the
+file. So any host-side rotation (whether triggered by the user's
+external `claude` use or by our interceptor hook below) is visible
+to the very next request, without rebuilding the sandbox.
+
+### Request-interceptor hook (the OAuth refresh MITM)
+
+`microsandbox-network` gained an `InterceptConfig` that the launcher
+fills with:
+
+```rust
+.intercept(|i| i
+    .hook(["…/agent-vm", "_intercept-hook", "--state-dir", "…"])
+    .rule("platform.claude.com", "POST", "/v1/oauth/token")
+    .rule("auth.openai.com",     "POST", "/oauth/token"))
+```
+
+When the in-VM agent posts an OAuth refresh request, the proxy:
+
+1. Buffers the full request (it's tiny — <1 KB — so this is cheap
+   and capped at 64 KiB).
+2. Spawns the hook command with the request bytes on stdin and four
+   env vars (`MSB_INTERCEPT_SNI/_HOST_RULE/_METHOD/_PATH_PREFIX`).
+3. Reads the hook's stdout as the response and writes it back to the
+   guest, encrypted under the forged TLS cert.
+4. Closes the connection without ever touching the upstream server.
+
+The hook (`agent-vm _intercept-hook`) is the same binary in a hidden
+clap subcommand mode:
+
+1. Reads the request from stdin (sanity-checks it's `POST …`).
+2. Spawns `claude -p hi --model sonnet` (or `codex exec --skip-git-
+   repo-check 'Reply OK'`) on the **host** so the host CLI rotates
+   `~/.claude/.credentials.json` / `~/.codex/auth.json` the normal way.
+3. Re-reads the rotated host file, rewrites
+   `<state>/tokens/{anthropic,openai}` so the next non-refresh
+   request from the guest gets the new bearer via `SecretValue::File`.
+4. Synthesizes an OAuth refresh-response JSON shaped like what the
+   upstream server would return, but with **placeholder** strings in
+   the `access_token` / `refresh_token` fields. The in-VM agent
+   updates its credentials.json to those placeholders and continues.
+5. Writes the response to stdout, exits 0.
+
+The guest never holds a real token at any layer:
+- `~/.claude/.credentials.json` always contains placeholders (Phase 3).
+- The proxy substitutes real-for-placeholder on the way *out* (Phase 3).
+- The OAuth refresh response also returns placeholders (Phase 4).
+- The host CLI on the host is the only thing that ever touches real
+  OAuth machinery, and it writes to a file we re-read.
+
+### Hook-process boundary, not callback
+
+The interceptor uses a subprocess (fork+exec per request) rather than
+a callback into the SDK. Reasons:
+
+- `Vec<Box<dyn RequestInterceptor>>` isn't serializable. The
+  network config is JSON-piped from the SDK to a separate `msb`
+  process, so anything we configure on the SDK side has to round-trip
+  through JSON.
+- Refresh requests are rare (once per hour at worst). Fork-per-request
+  overhead is irrelevant against the latency of the host `claude`
+  invocation that the hook does anyway.
+- A subprocess can dispatch on any logic without us having to
+  re-extend microsandbox each time we add a provider.
+
+### Smoke verification
+
+```
+Inside the guest:
+  POST https://platform.claude.com/v1/oauth/token
+  body: {"grant_type":"refresh_token","refresh_token":"…PLACEHOLDER_REFRESH…"}
+
+Response:
+  HTTP 200 application/json
+  {"access_token":"MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1",
+   "refresh_token":"MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1",
+   "expires_in":3499, "token_type":"Bearer",
+   "scope":["user:file_upload","user:inference",…]}
+```
+
+Confirmed on the same nested-VM test host as Phase 3. The hook ran,
+host `claude -p` rotated the host file, the new bearer landed in
+`<state>/tokens/anthropic`, and the synthesized response reached the
+guest. `expires_in: 3499` is the freshly-derived seconds-until-expiry
+of the just-rotated token.
+
+### What Phase 4 deliberately doesn't do
+
+- **No proactive expiry timer.** Discussed and rejected: the
+  guest's own refresh attempt at 401-time triggers our hook, which
+  triggers the host-side refresh. If the user runs `claude` on the
+  host between sessions, the host file is already fresh and the
+  `SecretValue::File` re-read picks it up with no hook involved.
+  A timer would be belt-and-suspenders.
+- **No msb shipped via `~/.microsandbox/bin/msb`.** The MSB_PATH
+  override is per-agent-vm-invocation only; other microsandbox SDK
+  consumers on the same host keep using the upstream prebuilt.
+- **No single-flight for concurrent in-guest refreshes.** Two
+  concurrent refresh attempts could each spawn a host `claude -p`.
+  The host CLI's own file lock prevents corruption, so the worst
+  outcome is one extra `claude -p` invocation. If this becomes a
+  pain point, a `<state>/tokens/.refresh.lock` flock around the host
+  CLI invocation is two lines.

@@ -191,7 +191,7 @@ verified on the nested test host because of an outer credential bridge
 that itself substitutes placeholders. Structurally equivalent to the
 original Bash agent-vm's credential-proxy flow.
 
-### Phase 4 — Refresh semantics [pending]
+### Phase 4 — Refresh semantics [done — submodule branch `agent-vm-secret-file`, agent-vm commit pending]
 
 Tokens rotate; long-running sandbox sessions must survive that without
 re-attaching. Phase 3 makes the access token swappable in principle;

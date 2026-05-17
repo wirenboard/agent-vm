@@ -33,6 +33,15 @@ pub async fn run(args: Args) -> Result<()> {
 
     run_build_script()?;
 
+    // Phase 4: rebuild the microsandbox CLI binary from the vendored
+    // submodule. The upstream prebuilt at ~/.microsandbox/bin/msb is
+    // missing the SecretValue::File + request-interceptor support
+    // that the launcher needs. Result lives in vendor/microsandbox/
+    // target/release/microsandbox; subsequent agent-vm invocations
+    // pick it up via MSB_PATH (set in main.rs).
+    crate::msb_install::build_or_skip()?;
+    crate::msb_install::point_at_workspace_msb();
+
     // We just pushed a new manifest under the same tag; explicitly pull
     // it into microsandbox's cache so subsequent launches (which use
     // PullPolicy::IfMissing) see the latest layers without having to

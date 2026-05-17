@@ -28,8 +28,9 @@ until v1 of the rewrite ships.
   Real Claude/Codex tokens stay on the host; the in-VM agent only sees
   placeholders. See ARCHITECTURE.md "Phase 3" for the two-layer
   placeholder dance.
-- Phase 4 (token-refresh semantics + `msb` rebuild for
-  `SecretValue::File`): **next**.
+- Phase 4 (token-refresh semantics: rebuilt `msb`, file-backed
+  secrets, OAuth-endpoint interception): done. Long sessions survive
+  host token rotation without manual intervention.
 - Phase 5 (fast-launch via detached mode): deferred — see PLAN.md;
   snapshots don't help launch time, detached mode is a product-shape
   decision.

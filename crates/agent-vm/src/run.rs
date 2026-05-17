@@ -185,30 +185,49 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // each provider — we don't intercept the refresh flow yet (Phase 4),
     // but we need to allow the request through to avoid the secret
     // violation detector blocking attempts at refresh.
-    if creds.anthropic_access_token.is_some() || creds.openai_access_token.is_some() {
-        let anthropic = creds.anthropic_access_token.clone();
-        let openai = creds.openai_access_token.clone();
+    if creds.anthropic_token_file.is_some() || creds.openai_token_file.is_some() {
+        let anthropic = creds.anthropic_token_file.clone();
+        let openai = creds.openai_token_file.clone();
+        // Hook command: this very binary in "_intercept-hook" mode.
+        // microsandbox spawns it per matched request with the request
+        // bytes on stdin and reads the response from stdout.
+        let self_path = std::env::current_exe().context("std::env::current_exe")?;
+        let state_dir = session.state_dir.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
-            if let Some(tok) = anthropic {
+            if let Some(file) = anthropic {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
-                        .value(tok)
+                        .value(file)
                         .placeholder(crate::secrets::ANTHROPIC_PLACEHOLDER)
                         .allow_host("api.anthropic.com")
                         .allow_host("platform.claude.com")
                 });
             }
-            if let Some(tok) = openai {
+            if let Some(file) = openai {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_OPENAI_UNUSED")
-                        .value(tok)
+                        .value(file)
                         .placeholder(crate::secrets::OPENAI_PLACEHOLDER)
                         .allow_host("api.openai.com")
                         .allow_host("chatgpt.com")
                         .allow_host("auth.openai.com")
                 });
             }
+            // Interceptor hook: spawn `agent-vm _intercept-hook
+            // --state-dir <dir>` and let it answer OAuth refresh
+            // requests. See crate::intercept_hook for the response
+            // synthesis logic.
+            n = n.intercept(|i| {
+                i.hook([
+                    self_path.to_string_lossy().to_string(),
+                    "_intercept-hook".to_string(),
+                    "--state-dir".to_string(),
+                    state_dir.to_string_lossy().to_string(),
+                ])
+                .rule("platform.claude.com", "POST", "/v1/oauth/token")
+                .rule("auth.openai.com", "POST", "/oauth/token")
+            });
             n
         });
     }

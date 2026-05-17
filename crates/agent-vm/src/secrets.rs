@@ -2,23 +2,22 @@
 //!
 //! For each invocation we snapshot the host's Claude / Codex credential
 //! files, write placeholder credentials into the guest-side state
-//! directory, and return the real access tokens to the launcher. The
-//! launcher registers them as microsandbox secret entries so the real
-//! tokens are substituted into outgoing TLS-intercepted requests at the
-//! network layer — the guest never sees them.
+//! directory, and return the *path* of a per-project token file to the
+//! launcher. The launcher registers that path as a microsandbox
+//! `SecretValue::File` entry so the patched msb re-reads it on every
+//! connection-setup — host-side rotation is picked up on the next
+//! request without rebuilding the sandbox.
 //!
-//! Phase 3 captures the token **once at launch time** as a static
-//! string. Long-running sandboxes will lose auth when the host token
-//! expires; the access-token-rotation work lives in Phase 4 along with
-//! the cross-process plumbing needed for live file-backed secrets
-//! (SecretValue::File exists on our microsandbox fork branch but the
-//! prebuilt msb runtime daemon on the host hasn't been rebuilt to
-//! understand it yet).
+//! The token file is the same file the Phase 4 interceptor hook
+//! rewrites whenever the in-VM agent asks for an OAuth refresh.
 //!
-//! Placeholders are stable per-version so credentials JSON written by a
-//! prior invocation is still valid for the current one.
+//! Placeholders are stable per-version so credentials JSON written by
+//! a prior invocation is still valid for the current one.
 
-use std::{fs, path::Path, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -26,44 +25,37 @@ use serde_json::Value;
 pub const ANTHROPIC_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1";
 pub const OPENAI_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_ACCESS_TOKEN_v1";
 
-/// Result of [`refresh`]. `*_access_token` strings are only present if the
-/// host credential file was found and parsed successfully. They are
-/// short-lived — handed to the network builder and dropped once the
-/// sandbox config is materialized; we never log them.
-#[derive(Default)]
+/// Result of [`refresh`]. `*_token_file` paths only exist if the host
+/// credential file was found and parsed successfully.
+#[derive(Debug, Default, Clone)]
 pub struct CredsState {
-    pub anthropic_access_token: Option<String>,
-    pub openai_access_token: Option<String>,
+    pub anthropic_token_file: Option<PathBuf>,
+    pub openai_token_file: Option<PathBuf>,
 }
 
-impl std::fmt::Debug for CredsState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CredsState")
-            .field(
-                "anthropic_access_token",
-                &self.anthropic_access_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "openai_access_token",
-                &self.openai_access_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .finish()
-    }
+/// Per-project location of the token file the proxy re-reads.
+pub fn anthropic_token_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("tokens/anthropic")
 }
 
-/// Read host credentials and write placeholder guest credentials. Returns
-/// access tokens that the launcher passes to microsandbox as static
-/// secret values. Silently skips providers whose host file is missing or
-/// unparseable so a host with only Claude credentials still works.
+pub fn openai_token_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("tokens/openai")
+}
+
+/// Read host credentials, write the token file (atomically, 0600) and
+/// the guest-side placeholder credentials.json. Returns the paths to
+/// the written token files so the launcher can plumb them into
+/// microsandbox's SecretValue::File config.
 pub fn refresh(state_dir: &Path) -> Result<CredsState> {
-    let anthropic_access_token = match refresh_anthropic(state_dir) {
+    fs::create_dir_all(state_dir.join("tokens"))?;
+    let anthropic_token_file = match refresh_anthropic(state_dir) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
             None
         }
     };
-    let openai_access_token = match refresh_openai(state_dir) {
+    let openai_token_file = match refresh_openai(state_dir) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "openai credential refresh failed; skipping");
@@ -72,12 +64,12 @@ pub fn refresh(state_dir: &Path) -> Result<CredsState> {
     };
 
     Ok(CredsState {
-        anthropic_access_token,
-        openai_access_token,
+        anthropic_token_file,
+        openai_token_file,
     })
 }
 
-fn refresh_anthropic(state_dir: &Path) -> Result<Option<String>> {
+fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(host_path) = host_claude_creds_path() else {
         return Ok(None);
     };
@@ -95,8 +87,11 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<String>> {
     let access_token = oauth
         .get("accessToken")
         .and_then(|v| v.as_str())
-        .context("host claudeAiOauth missing accessToken")?
-        .to_string();
+        .context("host claudeAiOauth missing accessToken")?;
+
+    // Token file the proxy re-reads on every connection-setup.
+    let token_file = anthropic_token_path(state_dir);
+    atomic_write(&token_file, access_token.as_bytes(), 0o600)?;
 
     // Placeholder credentials.json the in-guest Claude reads. Goes
     // into <state>/claude which is symlinked from /root/.claude in
@@ -106,7 +101,7 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<String>> {
     let placeholder = serde_json::json!({
         "claudeAiOauth": {
             "accessToken": ANTHROPIC_PLACEHOLDER,
-            "refreshToken": "REFRESH_NOT_AVAILABLE_PHASE_3",
+            "refreshToken": "MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1",
             "expiresAt": oauth.get("expiresAt"),
             "scopes": oauth.get("scopes"),
             "subscriptionType": oauth.get("subscriptionType"),
@@ -116,10 +111,10 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<String>> {
     let body = serde_json::to_string_pretty(&placeholder)?;
     atomic_write(&claude_dir.join(".credentials.json"), body.as_bytes(), 0o600)?;
 
-    Ok(Some(access_token))
+    Ok(Some(token_file))
 }
 
-fn refresh_openai(state_dir: &Path) -> Result<Option<String>> {
+fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(host_path) = host_codex_auth_path() else {
         return Ok(None);
     };
@@ -139,6 +134,8 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<String>> {
         .or_else(|| json.get("OPENAI_API_KEY").and_then(|v| v.as_str()))
         .context("host codex auth missing tokens.access_token or OPENAI_API_KEY")?
         .to_string();
+    let token_file = openai_token_path(state_dir);
+    atomic_write(&token_file, access_token.as_bytes(), 0o600)?;
 
     // Replace the real value in-place with the placeholder, preserving
     // every other field (account_id, last_refresh, etc.) so the in-VM
@@ -153,7 +150,7 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<String>> {
         if tokens.contains_key("refresh_token") {
             tokens.insert(
                 "refresh_token".into(),
-                Value::String("REFRESH_NOT_AVAILABLE_PHASE_3".to_string()),
+                Value::String("MSB_PLACEHOLDER_OPENAI_REFRESH_TOKEN_v1".to_string()),
             );
         }
     }
@@ -166,7 +163,7 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<String>> {
     fs::create_dir_all(&codex_dir)?;
     atomic_write(&codex_dir.join("auth.json"), body.as_bytes(), 0o600)?;
 
-    Ok(Some(access_token))
+    Ok(Some(token_file))
 }
 
 fn host_claude_creds_path() -> Option<PathBuf> {

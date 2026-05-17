@@ -1,6 +1,8 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod image_check;
+mod intercept_hook;
+mod msb_install;
 mod pull;
 mod pull_progress;
 mod pulled_marker;
@@ -38,11 +40,22 @@ enum Cmd {
 
     /// Open a bash shell in a sandbox mounted at the project's host path.
     Shell(run::Args),
+
+    /// Internal: invoked by msb's interceptor hook for matched OAuth
+    /// refresh requests. Reads the request on stdin, writes an
+    /// HTTP response on stdout. Not meant for direct use.
+    #[command(name = "_intercept-hook", hide = true)]
+    InterceptHook(intercept_hook::Args),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    // Phase 4: prefer our locally-built msb that knows about
+    // SecretValue::File and the request-interceptor hook. No-op if
+    // the binary hasn't been built yet (run `agent-vm setup` to
+    // build it).
+    msb_install::point_at_workspace_msb();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Setup(args) => setup::run(args).await,
@@ -51,6 +64,7 @@ async fn main() -> Result<()> {
         Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
         Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
         Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
+        Cmd::InterceptHook(args) => intercept_hook::run(args),
     }
 }
 
