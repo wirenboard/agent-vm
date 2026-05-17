@@ -1,26 +1,28 @@
-//! Render microsandbox `PullProgress` events as a single byte-weighted bar.
+//! Render microsandbox `PullProgress` events as a two-phase line.
 //!
-//! The bar is sized in *bytes* rather than steps so the ETA reflects real
-//! work remaining. Total bytes = compressed-download bytes (known from
-//! `Resolved.total_download_bytes`) + uncompressed-materialize bytes
-//! (learned per layer from `LayerMaterializeProgress.total_bytes` as each
-//! layer starts being decompressed).
+//! Microsandbox's pull is two very different workloads back-to-back:
 //!
-//! Until we know the materialize sizes, we start with a 4× heuristic
-//! estimate (download:materialize ≈ 1:3 for typical Debian-based images)
-//! so the bar length doesn't visibly leap each time a new layer starts
-//! materializing. As real sizes come in, the bar length is corrected.
-//! Indicatif's ETA tracks bytes-per-second across both phases.
+//! 1. **Download.** Layers are fetched from the registry. For a local
+//!    registry this is over in ~1 s and microsandbox often skips
+//!    `LayerDownloadProgress` events entirely, so any bar we draw here
+//!    jumps from 0 to "done" in a single tick. The rate computed from that
+//!    burst is meaningless (and poisons the rate for the whole rest of the
+//!    pull, since indicatif's estimator averages it in).
+//!
+//! 2. **Materialize.** Each compressed layer is decompressed into an
+//!    EROFS image. This is CPU-bound and slow — minutes for the Node.js
+//!    layer alone — and fires `LayerMaterializeProgress` events every
+//!    ~256 KiB so the rate is genuinely informative.
+//!
+//! So we draw a spinner with text for phase 1 (no bar, no rate), then
+//! finish_and_clear it and start a fresh bar sized in materialize bytes
+//! for phase 2. The bar's rate and ETA only ever see materialize samples
+//! and stay honest.
 
 use std::collections::HashMap;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use microsandbox::sandbox::{PullProgress, PullProgressHandle};
-
-/// Heuristic: compressed download is roughly 1/(1+RATIO) of total bytes.
-/// 3 fits Debian-slim + Node.js images we've measured (350 MiB download,
-/// ~1.1 GiB materialized).
-const ESTIMATED_DECOMPRESS_RATIO: u64 = 3;
 
 /// Drive the progress UI to completion. Returns when the channel closes.
 pub async fn render(mut handle: PullProgressHandle) {
@@ -33,18 +35,20 @@ pub async fn render(mut handle: PullProgressHandle) {
 
 struct State {
     bar: ProgressBar,
+    phase: Phase,
     layer_count: usize,
-    /// Bytes downloaded per layer so we can compute deltas regardless of
-    /// whether microsandbox emitted any `LayerDownloadProgress` events.
-    dl_bytes: HashMap<usize, u64>,
-    /// Bytes materialized per layer for the same reason.
-    mat_bytes: HashMap<usize, u64>,
-    /// Per-layer materialize *total* once we learn it from the first
-    /// `LayerMaterializeProgress` for that layer.
+    dl_total_bytes: u64,
+    dl_done_bytes: HashMap<usize, u64>,
     mat_totals: HashMap<usize, u64>,
-    /// True if we've replaced the initial estimate with sum-of-known.
+    mat_done: HashMap<usize, u64>,
+    /// Sum of known materialize totals; the bar length tracks this.
     known_materialize_sum: u64,
-    estimated_materialize: u64,
+}
+
+enum Phase {
+    ResolveOrDownload,
+    Materialize,
+    Stitch,
 }
 
 impl State {
@@ -55,12 +59,13 @@ impl State {
         bar.enable_steady_tick(std::time::Duration::from_millis(120));
         Self {
             bar,
+            phase: Phase::ResolveOrDownload,
             layer_count: 0,
-            dl_bytes: HashMap::new(),
-            mat_bytes: HashMap::new(),
+            dl_total_bytes: 0,
+            dl_done_bytes: HashMap::new(),
             mat_totals: HashMap::new(),
+            mat_done: HashMap::new(),
             known_materialize_sum: 0,
-            estimated_materialize: 0,
         }
     }
 
@@ -74,14 +79,8 @@ impl State {
                 ..
             } => {
                 self.layer_count = layer_count;
-                let dl_total = total_download_bytes.unwrap_or(0);
-                self.estimated_materialize = dl_total.saturating_mul(ESTIMATED_DECOMPRESS_RATIO);
-                let initial_len = dl_total.saturating_add(self.estimated_materialize);
-                self.bar.set_length(initial_len.max(1));
-                self.bar.set_style(bar_style());
-                self.bar.set_message(format!("Downloading {layer_count} layers"));
-                // Keep steady_tick on so the {spinner} in the template
-                // animates between byte updates during slow materialize.
+                self.dl_total_bytes = total_download_bytes.unwrap_or(0);
+                self.set_download_message();
             }
 
             PullProgress::LayerDownloadProgress {
@@ -89,8 +88,8 @@ impl State {
                 downloaded_bytes,
                 ..
             } => {
-                let prev = self.dl_bytes.insert(layer_index, downloaded_bytes).unwrap_or(0);
-                self.bar.inc(downloaded_bytes.saturating_sub(prev));
+                self.dl_done_bytes.insert(layer_index, downloaded_bytes);
+                self.set_download_message();
             }
 
             PullProgress::LayerDownloadComplete {
@@ -98,16 +97,8 @@ impl State {
                 downloaded_bytes,
                 ..
             } => {
-                let prev = self.dl_bytes.insert(layer_index, downloaded_bytes).unwrap_or(0);
-                self.bar.inc(downloaded_bytes.saturating_sub(prev));
-                let done = self.dl_bytes.len();
-                if done < self.layer_count {
-                    self.bar.set_message(format!(
-                        "Downloading layer {}/{}",
-                        done + 1,
-                        self.layer_count
-                    ));
-                }
+                self.dl_done_bytes.insert(layer_index, downloaded_bytes);
+                self.set_download_message();
             }
 
             PullProgress::LayerDownloadVerifying { layer_index, .. } => {
@@ -119,6 +110,7 @@ impl State {
             }
 
             PullProgress::LayerMaterializeStarted { layer_index, .. } => {
+                self.enter_materialize_phase();
                 self.bar.set_message(format!(
                     "Materializing layer {}/{}",
                     layer_index + 1,
@@ -131,15 +123,13 @@ impl State {
                 bytes_read,
                 total_bytes,
             } => {
-                // First time we see this layer's total, fold it into the
-                // bar length: subtract our per-layer share of the estimate,
-                // add the real number.
+                self.enter_materialize_phase();
                 if self.mat_totals.insert(layer_index, total_bytes).is_none() {
                     self.known_materialize_sum =
                         self.known_materialize_sum.saturating_add(total_bytes);
-                    self.refresh_length();
+                    self.bar.set_length(self.known_materialize_sum.max(1));
                 }
-                let prev = self.mat_bytes.insert(layer_index, bytes_read).unwrap_or(0);
+                let prev = self.mat_done.insert(layer_index, bytes_read).unwrap_or(0);
                 self.bar.inc(bytes_read.saturating_sub(prev));
             }
 
@@ -152,49 +142,83 @@ impl State {
             }
 
             PullProgress::LayerMaterializeComplete { layer_index, .. } => {
-                // Ensure the bar reflects the full layer total even if the
-                // last Progress event was a few KiB short.
                 if let Some(&total) = self.mat_totals.get(&layer_index) {
-                    let prev = self.mat_bytes.insert(layer_index, total).unwrap_or(0);
+                    let prev = self.mat_done.insert(layer_index, total).unwrap_or(0);
                     self.bar.inc(total.saturating_sub(prev));
                 }
             }
 
             PullProgress::StitchMergingTrees { .. } => {
+                self.enter_stitch_phase();
                 self.bar.set_message("Stitching rootfs");
             }
             PullProgress::StitchWritingFsmeta => {
+                self.enter_stitch_phase();
                 self.bar.set_message("Writing fsmeta");
             }
             PullProgress::StitchWritingVmdk => {
+                self.enter_stitch_phase();
                 self.bar.set_message("Writing VMDK descriptor");
             }
             PullProgress::StitchComplete | PullProgress::Complete { .. } => {
+                self.enter_stitch_phase();
                 self.bar.set_message("Rootfs ready");
             }
         }
     }
 
-    /// Reshape the bar length: download_total (already in length) was
-    /// estimate_materialize, replace with what we now know plus the
-    /// estimate for layers we haven't seen yet.
-    fn refresh_length(&mut self) {
-        let dl_total: u64 = self.dl_bytes.values().sum::<u64>().max(
-            self.bar.length().unwrap_or(0).saturating_sub(self.estimated_materialize),
-        );
-        let unseen_layers = self
-            .layer_count
-            .saturating_sub(self.mat_totals.len()) as u64;
-        let per_layer_estimate = if self.layer_count > 0 {
-            self.estimated_materialize / (self.layer_count as u64)
+    fn set_download_message(&mut self) {
+        if !matches!(self.phase, Phase::ResolveOrDownload) {
+            return;
+        }
+        let downloaded: u64 = self.dl_done_bytes.values().sum();
+        let msg = if self.layer_count == 0 {
+            "Resolving image manifest".to_string()
+        } else if self.dl_total_bytes > 0 {
+            format!(
+                "Downloading {} of {} ({}/{} layers)",
+                HumanBytes(downloaded),
+                HumanBytes(self.dl_total_bytes),
+                self.dl_done_bytes.len(),
+                self.layer_count,
+            )
         } else {
-            0
+            format!(
+                "Downloading {} ({}/{} layers)",
+                HumanBytes(downloaded),
+                self.dl_done_bytes.len(),
+                self.layer_count,
+            )
         };
-        let pending_estimate = unseen_layers.saturating_mul(per_layer_estimate);
-        let new_len = dl_total
-            .saturating_add(self.known_materialize_sum)
-            .saturating_add(pending_estimate);
-        self.bar.set_length(new_len.max(1));
+        self.bar.set_message(msg);
+    }
+
+    fn enter_materialize_phase(&mut self) {
+        if matches!(self.phase, Phase::Materialize | Phase::Stitch) {
+            return;
+        }
+        self.phase = Phase::Materialize;
+        // Wipe the download spinner and replace it with a fresh bar so
+        // indicatif's rate/elapsed/ETA estimator starts measuring purely
+        // materialize bytes.
+        self.bar.finish_and_clear();
+        let bar = ProgressBar::new(1); // grows as layer totals arrive
+        bar.set_style(bar_style());
+        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        bar.set_message("Materializing rootfs");
+        self.bar = bar;
+    }
+
+    fn enter_stitch_phase(&mut self) {
+        if matches!(self.phase, Phase::Stitch) {
+            return;
+        }
+        self.phase = Phase::Stitch;
+        self.bar.finish_and_clear();
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(spinner_style());
+        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        self.bar = bar;
     }
 
     fn finish(&mut self) {
