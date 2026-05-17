@@ -46,9 +46,10 @@ infrastructure becomes either unnecessary or moves into a small Rust binary.
 ## Phased roadmap
 
 Each row is one PR; we stop after each phase, fill in `ARCHITECTURE.md`, then
-the user signs off on the next.
+the user signs off on the next. Per-phase status updates land in this file as
+each phase ships.
 
-### Phase 0 — Scaffolding
+### Phase 0 — Scaffolding [done — commits `cb4be40`, `4462180`]
 
 - Worktree on `rewrite-microsandbox`.
 - microsandbox added as a git submodule at `vendor/microsandbox` (tracking
@@ -56,25 +57,35 @@ the user signs off on the next.
 - Cargo workspace at the worktree root; `crates/agent-vm/` binary crate.
 - Hello-world `main.rs`: `Sandbox::builder("hello").image("alpine").create()`,
   run `echo`, stop.
-- `cargo check -p agent-vm` succeeds (runtime exec needs KVM and is out of
-  scope for the lint).
+- `cargo check -p agent-vm` succeeds.
 
 **Done when:** scaffold compiles, PLAN and ARCHITECTURE files exist, submodule
-is registered.
+is registered. Verified end-to-end on KVM: 2.7 s round-trip for boot/exec/
+teardown with the alpine image cached.
 
-### Phase 1 — OCI image
+### Phase 1 — OCI image [done — commit `d23c421`]
 
-- `images/Dockerfile`: Debian 13 base + `git curl wget jq build-essential
-  python3 python3-pip nodejs(22) ripgrep fd-find docker-cli` + the three agent
-  CLIs (`@anthropic-ai/claude-code`, `opencode-ai`, `@openai/codex`).
-- `images/build.sh` builds locally and tags `agent-vm:latest`. No registry
-  push in v1.
-- `agent-vm setup` subcommand wraps `images/build.sh`.
+- `images/Dockerfile`: Debian 13 slim + `ca-certificates curl wget git jq bash
+  python3 python3-pip ripgrep fd-find nodejs(22)` + the three agent CLIs
+  (`claude.ai/install.sh`, `opencode.ai/install`, `openai/codex install.sh`).
+  Deliberately minimal: no Docker, Chromium, LSP plugins, mitmproxy, gh,
+  Copilot — those stay deferred per the v1-scope-out list.
+- `images/build.sh` ensures a host-local `registry:2` container
+  (`agent-vm-registry` on `127.0.0.1:5000`) is running, then builds and pushes
+  `localhost:5000/agent-vm:latest`. (The original plan said "no registry push";
+  changed to registry push because microsandbox's image-cache and snapshot
+  semantics are keyed off OCI references — see ARCHITECTURE.md "Image
+  distribution" for the rationale.)
+- `agent-vm setup` is a clap subcommand that shells out to `images/build.sh`,
+  then verifies the freshly pushed image by booting it under microsandbox and
+  running `claude --version && opencode --version && codex --version`.
+  `--no-verify` and `--image`/`AGENT_VM_IMAGE_TAG` escape hatches included.
 
-**Done when:** `agent-vm setup` builds the image and `msb run agent-vm:latest
--- claude --version` succeeds.
+**Done when:** `agent-vm setup` builds the image and the verify sandbox
+reports the three agent versions. Result: Claude 2.1.143, OpenCode 1.15.3,
+codex-cli 0.130.0.
 
-### Phase 2 — Launcher MVP
+### Phase 2 — Launcher MVP [pending]
 
 - clap-based subcommand parser: `setup | claude | codex | opencode | shell`.
 - Project hash + state dir helper (`${XDG_STATE_HOME:-~/.local/state}/agent-vm
@@ -88,7 +99,7 @@ is registered.
 **Done when:** `cd repo && agent-vm claude -p "say hi"` returns a real Claude
 response from inside the sandbox.
 
-### Phase 3 — Static host-rooted secrets
+### Phase 3 — Static host-rooted secrets [pending]
 
 - Branch `vendor/microsandbox` to add a `SecretValue::File(PathBuf)` variant
   alongside the existing `String` value. The TLS-intercept proxy re-reads the
@@ -103,7 +114,7 @@ response from inside the sandbox.
 **Done when:** inside the guest, `cat /proc/$$/environ | tr '\0' '\n' | grep
 ANTHROPIC` shows only placeholders, while a real Claude request succeeds.
 
-### Phase 4 — Refresh semantics
+### Phase 4 — Refresh semantics [pending]
 
 - inotify (Linux) / kqueue (macOS) watcher on host creds files: when host
   Claude/Codex rotates tokens, we re-snapshot to the file microsandbox watches.
@@ -116,7 +127,7 @@ ANTHROPIC` shows only placeholders, while a real Claude request succeeds.
 **Done when:** a multi-hour session crosses a token rotation without the agent
 seeing an auth error.
 
-### Phase 5 — Polish & docs
+### Phase 5 — Polish & docs [pending]
 
 - `.agent-vm.runtime.sh` project hook.
 - `--memory N` flag (passed through to microsandbox builder).
@@ -139,3 +150,7 @@ seeing an auth error.
 4. **microsandbox changes go into the submodule, not vendored copies.** If we
    need to fork, we do it on a branch of `wirenboard/microsandbox` so the
    diff stays reviewable upstream.
+5. **Every phase updates three docs together.** PLAN.md gets the status
+   marker and any plan corrections. ARCHITECTURE.md gets the new design
+   subsection. README.md status list moves the phase from pending to done.
+   The commit message references the phase number.
