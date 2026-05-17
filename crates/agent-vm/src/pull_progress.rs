@@ -54,10 +54,12 @@ impl State {
             PullProgress::Resolved { layer_count, .. } => {
                 self.layer_count = layer_count;
                 self.downloaded = vec![false; layer_count];
-                self.bar.disable_steady_tick();
                 self.bar.set_length((layer_count as u64) * 2);
                 self.bar.set_style(bar_style());
                 self.bar.set_message(format!("Downloading {layer_count} layers"));
+                // Keep the steady tick on so the spinner in the bar template
+                // animates between layer-completes — the materialize step
+                // can take ~15s per layer with no other ticks.
             }
 
             PullProgress::LayerDownloadProgress { .. } => {
@@ -130,7 +132,7 @@ fn spinner_style() -> ProgressStyle {
 
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{bar:30.cyan/blue} {pos:>3}/{len:<3} steps  {wide_msg} eta {eta:>3}",
+        "{spinner:.cyan} {bar:30.cyan/blue} {pos:>3}/{len:<3} steps  {wide_msg} eta {eta:>3}",
     )
     .unwrap()
     .progress_chars("##-")
