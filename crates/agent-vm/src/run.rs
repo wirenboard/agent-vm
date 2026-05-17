@@ -219,11 +219,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let state_dir = session.state_dir.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
+            // We only ever substitute into Authorization: Bearer headers.
+            // Explicitly disable basic_auth so the proxy's per-chunk fast
+            // path can short-circuit when the placeholder isn't present
+            // — critical for post-WebSocket-upgrade binary frames where
+            // a UTF-8 lossy round trip would corrupt the bytes.
             if let Some(file) = anthropic {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
                         .value(file)
                         .placeholder(ANTHROPIC_ACCESS_PLACEHOLDER)
+                        .inject_basic_auth(false)
                         .allow_host(ANTHROPIC_API_HOST)
                         .allow_host(ANTHROPIC_OAUTH_HOST)
                 });
@@ -233,6 +239,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     s.env("MSB_AGENT_VM_OPENAI_UNUSED")
                         .value(file)
                         .placeholder(OPENAI_ACCESS_PLACEHOLDER)
+                        .inject_basic_auth(false)
                         .allow_host(OPENAI_API_HOST)
                         .allow_host(OPENAI_CHATGPT_HOST)
                         .allow_host(OPENAI_OAUTH_HOST)
