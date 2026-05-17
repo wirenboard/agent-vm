@@ -105,6 +105,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
     );
 
+    eprintln!(
+        "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
+    );
     let sandbox = builder
         .create()
         .await
@@ -113,6 +116,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let cmd = agent.command();
     let agent_args = args.agent_args;
     let exit = if std::io::stdin().is_terminal() {
+        eprintln!("==> Attaching to {cmd} (Ctrl-P Ctrl-Q to detach)");
         sandbox
             .attach(cmd, agent_args)
             .await
@@ -121,6 +125,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // No host TTY (piped, redirected, smoke-tested under `sg`/`sudo` etc.).
         // attach() needs a real /dev/tty for raw-mode stdin, so fall back to
         // collected exec. Output is forwarded once the command exits.
+        eprintln!("==> Running {cmd} in sandbox (no TTY; output appears after exit)");
         use tokio::io::AsyncWriteExt as _;
         let output = sandbox
             .exec_with(cmd, |e| e.args(agent_args).cwd("/workspace"))
@@ -135,6 +140,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         output.status().code
     };
 
+    eprintln!("==> Stopping sandbox");
     sandbox.stop_and_wait().await.ok();
     Sandbox::remove(&session.sandbox_name).await.ok();
 

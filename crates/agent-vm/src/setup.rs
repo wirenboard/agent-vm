@@ -66,6 +66,7 @@ fn build_script_path() -> Result<PathBuf> {
 
 async fn verify_image(image: &str) -> Result<()> {
     println!("==> Verifying {image}");
+    println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
     let sandbox = Sandbox::builder("agent-vm-setup-verify")
         .image(image)
         .registry(|r| r.insecure())
@@ -76,6 +77,7 @@ async fn verify_image(image: &str) -> Result<()> {
         .await
         .context("booting verify sandbox")?;
 
+    println!("==> Running claude/opencode/codex --version inside the sandbox");
     let out = sandbox
         .shell("claude --version && opencode --version && codex --version")
         .await
@@ -83,6 +85,7 @@ async fn verify_image(image: &str) -> Result<()> {
 
     println!("{}", out.stdout()?.trim_end());
 
+    println!("==> Stopping verify sandbox");
     sandbox.stop_and_wait().await.ok();
     Sandbox::remove("agent-vm-setup-verify").await.ok();
 
