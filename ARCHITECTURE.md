@@ -52,3 +52,24 @@ mid-rewrite refactor of `Cargo.toml`.
 Smallest possible exercise of the SDK that proves we can talk to the runtime.
 Alpine is in the microsandbox examples, downloads quickly, and exits cleanly.
 No need to involve our own image (that's Phase 1).
+
+### Phase 0 runtime validation
+
+`cargo run -p agent-vm` was exercised end-to-end on a Linux KVM host:
+
+- One-time setup required outside the source tree: `apt install libcap-ng-dev`
+  (link-time dep pulled in transitively by `msb_krun`'s `capng` crate), and
+  user membership in the `kvm` group so `/dev/kvm` is openable. Both are host
+  prerequisites and don't belong in the repo.
+- microsandbox's build script downloads its prebuilt runtime artifacts the
+  first time `cargo check` runs against the workspace
+  (`microsandbox@0.4.6: downloading microsandbox runtime dependencies`).
+  Nothing in our crate has to opt into this; the `prebuilt` feature is on by
+  default in `microsandbox-runtime`.
+- Wall-clock for the full boot + `echo` + teardown with the alpine image
+  already in cache: **2.7s** on a release build. Cold first run includes the
+  OCI pull on top.
+
+This is the latest point we can confirm we're talking to a real runtime before
+adding our own scaffolding; pinning the validation here means a Phase 1 image
+regression won't masquerade as an SDK-integration regression.
