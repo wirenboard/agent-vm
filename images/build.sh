@@ -66,7 +66,13 @@ recreate_registry() {
 #   - stopped/etc        → start; recreate if still unhealthy after start.
 ensure_registry() {
     local state
-    state=$(docker inspect --type container -f '{{.State.Status}}' "${REGISTRY_NAME}" 2>/dev/null || echo missing)
+    # `docker inspect` on a missing container can emit a stray blank line to
+    # stdout before exiting non-zero (seen on Docker 29.x), so `|| echo
+    # missing` alone yields "\nmissing" and never matches the case below.
+    # Strip all whitespace and treat empty as missing.
+    state=$(docker inspect --type container -f '{{.State.Status}}' "${REGISTRY_NAME}" 2>/dev/null || true)
+    state=$(printf '%s' "${state}" | tr -d '[:space:]')
+    [ -z "${state}" ] && state=missing
 
     case "${state}" in
         running)
