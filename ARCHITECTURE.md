@@ -459,7 +459,7 @@ vendor/microsandbox/  (branch: agent-vm-secret-file)
 crates/agent-vm/src/
 ├── msb_install.rs              # new: build patched msb from vendor; point MSB_PATH at it
 ├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
-├── secrets.rs                  # switched from Static(token) to File(<state>/tokens/{anthropic,openai})
+├── secrets.rs                  # switched from Static(token) to File(<state>.secrets/{anthropic,openai})
 └── run.rs                      # registers the interceptor with two rules
 ```
 
@@ -486,15 +486,43 @@ person doesn't redo it.
 ### `SecretValue::File`
 
 Phase 3's per-launch snapshot becomes a per-launch *file write*. We
-write the host's `accessToken` to `<state>/tokens/anthropic` (and
-`.../openai`) with 0600 perms via atomic-write-then-rename. The
-launcher passes the file path to microsandbox as a `SecretValue::File`.
+write the host's `accessToken` to a host-only secret file (see next
+subsection for *where*) with 0600 perms via atomic-write-then-rename.
+The launcher passes the file path to microsandbox as a
+`SecretValue::File`.
 
 The patched msb's TLS-intercept proxy calls `SecretValue::resolve()`
 at *connection-setup* time — every new TCP connection re-reads the
 file. So any host-side rotation (whether triggered by the user's
 external `claude` use or by our interceptor hook below) is visible
 to the very next request, without rebuilding the sandbox.
+
+### Token files live *outside* the guest bind mount
+
+The launcher bind-mounts the per-project `state_dir` into the guest at
+`/agent-vm-state` as a *single* mount (libkrun caps virtio IRQs, so we
+deliberately use one bind for all per-agent state instead of one per
+agent). That makes mount placement security-critical: **anything under
+`state_dir` is readable from inside the VM.**
+
+The real access-token files therefore must *not* live under
+`state_dir`. They sit in a sibling host-only directory
+`${state_root}/<hash>.secrets/` (mode 0700), derived from `state_dir`
+by `secrets::{anthropic,openai}_token_path` so the launcher and the
+refresh hook agree on the path without passing it explicitly. The
+microsandbox proxy reads these files on the *host* side via
+`SecretValue::File`, so they never need to be mounted into the guest at
+all.
+
+This was a real leak found during Phase 4 end-to-end verification: the
+first cut wrote the tokens to `<state>/tokens/{anthropic,openai}`, i.e.
+*inside* the mount, so `cat /agent-vm-state/tokens/anthropic` in the
+guest returned the host's real bearer — silently defeating the entire
+"real tokens never enter the VM" guarantee. The nested test host masked
+it (there the "real" token is itself the outer bridge's placeholder), so
+it only surfaced once we grepped the guest filesystem for the token
+during verification. A `token_files_live_outside_the_guest_mount` unit
+test now guards the invariant.
 
 ### Request-interceptor hook (the OAuth refresh MITM)
 
@@ -525,8 +553,8 @@ clap subcommand mode:
 2. Spawns `claude -p hi --model sonnet` (or `codex exec --skip-git-
    repo-check 'Reply OK'`) on the **host** so the host CLI rotates
    `~/.claude/.credentials.json` / `~/.codex/auth.json` the normal way.
-3. Re-reads the rotated host file, rewrites
-   `<state>/tokens/{anthropic,openai}` so the next non-refresh
+3. Re-reads the rotated host file, rewrites the host-only token file
+   (`<state>.secrets/{anthropic,openai}`) so the next non-refresh
    request from the guest gets the new bearer via `SecretValue::File`.
 4. Synthesizes an OAuth refresh-response JSON shaped like what the
    upstream server would return, but with **placeholder** strings in
@@ -536,6 +564,8 @@ clap subcommand mode:
 
 The guest never holds a real token at any layer:
 - `~/.claude/.credentials.json` always contains placeholders (Phase 3).
+- The real-token file is on the host *outside* the guest bind mount
+  (see "Token files live outside the guest bind mount").
 - The proxy substitutes real-for-placeholder on the way *out* (Phase 3).
 - The OAuth refresh response also returns placeholders (Phase 4).
 - The host CLI on the host is the only thing that ever touches real
@@ -573,7 +603,7 @@ Response:
 
 Confirmed on the same nested-VM test host as Phase 3. The hook ran,
 host `claude -p` rotated the host file, the new bearer landed in
-`<state>/tokens/anthropic`, and the synthesized response reached the
+`<state>.secrets/anthropic`, and the synthesized response reached the
 guest. `expires_in: 3499` is the freshly-derived seconds-until-expiry
 of the just-rotated token.
 

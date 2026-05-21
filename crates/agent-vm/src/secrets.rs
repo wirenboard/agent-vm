@@ -52,13 +52,35 @@ pub struct CredsState {
     pub openai_token_file: Option<PathBuf>,
 }
 
-/// Per-project location of the token file the proxy re-reads.
+/// Host-only directory holding the real access-token files the proxy
+/// re-reads via `SecretValue::File`.
+///
+/// **Must live outside `state_dir`.** The launcher bind-mounts
+/// `state_dir` into the guest at `/agent-vm-state` (a single mount, to
+/// stay under libkrun's virtio-IRQ cap), so anything written *under*
+/// `state_dir` is readable from inside the VM — a `cat
+/// /agent-vm-state/tokens/anthropic` would hand the in-VM agent the
+/// host's real token and defeat the entire point of Phase 3/4. The
+/// microsandbox proxy reads these files on the *host* side, so they
+/// never need to be mounted; we keep them in a sibling `<hash>.secrets/`
+/// directory that is never bind-mounted anywhere.
+fn host_secret_dir(state_dir: &Path) -> PathBuf {
+    let name = state_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    let parent = state_dir.parent().unwrap_or(state_dir);
+    parent.join(format!("{name}.secrets"))
+}
+
+/// Per-project location of the token file the proxy re-reads. Lives in
+/// the host-only [`host_secret_dir`], never inside the guest mount.
 pub fn anthropic_token_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("tokens/anthropic")
+    host_secret_dir(state_dir).join("anthropic")
 }
 
 pub fn openai_token_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("tokens/openai")
+    host_secret_dir(state_dir).join("openai")
 }
 
 /// Read host credentials, write the token file (atomically, 0600) and
@@ -66,7 +88,22 @@ pub fn openai_token_path(state_dir: &Path) -> PathBuf {
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretValue::File config.
 pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState> {
-    std::fs::create_dir_all(state_dir.join("tokens"))?;
+    // The token files hold the host's *real* access tokens, so their
+    // directory must never be bind-mounted into the guest. Create it
+    // 0700 in the host-only sibling location (see `host_secret_dir`).
+    let secret_dir = host_secret_dir(state_dir);
+    std::fs::create_dir_all(&secret_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", secret_dir.display()))?;
+    }
+    // Best-effort: an older agent-vm wrote token files to
+    // `state_dir/tokens/`, which is inside the guest bind mount. If a
+    // user upgrades over such a state dir, remove the stale dir so a real
+    // token doesn't linger where the guest can read it.
+    let _ = std::fs::remove_dir_all(state_dir.join("tokens"));
 
     // First-run bypasses, run regardless of whether the user has host
     // credentials for the provider. Without these the in-VM agent
@@ -288,4 +325,33 @@ fn write_default_codex_config(path: &Path) -> Result<()> {
                 approval_policy = \"never\"\n";
     f.write_all(body.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Security invariant: the real-token files must never live under
+    /// `state_dir`, because the launcher bind-mounts `state_dir` into the
+    /// guest at `/agent-vm-state`. A token file under that path would be
+    /// readable by the in-VM agent (`cat /agent-vm-state/tokens/...`),
+    /// defeating the whole "real tokens never enter the VM" design.
+    #[test]
+    fn token_files_live_outside_the_guest_mount() {
+        let state_dir = Path::new("/home/u/.local/state/agent-vm/abc123");
+        for token in [
+            anthropic_token_path(state_dir),
+            openai_token_path(state_dir),
+        ] {
+            assert!(
+                !token.starts_with(state_dir),
+                "{} must not be under the bind-mounted state dir {}",
+                token.display(),
+                state_dir.display(),
+            );
+            // ...but still derivable from it (same parent) so the launcher
+            // and the refresh hook agree on the path.
+            assert_eq!(token.parent().unwrap().parent(), state_dir.parent());
+        }
+    }
 }

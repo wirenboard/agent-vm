@@ -146,7 +146,7 @@ they're in already and doesn't redo the work.
   only after a successful pull, so an interrupted pull never leaves the
   microsandbox cache in an empty or stale state.
 
-### Phase 3 — Static host-rooted secrets [done — submodule branch `agent-vm-secret-file`, agent-vm commit pending]
+### Phase 3 — Static host-rooted secrets [done — submodule branch `agent-vm-secret-file`, committed `8cc036b`]
 
 The big architectural payoff of moving to microsandbox: real tokens
 never enter the VM.
@@ -191,7 +191,7 @@ verified on the nested test host because of an outer credential bridge
 that itself substitutes placeholders. Structurally equivalent to the
 original Bash agent-vm's credential-proxy flow.
 
-### Phase 4 — Refresh semantics [done — submodule branch `agent-vm-secret-file`, agent-vm commit pending]
+### Phase 4 — Refresh semantics [done — committed `8e262c0`..`c7f7386`; end-to-end verified + leak fixed this session]
 
 Tokens rotate; long-running sandbox sessions must survive that without
 re-attaching. Phase 3 makes the access token swappable in principle;
@@ -235,6 +235,38 @@ externally-rotated case.
 **Done when:** a multi-hour session crosses a token rotation
 end-to-end without the agent seeing an auth error and without manual
 intervention.
+
+**Verification session (2026-05-21):** stood the runtime back up on a
+fresh host (installed `libkrunfw` bundle + the patched
+`0.4.6+agent-vm.phase4` msb), rebuilt the image, and ran the launcher
+against a real host Claude credential. Findings:
+
+- **`images/build.sh` registry bug fixed.** Docker 29.x emits a stray
+  blank line to *stdout* on `docker inspect` of a missing container, so
+  `state=$(... || echo missing)` became `"\nmissing"` and never matched
+  the `missing` case — the script tried to `docker start` a nonexistent
+  container. Now whitespace-stripped with an empty→missing fallback.
+- **Real-token leak into the guest found + fixed.** The token files
+  were written under `state_dir`, which is bind-mounted into the guest
+  at `/agent-vm-state`, so `cat /agent-vm-state/tokens/anthropic`
+  returned the host bearer. Moved to a host-only sibling
+  `<hash>.secrets/` (0700), never mounted; added a guard test. See
+  ARCHITECTURE.md "Token files live outside the guest bind mount".
+- **Network layer verified.** Inside the guest, `credentials.json` and
+  PID1 environ show only placeholders; `api.anthropic.com`'s server
+  cert is issued by `CN=microsandbox CA` (traffic goes through the
+  intercept proxy). The final real-response leg still can't be checked
+  here — this is a doubly-nested host whose *outer* agent-vm bridge
+  already replaced the host token with its own placeholder
+  (`sk-ant-oat01-placeholder-proxy-managed`) and doesn't re-intercept
+  the nested VM's egress, so Anthropic returns 401. Same documented
+  limitation as Phase 3.
+- **Codex path not exercisable here:** no `~/.codex/auth.json` on this
+  host, so the OpenAI/Codex websocket flow (the original stop point)
+  can't be authenticated. The `chatgpt.com` WebSocket support
+  (`inject_basic_auth(false)` + zero-copy fast path) is in place and
+  the codex CLI (now 0.133.0) is present in the verified image, but a
+  host with real Codex credentials is needed to confirm it end-to-end.
 
 ### Phase 5 — Fast-launch (deferred — wrong instrument for the job)
 
