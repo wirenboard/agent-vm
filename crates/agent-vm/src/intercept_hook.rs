@@ -95,9 +95,18 @@ pub async fn run(args: Args) -> Result<()> {
         .any(|h| args.sni.eq_ignore_ascii_case(h))
     {
         let response = match github_smart_decision(&request, &args.allowed_repos) {
-            GithubSmartDecision::Passthrough => Vec::new(), // empty = passthrough
-            GithubSmartDecision::Deny(msg) => error_response(403, &msg),
-            GithubSmartDecision::Malformed => {
+            // Allow-listed: passthrough verbatim. Empty stdout tells
+            // the proxy to forward the buffered prefix unchanged;
+            // the secret layer swaps the placeholder for the real
+            // bearer.
+            GithubSmartOutcome::Authenticated => Vec::new(),
+            // Not allow-listed: passthrough with Authorization
+            // stripped. Non-empty, non-`HTTP/` stdout tells the
+            // proxy "forward THESE bytes instead." GitHub treats
+            // the request as third-party.
+            GithubSmartOutcome::Anonymous => strip_authorization_from_request(&request),
+            GithubSmartOutcome::Deny(msg) => error_response(403, &msg),
+            GithubSmartOutcome::Malformed => {
                 error_response(400, "agent-vm github smart-HTTP filter: malformed request")
             }
         };
@@ -155,22 +164,19 @@ async fn forward_github_api(
     let (method, path, headers, body) = parse_http_request(request)
         .context("parsing intercepted github request")?;
 
-    if !github_path_allowed(&method, &path, allowed_repos) {
-        return Ok(error_response(
-            403,
-            &format!(
-                "agent-vm: {method} {path:?} blocked by per-launch repo allow-list (read access is unrestricted; writes/mutations are scoped). Allowed repos: {}",
-                if allowed_repos.is_empty() {
-                    "(none — pass --repo OWNER/NAME or run inside a project with a github remote)".into()
-                } else {
-                    allowed_repos.join(", ")
-                }
-            ),
-        ));
+    let access = github_access(&method, &path, allowed_repos);
+    if let GithubAccess::Deny(reason) = &access {
+        return Ok(error_response(403, reason));
     }
+    let forward_with_auth = matches!(access, GithubAccess::Authenticated);
 
-    let real_token = read_gh_token(state_dir)
-        .context("reading <state>.secrets/gh")?;
+    // Only need to read the real token if we're going to forward with
+    // auth. Anonymous requests don't need it.
+    let real_token = if forward_with_auth {
+        read_gh_token(state_dir).context("reading <state>.secrets/gh")?
+    } else {
+        String::new()
+    };
 
     let url = format!("https://{}{}", secrets::GITHUB_API_HOST, path);
 
@@ -202,25 +208,29 @@ async fn forward_github_api(
         }
         if lower == "authorization" {
             had_authorization = true;
-            // Substitute the placeholder → real token. Two forms:
-            //   - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` —
-            //     literal substring, handled by `replace`.
-            //   - `Basic base64(x-access-token:<PLACEHOLDER>)` —
-            //     the placeholder is base64-encoded, so a literal
-            //     replace finds nothing. Decode, substitute, re-
-            //     encode. Review finding #12.
-            let v = substitute_authorization_header(value, &real_token);
-            req = req.header("Authorization", v);
-        } else {
-            req = req.header(name, value);
+            if forward_with_auth {
+                // Substitute the placeholder → real token. Two forms:
+                //   - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` —
+                //     literal substring, handled by `replace`.
+                //   - `Basic base64(x-access-token:<PLACEHOLDER>)` —
+                //     the placeholder is base64-encoded, so a literal
+                //     replace finds nothing. Decode, substitute, re-
+                //     encode.
+                let v = substitute_authorization_header(value, &real_token);
+                req = req.header("Authorization", v);
+            }
+            // Anonymous: do NOT forward an Authorization header.
+            // The guest sent the placeholder; we drop it. GitHub
+            // then sees a third-party request.
+            continue;
         }
+        req = req.header(name, value);
     }
-    // If the guest sent no Authorization header at all (some scripts
-    // strip it before retry), inject a Bearer with the real token —
-    // we've already checked the path against the allow-list, and the
-    // alternative is silently anonymous traffic that gets a 401 and
-    // confuses the agent. Review finding #11/#12.
-    if !had_authorization {
+    if forward_with_auth && !had_authorization {
+        // Guest sent no Authorization at all but the path is
+        // allow-listed. Inject a Bearer with the real token — the
+        // alternative is sending a silently-anonymous request that
+        // gets 401, masking the agent's intent.
         req = req.header("Authorization", format!("Bearer {real_token}"));
     }
     if !body.is_empty() {
@@ -297,190 +307,242 @@ fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String
     Ok((method, path, headers, body))
 }
 
-/// Method+path-based allow-list check for api.github.com requests.
+/// Result of a GitHub access-policy decision.
 ///
-/// **Policy:** read-only access is unrestricted (agents commonly need
-/// to read arbitrary public/private GitHub state — browse a different
-/// repo, look up an API, fetch a README, check who reviewed a PR).
-/// Only **write / management** operations are scoped to the per-launch
-/// allow-list, mirroring the user's actual concern: "don't let the
-/// agent push to / mutate repos I didn't list."
+/// - `Authenticated` — forward with the user's real token (the proxy
+///   substitutes `GH_TOKEN_PLACEHOLDER` for the host bearer on the
+///   wire).
+/// - `Anonymous` — forward WITHOUT the Authorization header. GitHub
+///   then sees a third-party / unauthenticated request and serves
+///   exactly what an external visitor would: public state succeeds,
+///   private state returns 404 / 401, writes get 401.
+/// - `Deny(reason)` — synthesize a 403 with `reason` (used for `..`
+///   path traversal; otherwise the policy never denies outright, it
+///   defers to GitHub's own auth enforcement).
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum GithubAccess {
+    Authenticated,
+    Anonymous,
+    Deny(String),
+}
+
+/// Policy decision for an api.github.com request.
 ///
-/// Allowed unconditionally:
-/// - Any `GET` or `HEAD` request (read-only).
-/// - `POST /graphql` (gh PR/issue/etc. creation uses this). We do
-///   **not** body-filter GraphQL mutations — that needs the request
-///   body which the streaming intercept path doesn't see. Documented
-///   gap: an agent that crafts a GraphQL mutation can do anything the
-///   token can.
-/// - `POST /markdown` (utility, no state change).
-/// - `POST /user/repos`, `POST /repos/<owner>/<repo>/forks`,
-///   `POST /repos/<owner>/<repo>/transfer` and similar repo-creation
-///   shapes: these create new repos owned by the user — not "mutating
-///   someone else's repo." Allowed.
+/// **Spec:** "allow-listed repos get my access; everything else gets
+/// the same access a third-party / anonymous account would have."
 ///
-/// Write methods on `/repos/<owner>/<repo>/*`:
-/// - Allowed only when `<owner>/<repo>` (case-insensitive) is in
-///   the allow-list. Catches PR creation, issue creation, comments,
-///   merges, branch protection edits, releases, deletes — anything
-///   that mutates a specific repo's state.
+/// Strategy: instead of trying to enumerate which paths are
+/// public-vs-private (which would lag GitHub's API and break on every
+/// surface change), we delegate to GitHub itself by **stripping the
+/// Authorization header** for any request not naming an allow-listed
+/// repo. GitHub then enforces public-vs-private as it does for
+/// unauthenticated traffic.
 ///
-/// Traversal: any `..` path segment is rejected up front so a
-/// crafted `/repos/<allowed>/<repo>/../../<victim>/<private>` can't
-/// pass the prefix check and let GitHub resolve `..` upstream.
-///
-/// Anything else (write methods to paths outside /repos/ that aren't
-/// in the explicit allow list above) → deny by default.
-fn github_path_allowed(method: &str, path: &str, allowed: &[String]) -> bool {
+/// Path-shape decisions:
+/// - `/repos/<owner>/<repo>/...`: Authenticated iff `<owner>/<repo>`
+///   is in the allow-list; otherwise Anonymous.
+/// - `/user`, `/user/orgs`, `/user/orgs/...`: Authenticated. The
+///   basic identity probe is what `gh auth status` needs; org list
+///   is what `gh repo view org/x` uses.
+/// - `/user/repos`, `/user/keys`, `/user/emails`, `/user/gpg_keys`,
+///   any other `/user/*`: Anonymous (will 401 — matches "third
+///   party can't see this").
+/// - `/graphql`, `/search/*`, `/rate_limit`, `/meta`, `/markdown`:
+///   Authenticated (utility endpoints; the GraphQL gap is the same
+///   v1 limitation as before — bodies aren't filterable).
+/// - `/users/<x>`, `/orgs/<x>`, `/notifications`, anything else:
+///   Anonymous (third-party-visible info; private state hidden by
+///   GitHub).
+/// - `..` traversal anywhere: Deny.
+fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
     let p = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
 
-    // Reject `..` traversal anywhere. GitHub server-normalises `..`
-    // and would otherwise resolve to a different repo than the one
-    // we checked.
+    // Reject `..` traversal anywhere. GitHub server-normalises `..`,
+    // so a crafted `/repos/<allowed>/.../../<victim>/private` could
+    // otherwise resolve upstream to a different repo than we
+    // approved. Cheap to reject up front for any method.
     for seg in p.split('/') {
         if seg == ".." {
-            return false;
-        }
-    }
-
-    // Reads — unrestricted.
-    if matches!(method, "GET" | "HEAD") {
-        return true;
-    }
-
-    // GraphQL: allow (no body-level filtering in v1).
-    if p == "/graphql" {
-        return true;
-    }
-
-    // Utility / write-but-not-other-repo-mutating endpoints.
-    if matches!(p, "/markdown" | "/user/repos") {
-        return true;
-    }
-
-    // Repo-scoped writes: only against the allow-list.
-    if let Some(rest) = p.strip_prefix("/repos/") {
-        let mut it = rest.split('/');
-        let owner = it.next().unwrap_or("");
-        let repo = it.next().unwrap_or("");
-        if owner.is_empty() || repo.is_empty() {
-            return false;
-        }
-        let slug = format!("{owner}/{repo}");
-        return allowed.iter().any(|a| a.eq_ignore_ascii_case(&slug));
-    }
-
-    // Anything else (writes outside the explicit allow set above) is
-    // denied. Reaching here means a write to e.g. /user/keys, /orgs/X
-    // settings, /admin/* — none of which is a normal gh CLI flow.
-    false
-}
-
-/// Decision for a request to a git-smart-HTTP host (github.com /
-/// codeload / raw / objects).
-#[cfg_attr(test, derive(Debug))]
-enum GithubSmartDecision {
-    /// Path matches the allow-list: tell the proxy to passthrough
-    /// (empty hook stdout).
-    Passthrough,
-    /// Path is outside the allow-list: synthesize a 403 with `reason`.
-    Deny(String),
-    /// Couldn't parse the request well enough to decide; fall back to
-    /// a 400. Rare, indicates a non-HTTP or truncated request.
-    Malformed,
-}
-
-/// Check the first line of `request` against the per-launch repo
-/// allow-list, applying the same read-unrestricted / writes-scoped
-/// policy as the REST API: clone and fetch (`git-upload-pack`,
-/// codeload archives, raw blobs) are allowed against any repo;
-/// push (`git-receive-pack`) is scoped.
-///
-/// github.com smart-HTTP URLs (in scope for filtering):
-///
-///   GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack   ← read
-///   POST /<owner>/<repo>.git/git-upload-pack                      ← read
-///   GET  /<owner>/<repo>.git/info/refs?service=git-receive-pack  ← write (push handshake)
-///   POST /<owner>/<repo>.git/git-receive-pack                     ← write (push data)
-///
-/// codeload, raw, objects host paths look like
-/// `/<owner>/<repo>/...` and are always read-only — `git clone` /
-/// `git fetch` and tarball downloads. Allowed unconditionally; no
-/// owner/repo check.
-fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmartDecision {
-    let line_end = match request.windows(2).position(|w| w == b"\r\n") {
-        Some(p) => p,
-        None => return GithubSmartDecision::Malformed,
-    };
-    let line = match std::str::from_utf8(&request[..line_end]) {
-        Ok(s) => s,
-        Err(_) => return GithubSmartDecision::Malformed,
-    };
-    // METHOD path HTTP/1.1
-    let mut parts = line.split_ascii_whitespace();
-    let method = match parts.next() {
-        Some(m) => m,
-        None => return GithubSmartDecision::Malformed,
-    };
-    let path = match parts.next() {
-        Some(p) => p,
-        None => return GithubSmartDecision::Malformed,
-    };
-    let (path_no_query, query) = match path.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (path, ""),
-    };
-    let trimmed = path_no_query.trim_start_matches('/');
-
-    // Reject `..` traversal up front. Server normalisation would
-    // otherwise pick a different repo than the one we checked.
-    for seg in trimmed.split('/') {
-        if seg == ".." {
-            return GithubSmartDecision::Deny(format!(
+            return GithubAccess::Deny(format!(
                 "agent-vm: path {path:?} contains '..' (traversal rejected)"
             ));
         }
     }
 
-    // Identify the *operation*. Only the write paths need an allow-
-    // list check; everything else (reads, browsing, archive downloads)
-    // passes through.
-    let is_push_data = method == "POST" && path_no_query.ends_with("/git-receive-pack");
-    let is_push_handshake = method == "GET"
-        && path_no_query.ends_with("/info/refs")
-        && query.split('&').any(|kv| kv == "service=git-receive-pack");
-    if !(is_push_data || is_push_handshake) {
-        // Read / clone / fetch / browse / archive — allowed against
-        // any repo.
-        return GithubSmartDecision::Passthrough;
+    // Repo-scoped: allow-list determines auth.
+    if let Some(rest) = p.strip_prefix("/repos/") {
+        let mut it = rest.split('/');
+        let owner = it.next().unwrap_or("");
+        let repo = it.next().unwrap_or("");
+        if owner.is_empty() || repo.is_empty() {
+            // Malformed /repos/ path — go anonymous; GitHub returns 404.
+            return GithubAccess::Anonymous;
+        }
+        let slug = format!("{owner}/{repo}");
+        if allowed.iter().any(|a| a.eq_ignore_ascii_case(&slug)) {
+            return GithubAccess::Authenticated;
+        }
+        // Method doesn't matter — third-party reads work for public
+        // repos via Anonymous; writes 401, which is correct.
+        return GithubAccess::Anonymous;
     }
 
-    // It's a push. Extract owner/repo from the first two path
-    // segments and check the allow-list.
+    // Identity / org-membership probe: keep auth so gh CLI works.
+    if p == "/user" || p == "/user/orgs" || p.starts_with("/user/orgs/") {
+        return GithubAccess::Authenticated;
+    }
+
+    // All other /user/* paths leak host-user state to the agent if
+    // we forward auth. Strip → GitHub returns 401, which matches the
+    // user's spec ("third party wouldn't have access").
+    if p.starts_with("/user/") {
+        // Reads: GET /user/repos (private repo inventory), /user/keys,
+        // /user/emails, /user/gpg_keys, etc. Writes: POST /user/keys,
+        // DELETE /user/keys/N, etc. All go anonymous → 401.
+        let _ = method;
+        return GithubAccess::Anonymous;
+    }
+
+    // Utility endpoints — small, low-risk, gh-tooling-friendly.
+    if matches!(
+        p,
+        "/graphql" | "/rate_limit" | "/meta" | "/markdown" | "/notifications"
+    ) || p.starts_with("/search")
+    {
+        return GithubAccess::Authenticated;
+    }
+
+    // /users/<x>, /orgs/<x>, /repositories (id-based listing),
+    // /licenses, /gitignore/templates, /emojis, /feeds, /events, …
+    // — all third-party-visible read surfaces. Anonymous is fine.
+    GithubAccess::Anonymous
+}
+
+/// Outcome of the smart-HTTP filter pass:
+/// - `Authenticated`: passthrough verbatim (empty hook stdout — the
+///   network secret-substitution layer swaps the placeholder for the
+///   real bearer on the wire).
+/// - `Anonymous`: passthrough with the buffered request's
+///   Authorization header stripped (the new "modified passthrough"
+///   verdict). GitHub then serves what an unauthenticated visitor
+///   would see — public refs / blobs, 401 on private repos and
+///   pushes.
+/// - `Deny(reason)`: synthesized 403 (only on `..` traversal).
+/// - `Malformed`: synthesized 400.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum GithubSmartOutcome {
+    Authenticated,
+    Anonymous,
+    Deny(String),
+    Malformed,
+}
+
+/// Decide what to do with a git-smart-HTTP request to github.com /
+/// codeload / raw / objects.
+///
+/// **Spec:** allow-listed repo → my access (Authenticated); any other
+/// repo → third-party access (Anonymous). GitHub itself then enforces
+/// public-vs-private: clone of a public repo works, clone of a
+/// private non-allow-listed repo gets 401, push to any non-allow-
+/// listed repo gets 401.
+///
+/// URL shapes that we look at:
+///   GET  /<owner>/<repo>.git/info/refs?service=git-{upload,receive}-pack
+///   POST /<owner>/<repo>.git/git-{upload,receive}-pack
+///   GET  /<owner>/<repo>/...                      (codeload / raw / objects)
+fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmartOutcome {
+    let line_end = match request.windows(2).position(|w| w == b"\r\n") {
+        Some(p) => p,
+        None => return GithubSmartOutcome::Malformed,
+    };
+    let line = match std::str::from_utf8(&request[..line_end]) {
+        Ok(s) => s,
+        Err(_) => return GithubSmartOutcome::Malformed,
+    };
+    let mut parts = line.split_ascii_whitespace();
+    let _method = match parts.next() {
+        Some(m) => m,
+        None => return GithubSmartOutcome::Malformed,
+    };
+    let path = match parts.next() {
+        Some(p) => p,
+        None => return GithubSmartOutcome::Malformed,
+    };
+    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let trimmed = path_no_query.trim_start_matches('/');
+
+    for seg in trimmed.split('/') {
+        if seg == ".." {
+            return GithubSmartOutcome::Deny(format!(
+                "agent-vm: path {path:?} contains '..' (traversal rejected)"
+            ));
+        }
+    }
+
+    // Extract owner/repo from the first two path segments. Strip a
+    // single trailing `.git` (git smart paths are `<repo>.git/...`).
     let mut it = trimmed.split('/');
     let owner = it.next().unwrap_or("");
     let repo_raw = it.next().unwrap_or("");
     if owner.is_empty() || repo_raw.is_empty() {
-        return GithubSmartDecision::Deny(format!(
-            "agent-vm: push path {path:?} doesn't name an owner/repo"
-        ));
+        // Can't tell which repo — go anonymous, GitHub serves whatever
+        // is public at that URL (typically 404 for malformed paths).
+        return GithubSmartOutcome::Anonymous;
     }
-    // Strip a single trailing `.git`; git smart paths are
-    // `<repo>.git/...`. `strip_suffix` removes exactly one.
     let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
     let slug = format!("{owner}/{repo}");
     if allowed_repos.iter().any(|a| a.eq_ignore_ascii_case(&slug)) {
-        GithubSmartDecision::Passthrough
+        GithubSmartOutcome::Authenticated
     } else {
-        GithubSmartDecision::Deny(format!(
-            "agent-vm: push to {slug:?} blocked by per-launch repo allow-list (reads are unrestricted; pushes are scoped). Allowed: {}",
-            if allowed_repos.is_empty() {
-                "(none)".into()
-            } else {
-                allowed_repos.join(", ")
-            }
-        ))
+        GithubSmartOutcome::Anonymous
     }
+}
+
+/// Return `request` with the `Authorization` header line removed.
+/// Used to convert a buffered authenticated request into an
+/// "anonymous" request that we can hand back to the proxy via the
+/// passthrough-with-modified-bytes verdict.
+///
+/// Operates byte-precise on the header block (terminator
+/// `\r\n\r\n`), preserves the request body verbatim, doesn't try to
+/// re-parse anything else. Case-insensitive on the header name.
+fn strip_authorization_from_request(request: &[u8]) -> Vec<u8> {
+    let hdr_end = match request.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => p,
+        None => return request.to_vec(), // malformed; pass through
+    };
+    let (head, rest) = request.split_at(hdr_end);
+    // rest starts with "\r\n\r\n"; keep that + body verbatim.
+
+    let mut out: Vec<u8> = Vec::with_capacity(request.len());
+    let mut cursor = 0usize;
+    // Iterate header lines, skipping any whose name is "authorization".
+    // Note: the LAST header in `head` typically has no trailing \r\n
+    // (its CRLF is in `rest` as part of the \r\n\r\n separator) — so
+    // we handle that case explicitly, checking auth before deciding
+    // whether to emit it.
+    while cursor < head.len() {
+        let (line, next_cursor, has_trailing_crlf) =
+            match head[cursor..].windows(2).position(|w| w == b"\r\n") {
+                Some(p) => (&head[cursor..cursor + p], cursor + p + 2, true),
+                None => (&head[cursor..], head.len(), false),
+            };
+        let is_auth = line
+            .iter()
+            .position(|&b| b == b':')
+            .map(|colon| line[..colon].eq_ignore_ascii_case(b"authorization"))
+            .unwrap_or(false);
+        if !is_auth {
+            out.extend_from_slice(line);
+            if has_trailing_crlf {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        cursor = next_cursor;
+    }
+    // Append the body separator + body unchanged.
+    out.extend_from_slice(rest);
+    out
 }
 
 fn read_gh_token(state_dir: &Path) -> Result<String> {
@@ -718,143 +780,179 @@ mod tests {
         slugs.iter().map(|s| s.to_string()).collect()
     }
 
-    // ── github_path_allowed: reads ────────────────────────────────
+    // ── github_access: allow-listed = my access ───────────────────
 
     #[test]
-    fn gh_reads_are_unrestricted_any_repo() {
+    fn gh_access_allow_listed_repo_is_authenticated() {
         let allowed = al(&["wirenboard/agent-vm"]);
-        // GET on a NOT-allow-listed repo: allow.
-        assert!(github_path_allowed("GET", "/repos/octocat/Hello-World", &allowed));
-        assert!(github_path_allowed("GET", "/repos/octocat/Hello-World/issues", &allowed));
-        assert!(github_path_allowed("GET", "/repos/some-other/repo/contents/README.md", &allowed));
-        assert!(github_path_allowed("HEAD", "/repos/anyone/anything", &allowed));
-        // /user/* reads — including the ones the previous policy
-        // narrowed away.
-        assert!(github_path_allowed("GET", "/user", &allowed));
-        assert!(github_path_allowed("GET", "/user/repos", &allowed));
-        assert!(github_path_allowed("GET", "/user/keys", &allowed));
-        assert!(github_path_allowed("GET", "/user/emails", &allowed));
-        // Search, /orgs/<x>, /notifications all read-only — allow.
-        assert!(github_path_allowed("GET", "/search/issues?q=foo", &allowed));
-        assert!(github_path_allowed("GET", "/orgs/some-org", &allowed));
-        assert!(github_path_allowed("GET", "/notifications", &allowed));
-    }
-
-    // ── github_path_allowed: writes ──────────────────────────────
-
-    #[test]
-    fn gh_writes_to_allow_listed_repo_pass() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        for m in ["POST", "PATCH", "PUT", "DELETE"] {
-            assert!(
-                github_path_allowed(m, "/repos/wirenboard/agent-vm/issues", &allowed),
-                "{m} on allow-listed repo should pass"
+        for m in ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"] {
+            assert_eq!(
+                github_access(m, "/repos/wirenboard/agent-vm", &allowed),
+                GithubAccess::Authenticated,
+                "{m} /repos/wirenboard/agent-vm should be Authenticated"
             );
-            assert!(github_path_allowed(
-                m,
-                "/repos/wirenboard/agent-vm/pulls/1/merge",
-                &allowed
-            ));
-        }
-    }
-
-    #[test]
-    fn gh_writes_to_other_repo_are_denied() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        for m in ["POST", "PATCH", "PUT", "DELETE"] {
-            assert!(
-                !github_path_allowed(m, "/repos/octocat/Hello-World/issues", &allowed),
-                "{m} on non-allow-listed repo should be denied"
+            assert_eq!(
+                github_access(m, "/repos/wirenboard/agent-vm/issues", &allowed),
+                GithubAccess::Authenticated,
             );
         }
     }
 
     #[test]
-    fn gh_allow_list_match_is_case_insensitive() {
+    fn gh_access_other_repo_is_anonymous_any_method() {
+        // The whole point: a non-allow-listed repo gets third-party
+        // access. GitHub itself enforces public/private — public
+        // reads succeed, private 404s, writes 401.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for m in ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"] {
+            assert_eq!(
+                github_access(m, "/repos/octocat/Hello-World", &allowed),
+                GithubAccess::Anonymous,
+                "{m} on non-allow-listed repo should be Anonymous"
+            );
+            assert_eq!(
+                github_access(m, "/repos/private/something/issues", &allowed),
+                GithubAccess::Anonymous,
+            );
+        }
+    }
+
+    #[test]
+    fn gh_access_allow_list_match_is_case_insensitive() {
         let allowed = al(&["WirenBoard/Agent-VM"]);
-        assert!(github_path_allowed(
-            "POST",
-            "/repos/wirenboard/agent-vm/issues",
-            &allowed
-        ));
-        assert!(github_path_allowed(
-            "DELETE",
-            "/repos/WIRENBOARD/AGENT-VM",
-            &allowed
-        ));
+        assert_eq!(
+            github_access("POST", "/repos/wirenboard/agent-vm/issues", &allowed),
+            GithubAccess::Authenticated,
+        );
+        assert_eq!(
+            github_access("DELETE", "/repos/WIRENBOARD/AGENT-VM", &allowed),
+            GithubAccess::Authenticated,
+        );
     }
 
     #[test]
-    fn gh_graphql_post_is_allowed() {
-        // GraphQL is the v1 gap (no body-level filtering); allow.
-        assert!(github_path_allowed("POST", "/graphql", &[]));
-        assert!(github_path_allowed("POST", "/graphql", &al(&["x/y"])));
+    fn gh_access_user_identity_endpoints_authenticated() {
+        // gh auth status / gh repo view org/x need these.
+        let allowed = al(&[]);
+        assert_eq!(github_access("GET", "/user", &allowed), GithubAccess::Authenticated);
+        assert_eq!(
+            github_access("GET", "/user/orgs", &allowed),
+            GithubAccess::Authenticated
+        );
+        assert_eq!(
+            github_access("GET", "/user/orgs/123", &allowed),
+            GithubAccess::Authenticated
+        );
     }
 
     #[test]
-    fn gh_utility_writes_are_allowed() {
-        // POST /markdown: server-side rendering, no state change.
-        assert!(github_path_allowed("POST", "/markdown", &[]));
-        // POST /user/repos: create a new repo owned by the user.
-        // Not a mutation of someone else's repo.
-        assert!(github_path_allowed("POST", "/user/repos", &[]));
+    fn gh_access_user_pii_endpoints_are_anonymous() {
+        // Per spec: third party can't see /user/repos (would reveal
+        // private repo inventory), /user/keys (SSH keys),
+        // /user/emails (verified emails), /user/gpg_keys. Stripping
+        // auth → GitHub 401, matching what a third party would get.
+        let allowed = al(&[]);
+        for path in [
+            "/user/repos",
+            "/user/keys",
+            "/user/keys/123",
+            "/user/emails",
+            "/user/gpg_keys",
+            "/user/something-future-we-dont-recognise",
+        ] {
+            assert_eq!(
+                github_access("GET", path, &allowed),
+                GithubAccess::Anonymous,
+                "{path} should strip auth"
+            );
+            assert_eq!(github_access("POST", path, &allowed), GithubAccess::Anonymous);
+        }
     }
 
     #[test]
-    fn gh_write_to_unlisted_user_endpoints_denied() {
-        // The previous policy narrowed /user/* reads; the new policy
-        // allows reads everywhere but writes to /user/keys, /user/emails
-        // etc. should still be denied — they're not in the explicit
-        // utility-write allow set.
-        let allowed = al(&["wirenboard/agent-vm"]);
-        assert!(!github_path_allowed("POST", "/user/keys", &allowed));
-        assert!(!github_path_allowed("DELETE", "/user/keys/123", &allowed));
-        assert!(!github_path_allowed("PATCH", "/user/emails", &allowed));
-        assert!(!github_path_allowed("POST", "/admin/users", &allowed));
+    fn gh_access_utility_endpoints_authenticated() {
+        let allowed = al(&[]);
+        for path in [
+            "/graphql",
+            "/rate_limit",
+            "/meta",
+            "/markdown",
+            "/notifications",
+            "/search/issues?q=foo",
+            "/search/repositories",
+        ] {
+            assert!(
+                matches!(github_access("POST", path, &allowed), GithubAccess::Authenticated)
+                    || matches!(github_access("GET", path, &allowed), GithubAccess::Authenticated),
+                "{path} should be Authenticated"
+            );
+        }
     }
 
     #[test]
-    fn gh_traversal_segments_are_rejected_for_any_method() {
-        // Even reads should fail-closed on `..` because the underlying
-        // proxy substitution layer would still hand the real bearer
-        // upstream and GitHub would normalise the path.
+    fn gh_access_public_lookup_endpoints_are_anonymous() {
+        // Reads of other users / orgs / etc. — third-party
+        // access serves what's public, hides what's private.
+        let allowed = al(&[]);
+        for path in [
+            "/users/octocat",
+            "/users/octocat/repos",
+            "/orgs/github",
+            "/orgs/private-org/members",
+            "/licenses",
+            "/emojis",
+        ] {
+            assert_eq!(
+                github_access("GET", path, &allowed),
+                GithubAccess::Anonymous,
+                "{path} should be Anonymous (third-party access)"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_access_traversal_is_denied() {
         let allowed = al(&["allowed/repo"]);
-        assert!(!github_path_allowed(
-            "GET",
-            "/repos/allowed/repo/../../victim/private/contents",
-            &allowed
+        assert!(matches!(
+            github_access("GET", "/repos/allowed/repo/../../victim/private", &allowed),
+            GithubAccess::Deny(_)
         ));
-        assert!(!github_path_allowed(
-            "POST",
-            "/repos/allowed/repo/../../victim/private/issues",
-            &allowed
+        assert!(matches!(
+            github_access("POST", "/repos/allowed/repo/../../victim/issues", &allowed),
+            GithubAccess::Deny(_)
         ));
-        assert!(!github_path_allowed("GET", "/../etc/passwd", &allowed));
-    }
-
-    #[test]
-    fn gh_query_string_is_stripped_before_checks() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        assert!(github_path_allowed(
-            "GET",
-            "/repos/wirenboard/agent-vm?ref=main",
-            &allowed
-        ));
-        assert!(github_path_allowed(
-            "POST",
-            "/repos/wirenboard/agent-vm/issues?foo=bar",
-            &allowed
+        assert!(matches!(
+            github_access("GET", "/../etc/passwd", &allowed),
+            GithubAccess::Deny(_)
         ));
     }
 
     #[test]
-    fn gh_repos_with_empty_owner_or_repo_denied() {
+    fn gh_access_query_string_stripped_for_path_match() {
         let allowed = al(&["wirenboard/agent-vm"]);
-        // Write methods to malformed /repos/ paths must not pass.
-        assert!(!github_path_allowed("POST", "/repos/", &allowed));
-        assert!(!github_path_allowed("POST", "/repos/owner", &allowed));
-        assert!(!github_path_allowed("POST", "/repos/owner/", &allowed));
-        assert!(!github_path_allowed("POST", "/repos//repo", &allowed));
+        assert_eq!(
+            github_access("GET", "/repos/wirenboard/agent-vm?ref=main", &allowed),
+            GithubAccess::Authenticated,
+        );
+        assert_eq!(
+            github_access("POST", "/repos/octocat/Hello-World/issues?x=y", &allowed),
+            GithubAccess::Anonymous,
+        );
+    }
+
+    #[test]
+    fn gh_access_malformed_repos_path_goes_anonymous() {
+        // The old policy denied these outright; the new policy
+        // defers to GitHub by stripping auth, and GitHub returns
+        // 404 for shapes it doesn't recognise. Safer + simpler.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for path in ["/repos/", "/repos/owner", "/repos/owner/", "/repos//repo"] {
+            assert_eq!(
+                github_access("POST", path, &allowed),
+                GithubAccess::Anonymous,
+                "{path} should be Anonymous (GitHub returns 404)"
+            );
+        }
     }
 
     // ── github_smart_decision: smart-HTTP ─────────────────────────
@@ -864,108 +962,74 @@ mod tests {
     }
 
     #[test]
-    fn smart_clone_fetch_is_unrestricted() {
+    fn smart_allow_listed_repo_is_authenticated_for_clone_and_push() {
         let allowed = al(&["wirenboard/agent-vm"]);
         // Clone handshake.
-        assert!(matches!(
+        assert_eq!(
             github_smart_decision(
-                &req("GET /octocat/Hello-World.git/info/refs?service=git-upload-pack HTTP/1.1"),
+                &req("GET /wirenboard/agent-vm.git/info/refs?service=git-upload-pack HTTP/1.1"),
                 &allowed,
             ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // Clone pack data POST.
-        assert!(matches!(
-            github_smart_decision(
-                &req("POST /octocat/Hello-World.git/git-upload-pack HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // codeload archive.
-        assert!(matches!(
-            github_smart_decision(
-                &req("GET /octocat/Hello-World/zip/refs/heads/master HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // raw blob.
-        assert!(matches!(
-            github_smart_decision(
-                &req("GET /octocat/Hello-World/main/README.md HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-    }
-
-    #[test]
-    fn smart_push_handshake_checked_against_allow_list() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        // info/refs?service=git-receive-pack is the push handshake.
-        // Allow-listed → Passthrough.
-        assert!(matches!(
-            github_smart_decision(
-                &req(
-                    "GET /wirenboard/agent-vm.git/info/refs?service=git-receive-pack HTTP/1.1"
-                ),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // Non-allow-listed → Deny.
-        let v = github_smart_decision(
-            &req("GET /octocat/Hello-World.git/info/refs?service=git-receive-pack HTTP/1.1"),
-            &allowed,
+            GithubSmartOutcome::Authenticated,
         );
-        match v {
-            GithubSmartDecision::Deny(msg) => assert!(msg.contains("octocat/Hello-World")),
-            _ => panic!("expected Deny, got {v:?}"),
-        }
-    }
-
-    #[test]
-    fn smart_push_data_checked_against_allow_list() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        // git-receive-pack POST is the actual push.
-        assert!(matches!(
+        // Push handshake.
+        assert_eq!(
+            github_smart_decision(
+                &req("GET /wirenboard/agent-vm.git/info/refs?service=git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartOutcome::Authenticated,
+        );
+        // Push data.
+        assert_eq!(
             github_smart_decision(
                 &req("POST /wirenboard/agent-vm.git/git-receive-pack HTTP/1.1"),
                 &allowed,
             ),
-            GithubSmartDecision::Passthrough,
-        ));
-        assert!(matches!(
-            github_smart_decision(
-                &req("POST /octocat/Hello-World.git/git-receive-pack HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Deny(_),
-        ));
+            GithubSmartOutcome::Authenticated,
+        );
+    }
+
+    #[test]
+    fn smart_other_repo_is_anonymous_for_any_operation() {
+        // Third-party model: clone of a public repo works (GitHub
+        // serves it), private 401s, push always 401s. We hand back
+        // the same "Anonymous" verdict for every op and let GitHub
+        // enforce.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for line in [
+            "GET /octocat/Hello-World.git/info/refs?service=git-upload-pack HTTP/1.1",
+            "POST /octocat/Hello-World.git/git-upload-pack HTTP/1.1",
+            "GET /octocat/Hello-World.git/info/refs?service=git-receive-pack HTTP/1.1",
+            "POST /octocat/Hello-World.git/git-receive-pack HTTP/1.1",
+            "GET /octocat/Hello-World/zip/refs/heads/master HTTP/1.1",
+            "GET /octocat/Hello-World/main/README.md HTTP/1.1",
+        ] {
+            assert_eq!(
+                github_smart_decision(&req(line), &allowed),
+                GithubSmartOutcome::Anonymous,
+                "expected Anonymous for: {line}"
+            );
+        }
     }
 
     #[test]
     fn smart_dot_git_suffix_is_stripped_once_only() {
-        // GitHub doesn't accept `<repo>.git.git` so this is mostly a
-        // safety net, but make sure the strip is the precise
-        // `strip_suffix` form (one match), not `trim_end_matches`
-        // (greedy).
         let allowed = al(&["owner/repo.git"]);
         // Allow-list is literally `owner/repo.git` (silly but legal).
-        // smart path is `/owner/repo.git.git/...` (also silly). After
-        // stripping ONE .git, slug = `owner/repo.git`, matches.
-        assert!(matches!(
+        // smart path is `/owner/repo.git.git/...`. After stripping
+        // ONE `.git`, slug = `owner/repo.git`, matches the allow-list.
+        assert_eq!(
             github_smart_decision(
                 &req("POST /owner/repo.git.git/git-receive-pack HTTP/1.1"),
                 &allowed,
             ),
-            GithubSmartDecision::Passthrough,
-        ));
+            GithubSmartOutcome::Authenticated,
+        );
     }
 
     #[test]
-    fn smart_traversal_in_push_is_rejected() {
+    fn smart_traversal_is_denied() {
         let allowed = al(&["allowed/repo"]);
         assert!(matches!(
             github_smart_decision(
@@ -974,76 +1038,118 @@ mod tests {
                 ),
                 &allowed,
             ),
-            GithubSmartDecision::Deny(_),
+            GithubSmartOutcome::Deny(_),
         ));
     }
 
     #[test]
     fn smart_case_insensitive_allow_list() {
         let allowed = al(&["WirenBoard/Agent-VM"]);
-        assert!(matches!(
+        assert_eq!(
             github_smart_decision(
                 &req("POST /wirenboard/agent-vm.git/git-receive-pack HTTP/1.1"),
                 &allowed,
             ),
-            GithubSmartDecision::Passthrough,
-        ));
+            GithubSmartOutcome::Authenticated,
+        );
     }
 
     #[test]
     fn smart_malformed_request_is_flagged() {
-        // No CRLF anywhere.
-        assert!(matches!(
-            github_smart_decision(b"GET /foo HTTP/1.1", &al(&["x/y"])),
-            GithubSmartDecision::Malformed,
-        ));
-        // Empty.
-        assert!(matches!(
-            github_smart_decision(b"", &al(&["x/y"])),
-            GithubSmartDecision::Malformed,
-        ));
-        // Only one whitespace-separated token on the request line.
-        assert!(matches!(
-            github_smart_decision(b"GET\r\n", &al(&["x/y"])),
-            GithubSmartDecision::Malformed,
-        ));
+        for r in [
+            b"GET /foo HTTP/1.1".as_slice(),
+            b"".as_slice(),
+            b"GET\r\n".as_slice(),
+        ] {
+            assert!(matches!(
+                github_smart_decision(r, &al(&["x/y"])),
+                GithubSmartOutcome::Malformed,
+            ));
+        }
     }
 
     #[test]
-    fn smart_info_refs_without_receive_pack_is_passthrough() {
-        // info/refs with NO service= or service=git-upload-pack: a
-        // read. Should never be checked against the allow-list.
-        let allowed = al(&["only/this"]);
-        assert!(matches!(
+    fn smart_malformed_owner_repo_path_is_anonymous() {
+        // `/just-one-segment` doesn't name owner/repo. Old policy
+        // denied; new policy goes Anonymous and lets GitHub 404.
+        let allowed = al(&["x/y"]);
+        assert_eq!(
             github_smart_decision(
-                &req("GET /other/repo.git/info/refs HTTP/1.1"),
+                &req("GET /just-one-segment HTTP/1.1"),
                 &allowed,
             ),
-            GithubSmartDecision::Passthrough,
-        ));
-        assert!(matches!(
-            github_smart_decision(
-                &req("GET /other/repo.git/info/refs?service=git-upload-pack HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // Multi-param query with service= somewhere middle.
-        assert!(matches!(
-            github_smart_decision(
-                &req("GET /other/repo.git/info/refs?foo=bar&service=git-upload-pack&baz=qux HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Passthrough,
-        ));
-        // Same shape but service=git-receive-pack → Deny on non-listed.
-        assert!(matches!(
-            github_smart_decision(
-                &req("GET /other/repo.git/info/refs?foo=bar&service=git-receive-pack HTTP/1.1"),
-                &allowed,
-            ),
-            GithubSmartDecision::Deny(_),
-        ));
+            GithubSmartOutcome::Anonymous,
+        );
+    }
+
+    // ── strip_authorization_from_request ─────────────────────────
+
+    #[test]
+    fn strip_auth_removes_the_header_keeps_body() {
+        let r = b"POST /repos/x/y/issues HTTP/1.1\r\n\
+                  Host: api.github.com\r\n\
+                  Authorization: token MSB_PLACEHOLDER_GH_TOKEN_v1\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  \r\n\
+                  {\"title\":1}";
+        let out = strip_authorization_from_request(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        // Authorization line gone.
+        assert!(!s.to_ascii_lowercase().contains("authorization:"));
+        // Other headers preserved.
+        assert!(s.contains("Host: api.github.com"));
+        assert!(s.contains("Content-Type: application/json"));
+        assert!(s.contains("Content-Length: 11"));
+        // Body preserved verbatim.
+        assert!(s.ends_with("\r\n\r\n{\"title\":1}"));
+        // Placeholder absent at any layer.
+        assert!(!s.contains("MSB_PLACEHOLDER_GH_TOKEN_v1"));
+    }
+
+    #[test]
+    fn strip_auth_case_insensitive_on_header_name() {
+        let r = b"GET /x HTTP/1.1\r\n\
+                  authorization: Bearer X\r\n\
+                  AUTHORIZATION: Bearer Y\r\n\
+                  AuThOrIzAtIoN: Bearer Z\r\n\
+                  Host: api.github.com\r\n\r\n";
+        let out = strip_authorization_from_request(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.to_ascii_lowercase().contains("authorization:"));
+        assert!(s.contains("Host: api.github.com"));
+    }
+
+    #[test]
+    fn strip_auth_no_auth_present_is_noop() {
+        let r = b"GET /x HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: gh\r\n\r\n";
+        let out = strip_authorization_from_request(r);
+        assert_eq!(out, r);
+    }
+
+    #[test]
+    fn strip_auth_malformed_no_separator_returns_input() {
+        let r = b"GET /x HTTP/1.1\r\nAuthorization: Bearer X";
+        let out = strip_authorization_from_request(r);
+        // We don't try to parse beyond the separator; if it's
+        // missing, pass through unchanged so the proxy at least
+        // forwards SOMETHING.
+        assert_eq!(out, r);
+    }
+
+    #[test]
+    fn strip_auth_preserves_request_line_and_other_colons() {
+        // Some header values contain `:` (e.g. Cookie name=URL). The
+        // split-on-first-`:` for the header NAME must not be tricked.
+        let r = b"POST /repos/x/y HTTP/1.1\r\n\
+                  Cookie: a=b; url=http://example.com/path\r\n\
+                  Authorization: token PLACEHOLDER\r\n\
+                  \r\n";
+        let out = strip_authorization_from_request(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.starts_with("POST /repos/x/y HTTP/1.1\r\n"));
+        assert!(s.contains("Cookie: a=b; url=http://example.com/path"));
+        assert!(!s.to_ascii_lowercase().contains("authorization:"));
     }
 
     // ── substitute_authorization_header ───────────────────────────
