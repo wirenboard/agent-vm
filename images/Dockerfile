@@ -82,16 +82,32 @@ RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
         '# Args (npx + chrome-devtools-mcp + flags) come from the MCP' \
         '# config in ~/.claude.json; we just switch UID.' \
         '#' \
-        '# We preserve a small allow-list of env vars across the sudo' \
-        '# call: agentd boot-sets NODE_EXTRA_CA_CERTS / SSL_CERT_FILE /' \
-        '# CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE so any HTTPS client in' \
-        '# the guest trusts the microsandbox MITM CA. Without these' \
-        '# preserved, node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN' \
-        '# fetching from registry.npmjs.org and the MCP exits before' \
-        '# the JSON-RPC handshake. PATH is needed so npx is findable.' \
+        '# Preserve list (passed through sudo'\''s env_reset):' \
+        '#  - NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / CURL_CA_BUNDLE /' \
+        '#    REQUESTS_CA_BUNDLE: agentd boot-sets these so any HTTPS' \
+        '#    client trusts the microsandbox MITM CA. Without them' \
+        '#    node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN.' \
+        '#  - PATH: needed so npx is findable (sudo'\''s secure_path' \
+        '#    would otherwise replace it).' \
+        '#  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (both cases):' \
+        '#    forward agentd-set proxy config so chrome routes traffic' \
+        '#    the same way as the rest of the guest.' \
+        '#  - CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS / CI / DEBUG:' \
+        '#    user/MCP-config opt-outs and debugging knobs that' \
+        '#    chrome-devtools-mcp documents.' \
+        '#  - TZ / LANG / LC_ALL / TMPDIR: locale + sane temp paths.' \
+        '#' \
+        '# `cd /home/chrome` keeps chromium'\''s default CWD writable' \
+        '# (the agent runs as root in /workspace, where chrome (UID' \
+        '# 9999) cannot write; tools that emit relative paths' \
+        '# (./trace.json, ./screenshot.png) would otherwise EACCES).' \
         'set -e' \
+        'cd /home/chrome' \
         'exec sudo -u chrome -H -n \' \
-        '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE,PATH \' \
+        '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
+        '    --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
+        '    --preserve-env=CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,CI,DEBUG \' \
+        '    --preserve-env=TZ,LANG,LC_ALL,TMPDIR \' \
         '    -- "$@"' \
         > /usr/local/bin/agent-vm-chrome-mcp \
  && chmod 0755 /usr/local/bin/agent-vm-chrome-mcp
@@ -111,6 +127,15 @@ RUN install -dm 755 /etc/apt/keyrings \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
+
+# Pre-warm chrome-devtools-mcp's npm cache as the chrome user so the
+# first browser tool call in any sandbox doesn't pay the multi-second
+# `npx -y` fetch cost (and so cold launches don't fail entirely when
+# registry.npmjs.org is briefly unreachable). `--help` exits cleanly
+# after install/version-check; it's the cheapest exercise of the full
+# install path. Must come AFTER the nodejs RUN above — npx didn't
+# exist before it.
+RUN sudo -u chrome -H npx -y chrome-devtools-mcp@latest --help >/dev/null
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash

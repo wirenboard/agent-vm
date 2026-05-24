@@ -1199,14 +1199,17 @@ mod tests {
 
     #[test]
     fn strip_auth_removes_the_header_keeps_body() {
-        let r = b"POST /repos/x/y/issues HTTP/1.1\r\n\
-                  Host: api.github.com\r\n\
-                  Authorization: token MSB_PLACEHOLDER_GH_TOKEN_v1\r\n\
-                  Content-Type: application/json\r\n\
-                  Content-Length: 11\r\n\
-                  \r\n\
-                  {\"title\":1}";
-        let out = strip_authorization_from_request(r);
+        let r = format!(
+            "POST /repos/x/y/issues HTTP/1.1\r\n\
+             Host: api.github.com\r\n\
+             Authorization: token {placeholder}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 11\r\n\
+             \r\n\
+             {{\"title\":1}}",
+            placeholder = secrets::GH_TOKEN_PLACEHOLDER,
+        );
+        let out = strip_authorization_from_request(r.as_bytes());
         let s = std::str::from_utf8(&out).unwrap();
         // Authorization line gone.
         assert!(!s.to_ascii_lowercase().contains("authorization:"));
@@ -1217,7 +1220,7 @@ mod tests {
         // Body preserved verbatim.
         assert!(s.ends_with("\r\n\r\n{\"title\":1}"));
         // Placeholder absent at any layer.
-        assert!(!s.contains("MSB_PLACEHOLDER_GH_TOKEN_v1"));
+        assert!(!s.contains(secrets::GH_TOKEN_PLACEHOLDER));
     }
 
     #[test]
@@ -1470,7 +1473,7 @@ mod tests {
         use base64::Engine as _;
         use microsandbox_network::secrets::handler::SecretsHandler;
 
-        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let placeholder = secrets::GH_TOKEN_PLACEHOLDER;
         let real_token = "REAL_TOKEN_KEEPALIVE_DEFENSE_CANARY";
 
         let config = build_github_secrets_config(placeholder, real_token);
@@ -1523,7 +1526,7 @@ mod tests {
         use base64::Engine as _;
         use microsandbox_network::secrets::handler::SecretsHandler;
 
-        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let placeholder = secrets::GH_TOKEN_PLACEHOLDER;
         let real_token = "REAL_TOKEN_ALLOWED_REPO";
 
         let config = build_github_secrets_config(placeholder, real_token);
@@ -1627,7 +1630,7 @@ mod tests {
         // Sentinel values: if either string shows up in the final
         // upstream bytes, the test fails — we'd be leaking a real
         // token to the network.
-        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let placeholder = secrets::GH_TOKEN_PLACEHOLDER;
         let real_token = "REAL_TOKEN_MUST_NEVER_REACH_UPSTREAM_42";
 
         let config = build_github_secrets_config(placeholder, real_token);
@@ -1718,7 +1721,7 @@ mod tests {
         use base64::Engine as _;
         use microsandbox_network::secrets::handler::SecretsHandler;
 
-        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let placeholder = secrets::GH_TOKEN_PLACEHOLDER;
         let real_token = "REAL_TOKEN_KEEPALIVE_LEAK_CANARY";
 
         let config = build_github_secrets_config(placeholder, real_token);
@@ -1795,7 +1798,7 @@ mod tests {
         use base64::Engine as _;
         use microsandbox_network::secrets::handler::SecretsHandler;
 
-        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let placeholder = secrets::GH_TOKEN_PLACEHOLDER;
         let real_token = "REAL_TOKEN_FOR_ALLOWED_REPO";
 
         let config = build_github_secrets_config(placeholder, real_token);

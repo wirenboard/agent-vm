@@ -61,14 +61,16 @@ pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ
 /// header  = base64url('{"alg":"none","typ":"JWT"}')
 /// payload = base64url('{"exp":9999999999,
 ///                       "chatgpt_account_id":"00000000-0000-0000-0000-000000000000"}')
-/// sig     = "MSB_OPENCODE_v1"
+/// sig     = "msb-opencode-placeholder-a-v2"  (non-token-shaped to
+///           match the rest of the placeholder family; see the warning
+///           on `OPENAI_ID_PLACEHOLDER`)
 ///
 /// **Kept short on purpose:** an earlier ~480-char payload (with
 /// iss/aud/scp/email/sub claims) triggered upstream issue #8 — long
 /// placeholders fail sandbox boot with `handshake read id_offset:
 /// timed out before relay sent bytes`. Add fields here only if
 /// OpenCode actually parses them and chokes on absence.
-pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.MSB_OPENCODE_v1";
+pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.msb-opencode-placeholder-a-v2";
 pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "msb-opencode-placeholder-r-v2";
 /// Placeholder for the host's `gh auth token`. The in-guest `gh` /
 /// git credential helper sees this string; the proxy substitutes the
@@ -673,12 +675,19 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     //   (`/home/chrome/.pki/nssdb/`, populated by the launcher's bash
     //   prelude at boot). With that, no `--acceptInsecureCerts` (which
     //   would accept *any* untrusted cert) — only our CA is trusted.
-    if std::env::var("AGENT_VM_NO_CHROME_MCP").is_err() {
-        let mcp = obj
-            .entry("mcpServers".to_string())
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .context("~/.claude.json mcpServers is not an object")?;
+    // The map is created (or reused) regardless so the opt-out can
+    // also REMOVE a previously-written entry — without this, setting
+    // AGENT_VM_NO_CHROME_MCP after a launch without it would leave
+    // the stale entry in the on-disk claude.json and the MCP would
+    // keep spawning. We always own this key.
+    let mcp = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("~/.claude.json mcpServers is not an object")?;
+    if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
+        mcp.remove("chrome-devtools");
+    } else {
         mcp.insert(
             "chrome-devtools".into(),
             serde_json::json!({

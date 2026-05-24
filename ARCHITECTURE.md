@@ -310,8 +310,10 @@ Real tokens never enter the VM. The dance per provider:
    `~/.codex/auth.json` for Codex) at every launch. It extracts the
    access token, keeps it in a short-lived Rust `String`, and registers
    it as a microsandbox secret with a stable placeholder string
-   (`MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1` and
-   `MSB_PLACEHOLDER_OPENAI_ACCESS_TOKEN_v1`).
+   (`msb-anthropic-placeholder-a-v2` and
+   `msb-openai-placeholder-a-v2`). The placeholder *constants* live in
+   `crates/agent-vm/src/secrets.rs` (`ANTHROPIC_ACCESS_PLACEHOLDER` etc.) —
+   prefer the constant over the literal so a future rename doesn't drift.
 2. **Guest side.** agent-vm writes a "placeholder credentials" JSON
    into the per-project state dir
    (`<state>/claude/.credentials.json`,
@@ -324,7 +326,7 @@ Real tokens never enter the VM. The dance per provider:
    sandbox's HTTPS traffic. When the agent makes a request to any
    allowed host (`api.anthropic.com`, `platform.claude.com`,
    `api.openai.com`, `chatgpt.com`, `auth.openai.com`), the proxy
-   sees `Authorization: Bearer MSB_PLACEHOLDER_...` in the outgoing
+   sees `Authorization: Bearer msb-…-placeholder-…` in the outgoing
    request, splices in the real token from the secret config, then
    forwards.
 
@@ -402,7 +404,7 @@ End-to-end verified on a nested-VM test host (cwd
 - `cat /root/.claude/.credentials.json` inside the guest shows the
   placeholder, not the real token. ✓
 - `cat /proc/1/environ | tr '\0' '\n' | grep -i token` finds only
-  `MSB_AGENT_VM_ANTHROPIC_UNUSED=MSB_PLACEHOLDER_…`. ✓
+  `MSB_AGENT_VM_ANTHROPIC_UNUSED=msb-…-placeholder-…`. ✓
 - TLS-intercepted curl to `https://api.anthropic.com` sees the
   microsandbox CA on the server cert (`CN=microsandbox CA`),
   confirming requests go through the substitution proxy. ✓
@@ -596,8 +598,8 @@ Inside the guest:
 
 Response:
   HTTP 200 application/json
-  {"access_token":"MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1",
-   "refresh_token":"MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1",
+  {"access_token":"msb-anthropic-placeholder-a-v2",
+   "refresh_token":"msb-anthropic-placeholder-r-v2",
    "expires_in":3499, "token_type":"Bearer",
    "scope":["user:file_upload","user:inference",…]}
 ```
