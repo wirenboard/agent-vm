@@ -28,6 +28,7 @@ dependencies = [
  "clap",
  "indicatif",
  "microsandbox",
+ "microsandbox-network",
  "reqwest",
  "serde_json",
  "sha2 0.10.9",

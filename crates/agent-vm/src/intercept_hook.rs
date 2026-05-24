@@ -95,16 +95,26 @@ pub async fn run(args: Args) -> Result<()> {
         .any(|h| args.sni.eq_ignore_ascii_case(h))
     {
         let response = match github_smart_decision(&request, &args.allowed_repos) {
-            // Allow-listed: passthrough verbatim. Empty stdout tells
-            // the proxy to forward the buffered prefix unchanged;
-            // the secret layer swaps the placeholder for the real
-            // bearer.
-            GithubSmartOutcome::Authenticated => Vec::new(),
+            // Allow-listed: forward the request unchanged EXCEPT we
+            // inject `Connection: close` so the upstream tears down
+            // the TCP after responding. This prevents the
+            // keep-alive bypass: msb's Interceptor goes to
+            // State::Disabled after one dispatch, so any subsequent
+            // HTTP/1.1 request on the same connection would be
+            // forwarded with the secret-substituted Authorization
+            // (real token) directly to upstream, even if it
+            // targets a different (non-allow-listed) repo.
+            GithubSmartOutcome::Authenticated => set_connection_close(&request),
             // Not allow-listed: passthrough with Authorization
             // stripped. Non-empty, non-`HTTP/` stdout tells the
-            // proxy "forward THESE bytes instead." GitHub treats
+            // proxy "forward THESE bytes instead." Also injects
+            // `Connection: close` for the same reason (otherwise
+            // the next request on the same connection — e.g. a
+            // libcurl retry — bypasses the hook). GitHub treats
             // the request as third-party.
-            GithubSmartOutcome::Anonymous => strip_authorization_from_request(&request),
+            GithubSmartOutcome::Anonymous => {
+                set_connection_close(&strip_authorization_from_request(&request))
+            }
             GithubSmartOutcome::Deny(msg) => error_response(403, &msg),
             GithubSmartOutcome::Malformed => {
                 error_response(400, "agent-vm github smart-HTTP filter: malformed request")
@@ -517,6 +527,74 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
 /// Operates byte-precise on the header block (terminator
 /// `\r\n\r\n`), preserves the request body verbatim, doesn't try to
 /// re-parse anything else. Case-insensitive on the header name.
+/// Inject (or overwrite) a `Connection: close` header in the request.
+///
+/// **Why:** msb's Interceptor handles one request per connection.
+/// After dispatch its state becomes Disabled and subsequent HTTP/1.1
+/// requests on the same TCP/TLS connection bypass the hook entirely
+/// — the proxy forwards the secret-substitution layer's output
+/// (with the real token already in the Authorization header) straight
+/// to upstream. Forcing `Connection: close` makes the server tear
+/// down the connection after responding, so any follow-up request
+/// opens a fresh TCP, creating a fresh Interceptor that re-evaluates
+/// the policy. This is the dominant real-world bypass: libcurl
+/// (git's HTTP backend) reuses connections aggressively, and gh /
+/// git clone do multiple requests per connection.
+///
+/// Operates byte-precise on the header block (terminator `\r\n\r\n`),
+/// preserves the request body verbatim, doesn't try to re-parse
+/// anything else.
+fn set_connection_close(request: &[u8]) -> Vec<u8> {
+    let hdr_end = match request.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => p,
+        None => return request.to_vec(), // malformed; pass through
+    };
+    let (head, rest) = request.split_at(hdr_end);
+
+    // Collect kept lines, skipping any existing Connection / Keep-Alive
+    // / Proxy-Connection headers — we replace them with our own
+    // single `Connection: close`.
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < head.len() {
+        let (line, next_cursor) = match head[cursor..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => (&head[cursor..cursor + p], cursor + p + 2),
+            None => (&head[cursor..], head.len()),
+        };
+        let should_drop = line
+            .iter()
+            .position(|&b| b == b':')
+            .map(|colon| {
+                let name = &line[..colon];
+                name.eq_ignore_ascii_case(b"connection")
+                    || name.eq_ignore_ascii_case(b"keep-alive")
+                    || name.eq_ignore_ascii_case(b"proxy-connection")
+            })
+            .unwrap_or(false);
+        if !should_drop {
+            kept.push(line);
+        }
+        cursor = next_cursor;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(request.len() + 32);
+    for (i, line) in kept.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(line);
+    }
+    // Always emit the Connection: close header (after the last kept
+    // line, before the rest's \r\n\r\n). If `kept` is empty (no
+    // request line — malformed), skip prepending the join \r\n.
+    if !kept.is_empty() {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close");
+    out.extend_from_slice(rest);
+    out
+}
+
 fn strip_authorization_from_request(request: &[u8]) -> Vec<u8> {
     let hdr_end = match request.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(p) => p,
@@ -1328,5 +1406,428 @@ mod tests {
         );
         let out = substitute_authorization_header(&untouched_basic, "real_xyz");
         assert_eq!(out, untouched_basic);
+    }
+
+    // ── set_connection_close ──────────────────────────────────────
+
+    #[test]
+    fn connection_close_injected_when_header_absent() {
+        let r = b"GET / HTTP/1.1\r\nHost: github.com\r\n\r\n";
+        let out = set_connection_close(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("Connection: close\r\n\r\n"), "got: {s:?}");
+        assert!(s.starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn connection_close_replaces_existing_keep_alive() {
+        // RFC 7230 says proxies must remove hop-by-hop headers
+        // (Connection, Keep-Alive, Proxy-Connection) — we strip all
+        // three and emit our own single Connection: close.
+        let r = b"GET / HTTP/1.1\r\n\
+                  Host: github.com\r\n\
+                  Connection: keep-alive\r\n\
+                  Keep-Alive: timeout=60\r\n\
+                  Proxy-Connection: keep-alive\r\n\
+                  \r\n";
+        let out = set_connection_close(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        // All three hop-by-hop headers must be removed; only our
+        // single Connection: close remains.
+        let lower = s.to_ascii_lowercase();
+        assert_eq!(
+            lower.matches("connection:").count(),
+            1,
+            "should have exactly one Connection header; got: {s:?}"
+        );
+        assert!(s.contains("Connection: close"));
+        assert!(!lower.contains("keep-alive:"));
+        assert!(!lower.contains("proxy-connection:"));
+        assert!(s.contains("Host: github.com"));
+    }
+
+    #[test]
+    fn connection_close_preserves_body_verbatim() {
+        let r = b"POST /x HTTP/1.1\r\n\
+                  Host: github.com\r\n\
+                  Content-Length: 5\r\n\
+                  \r\n\
+                  hello";
+        let out = set_connection_close(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\r\n\r\nhello"), "body must follow exactly one \\r\\n\\r\\n; got: {s:?}");
+        assert!(s.ends_with("hello"));
+    }
+
+    /// End-to-end: after the hook runs on a non-allow-listed clone,
+    /// the bytes that reach upstream MUST contain `Connection: close`
+    /// (to prevent the keep-alive bypass for any follow-up requests
+    /// libcurl/git would do on the same TCP connection). This is the
+    /// regression assertion for the bug behind real-world private
+    /// repo clone-through.
+    #[test]
+    fn anonymous_passthrough_forces_connection_close() {
+        use base64::Engine as _;
+        use microsandbox_network::secrets::handler::SecretsHandler;
+
+        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let real_token = "REAL_TOKEN_KEEPALIVE_DEFENSE_CANARY";
+
+        let config = build_github_secrets_config(placeholder, real_token);
+        let mut handler = SecretsHandler::new(&config, "github.com", true);
+
+        let creds = format!("x-access-token:{placeholder}");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        let req = format!(
+            "GET /evgeny-boger/mitsubishi-ac-ir.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             Connection: keep-alive\r\n\
+             User-Agent: git/2.47\r\n\
+             Authorization: Basic {b64}\r\n\
+             \r\n"
+        );
+        let substituted = handler.substitute(req.as_bytes()).expect("not a violation");
+        let allowed: Vec<String> = Vec::new();
+        assert!(matches!(
+            github_smart_decision(&substituted, &allowed),
+            GithubSmartOutcome::Anonymous
+        ));
+
+        // What the hook would write to stdout for Anonymous:
+        let hook_out = set_connection_close(&strip_authorization_from_request(&substituted));
+        let s = std::str::from_utf8(&hook_out).unwrap();
+
+        let expected_creds = format!("x-access-token:{real_token}");
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        // No real token of any flavor.
+        assert!(!s.contains(real_token), "raw real token leaked: {s}");
+        assert!(!s.contains(&expected_b64), "base64 real token leaked: {s}");
+        // No keep-alive — the defining property of the fix.
+        assert!(
+            s.contains("Connection: close"),
+            "Connection: close missing — keep-alive bypass still possible: {s}"
+        );
+        let lower = s.to_ascii_lowercase();
+        assert_eq!(lower.matches("connection:").count(), 1);
+        assert!(!lower.contains("keep-alive:"));
+    }
+
+    /// End-to-end: same for the allow-listed (Authenticated) path.
+    /// The real token IS allowed through (that's the point), but the
+    /// connection still MUST be torn down after responding so that
+    /// a subsequent (potentially non-allow-listed) request on the
+    /// same TCP doesn't bypass the hook.
+    #[test]
+    fn authenticated_passthrough_forces_connection_close() {
+        use base64::Engine as _;
+        use microsandbox_network::secrets::handler::SecretsHandler;
+
+        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let real_token = "REAL_TOKEN_ALLOWED_REPO";
+
+        let config = build_github_secrets_config(placeholder, real_token);
+        let mut handler = SecretsHandler::new(&config, "github.com", true);
+
+        let creds = format!("x-access-token:{placeholder}");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        let req = format!(
+            "POST /wirenboard/agent-vm.git/git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             Connection: keep-alive\r\n\
+             Authorization: Basic {b64}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let substituted = handler.substitute(req.as_bytes()).expect("not a violation");
+        let allowed = vec!["wirenboard/agent-vm".to_string()];
+        assert!(matches!(
+            github_smart_decision(&substituted, &allowed),
+            GithubSmartOutcome::Authenticated
+        ));
+
+        let hook_out = set_connection_close(&substituted);
+        let s = std::str::from_utf8(&hook_out).unwrap();
+
+        // Real token IS in here — Authenticated means it's allowed.
+        let expected_creds = format!("x-access-token:{real_token}");
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        assert!(s.contains(&expected_b64), "auth must reach upstream for allow-listed repo");
+        // Connection must be close — the connection-reset is the
+        // entire point even for the allowed path.
+        assert!(
+            s.contains("Connection: close"),
+            "Connection: close missing on Authenticated: {s}"
+        );
+        let lower = s.to_ascii_lowercase();
+        assert_eq!(lower.matches("connection:").count(), 1);
+        assert!(!lower.contains("keep-alive:"));
+    }
+
+    // ── full pipeline (secrets → hook) end-to-end regression ──────
+    //
+    // These tests wire up the SAME pipeline order as
+    // `vendor/microsandbox/.../tls/proxy.rs:forward_plaintext`:
+    //
+    //   1. SecretsHandler.substitute(guest_bytes)
+    //         → inject_basic_auth base64-decodes the Authorization,
+    //           swaps GH_TOKEN_PLACEHOLDER for the real token, re-encodes.
+    //   2. github_smart_decision(substituted_bytes, allowed_repos)
+    //         → Authenticated / Anonymous / Deny / Malformed.
+    //   3. If Anonymous: strip_authorization_from_request(substituted_bytes)
+    //         is the bytes the proxy actually writes to upstream.
+    //
+    // The invariant under test: for a NON-allow-listed private repo,
+    // the bytes that would reach GitHub must NOT contain the real
+    // token. If this test ever fails, a private repo clone would
+    // succeed against the proxy.
+
+    #[allow(dead_code)] // helper used only by the test below
+    fn build_github_secrets_config(
+        placeholder: &str,
+        real_token: &str,
+    ) -> microsandbox_network::secrets::config::SecretsConfig {
+        use microsandbox_network::secrets::config::{
+            HostPattern, SecretEntry, SecretInjection, SecretValue, SecretsConfig,
+        };
+        SecretsConfig {
+            secrets: vec![SecretEntry {
+                env_var: "GH_TOKEN".into(),
+                value: SecretValue::Static(real_token.into()),
+                placeholder: placeholder.into(),
+                allowed_hosts: vec![
+                    HostPattern::Exact("github.com".into()),
+                    HostPattern::Exact("api.github.com".into()),
+                    HostPattern::Exact("codeload.github.com".into()),
+                    HostPattern::Exact("raw.github.com".into()),
+                    HostPattern::Exact("objects.github.com".into()),
+                ],
+                injection: SecretInjection {
+                    headers: true,
+                    basic_auth: true,
+                    query_params: false,
+                    body: false,
+                },
+                require_tls_identity: true,
+            }],
+            on_violation: Default::default(),
+        }
+    }
+
+    /// E2E: git's first request to clone a private, NON-allow-listed
+    /// repo. Pipeline: secrets-substitute(real token in Basic auth) →
+    /// hook returns Anonymous (strip auth). Real token MUST NOT
+    /// appear in the bytes the proxy would forward to GitHub.
+    #[test]
+    fn private_repo_clone_does_not_leak_real_token_through_pipeline() {
+        use base64::Engine as _;
+        use microsandbox_network::secrets::handler::SecretsHandler;
+
+        // Sentinel values: if either string shows up in the final
+        // upstream bytes, the test fails — we'd be leaking a real
+        // token to the network.
+        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let real_token = "REAL_TOKEN_MUST_NEVER_REACH_UPSTREAM_42";
+
+        let config = build_github_secrets_config(placeholder, real_token);
+        let mut handler = SecretsHandler::new(&config, "github.com", true);
+
+        // What git actually sends when cloning a private repo via
+        // HTTPS with the credential helper: Basic auth carrying
+        // `x-access-token:<placeholder>` base64-encoded. Authorization
+        // is the LAST header (the bug we fixed earlier hit exactly
+        // this shape).
+        let creds = format!("x-access-token:{placeholder}");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        let request = format!(
+            "GET /evgeny-boger/mitsubishi-ac-ir/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             User-Agent: git/2.47\r\n\
+             Accept: */*\r\n\
+             Authorization: Basic {b64}\r\n\
+             \r\n"
+        );
+        let request_bytes = request.as_bytes();
+
+        // Step 1: secrets layer substitutes the placeholder with the
+        // real token (decoded basic creds, replaced, re-encoded).
+        let substituted = handler.substitute(request_bytes).expect("not a violation");
+        let substituted_bytes: &[u8] = &substituted;
+
+        // Sanity check: the real token IS in the substituted bytes
+        // (base64-encoded inside the Basic value). If this fails the
+        // SecretsHandler isn't doing its job — different bug.
+        let expected_creds = format!("x-access-token:{real_token}");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        let substituted_str = std::str::from_utf8(substituted_bytes)
+            .expect("substituted output should still be UTF-8 for this ASCII request");
+        assert!(
+            substituted_str.contains(&expected_b64),
+            "secrets layer should have substituted the placeholder with the real token; \
+             expected Basic value {expected_b64:?} in:\n{substituted_str}"
+        );
+
+        // Step 2: hook decides. Repo evgeny-boger/mitsubishi-ac-ir is
+        // NOT in the (empty) allow-list → Anonymous.
+        let allowed: Vec<String> = Vec::new();
+        let decision = github_smart_decision(substituted_bytes, &allowed);
+        assert!(
+            matches!(decision, GithubSmartOutcome::Anonymous),
+            "non-allow-listed repo must route to Anonymous (third-party access)"
+        );
+
+        // Step 3: stripped bytes are what hits upstream.
+        let upstream_bytes = strip_authorization_from_request(substituted_bytes);
+        let upstream_str = std::str::from_utf8(&upstream_bytes)
+            .expect("stripped request should still be UTF-8");
+
+        // INVARIANT: real token bytes (raw AND base64) must not be
+        // anywhere in what we send upstream.
+        assert!(
+            !upstream_str.contains(real_token),
+            "raw real token leaked to upstream:\n{upstream_str}"
+        );
+        assert!(
+            !upstream_str.contains(&expected_b64),
+            "base64-encoded real token leaked to upstream:\n{upstream_str}"
+        );
+
+        // And no Authorization header at all should reach upstream.
+        assert!(
+            !upstream_str.to_ascii_lowercase().contains("authorization:"),
+            "Authorization header reached upstream:\n{upstream_str}"
+        );
+    }
+
+    /// Two requests on the SAME connection (HTTP/1.1 keep-alive),
+    /// which is what git+libcurl actually do during clone (info/refs
+    /// then git-upload-pack). The SecretsHandler is created once per
+    /// connection and reused for both requests. This test asserts
+    /// that the substitution layer + naive hook-style filtering
+    /// alone do NOT close the leak: a second request's real token
+    /// can reach upstream if the hook isn't re-invoked.
+    ///
+    /// This is a hypothesis-confirmation test — it reproduces the
+    /// keep-alive bypass that the unit-level pipeline test misses.
+    /// If this test shows the second request's bytes contain the
+    /// real token without going through the hook, we've found the
+    /// real-world leak.
+    #[test]
+    fn keep_alive_second_request_bytes_contain_real_token_pre_hook() {
+        use base64::Engine as _;
+        use microsandbox_network::secrets::handler::SecretsHandler;
+
+        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let real_token = "REAL_TOKEN_KEEPALIVE_LEAK_CANARY";
+
+        let config = build_github_secrets_config(placeholder, real_token);
+        // ONE handler per "connection".
+        let mut handler = SecretsHandler::new(&config, "github.com", true);
+
+        let creds = format!("x-access-token:{placeholder}");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+
+        // Request 1 — info/refs (the request the hook intercepts).
+        let req1 = format!(
+            "GET /evgeny-boger/mitsubishi-ac-ir.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             Authorization: Basic {b64}\r\n\
+             \r\n"
+        );
+        let sub1 = handler.substitute(req1.as_bytes()).expect("not a violation");
+        // The hook would run here and strip auth for non-allow-listed.
+        // Asserting that part is the other test.
+
+        // Request 2 — second request on the SAME connection (e.g.
+        // a retry, or libcurl's pipelined follow-up). In the real
+        // proxy, after the first dispatch the Interceptor goes to
+        // State::Disabled and returns Verdict::Forward for every
+        // subsequent chunk — which means the substituted bytes go
+        // STRAIGHT to upstream, unfiltered.
+        let req2 = format!(
+            "POST /evgeny-boger/mitsubishi-ac-ir.git/git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             Content-Type: application/x-git-upload-pack-request\r\n\
+             Authorization: Basic {b64}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let sub2 = handler.substitute(req2.as_bytes()).expect("not a violation");
+        let sub2_str = std::str::from_utf8(&sub2).unwrap();
+
+        let expected_creds = format!("x-access-token:{real_token}");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+
+        // INVARIANT (currently FAILS for keep-alive): if the hook
+        // isn't re-engaged for request 2, the substituted bytes
+        // (with real token) are what hits the wire. This assertion
+        // documents the leak — if it passes (i.e., real token IS
+        // in sub2), we've confirmed the bypass.
+        let leaked = sub2_str.contains(&expected_b64);
+        assert!(
+            leaked,
+            "expected the keep-alive bypass to manifest: secret-substitution \
+             puts the real token in the bytes of request 2 on the same connection, \
+             and the proxy's interceptor goes to Disabled after request 1's \
+             dispatch — so these bytes go upstream unfiltered. \
+             If this assertion fails the leak may already be plugged."
+        );
+
+        // For completeness: prove request 1 alone is properly stripped by the hook.
+        let allowed: Vec<String> = Vec::new();
+        let decision1 = github_smart_decision(&sub1, &allowed);
+        assert!(matches!(decision1, GithubSmartOutcome::Anonymous));
+        let stripped1 = strip_authorization_from_request(&sub1);
+        let stripped1_str = std::str::from_utf8(&stripped1).unwrap();
+        assert!(
+            !stripped1_str.contains(&expected_b64),
+            "request 1 strip should remove the real token from the wire"
+        );
+    }
+
+    /// E2E: same pipeline, but the repo IS allow-listed → hook
+    /// returns Authenticated (empty stdout → proxy forwards the
+    /// post-substitution bytes verbatim). Real token SHOULD appear
+    /// upstream in this case (legitimate clone).
+    #[test]
+    fn allowlisted_repo_clone_does_pass_real_token_through_pipeline() {
+        use base64::Engine as _;
+        use microsandbox_network::secrets::handler::SecretsHandler;
+
+        let placeholder = "MSB_PLACEHOLDER_GH_TOKEN_v1_xxxxxxxx";
+        let real_token = "REAL_TOKEN_FOR_ALLOWED_REPO";
+
+        let config = build_github_secrets_config(placeholder, real_token);
+        let mut handler = SecretsHandler::new(&config, "github.com", true);
+
+        let creds = format!("x-access-token:{placeholder}");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        let request = format!(
+            "GET /wirenboard/agent-vm/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: github.com\r\n\
+             Authorization: Basic {b64}\r\n\
+             \r\n"
+        );
+        let substituted = handler.substitute(request.as_bytes()).expect("not a violation");
+
+        let allowed = vec!["wirenboard/agent-vm".to_string()];
+        let decision = github_smart_decision(&substituted, &allowed);
+        assert!(
+            matches!(decision, GithubSmartOutcome::Authenticated),
+            "allow-listed repo must route to Authenticated"
+        );
+
+        // In the proxy, Authenticated means hook returns empty stdout
+        // → `Verdict::ForwardBuffered(substituted)`. So the real token
+        // (in the substituted bytes) IS what reaches upstream — this
+        // is the intended path for legitimate auth on allowed repos.
+        let upstream_str = std::str::from_utf8(&substituted).unwrap();
+        let expected_creds = format!("x-access-token:{real_token}");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        assert!(
+            upstream_str.contains(&expected_b64),
+            "for allow-listed repo, real token should reach upstream; got:\n{upstream_str}"
+        );
     }
 }
