@@ -372,6 +372,18 @@ fn write_agent_config_defaults(state_dir: &Path, project_guest_path: &str) -> Re
     std::fs::create_dir_all(&opencode_config_dir)?;
     write_default_opencode_config(&opencode_config_dir.join("opencode.json"))?;
 
+    // Persistent per-project bash history. The launcher symlinks
+    // /root/.bash_history → /agent-vm-state/bash_history; touching
+    // the file here ensures the symlink target exists on first
+    // launch (bash refuses to write history if the target's parent
+    // dir is missing — by here state_dir exists, so just ensure
+    // the file does too). Subsequent launches preserve whatever
+    // bash appended on exit.
+    let history_path = state_dir.join("bash_history");
+    if !history_path.exists() {
+        atomic_write(&history_path, b"", 0o600)?;
+    }
+
     Ok(())
 }
 
@@ -782,6 +794,8 @@ mod tests {
         for token in [
             anthropic_token_path(state_dir),
             openai_token_path(state_dir),
+            gh_token_path(state_dir),
+            opencode_openai_token_path(state_dir),
         ] {
             assert!(
                 !token.starts_with(state_dir),
@@ -793,5 +807,209 @@ mod tests {
             // and the refresh hook agree on the path.
             assert_eq!(token.parent().unwrap().parent(), state_dir.parent());
         }
+    }
+
+    /// Trailing-slash state_dir was flagged in code review as a
+    /// possible edge case where the secrets dir might land inside the
+    /// mount. Verify it doesn't.
+    #[test]
+    fn host_secret_dir_safe_for_trailing_slash_state_dir() {
+        // Path::file_name() strips trailing slashes — verify the
+        // sibling-secrets pattern still works.
+        for sd in [
+            "/home/u/.local/state/agent-vm/abc123",
+            "/home/u/.local/state/agent-vm/abc123/",
+            "/tmp/agent-vm-state",
+        ] {
+            let sdp = Path::new(sd);
+            let secret = host_secret_dir(sdp);
+            assert!(
+                !secret.starts_with(sdp.canonicalize().unwrap_or(sdp.to_path_buf())),
+                "{} must not be inside {}",
+                secret.display(),
+                sdp.display(),
+            );
+        }
+    }
+
+    /// **Placeholder distinctness**. If one placeholder were a
+    /// substring of another, the secret-substitution proxy would
+    /// swap the wrong token on outbound bytes — silently corrupting
+    /// requests. Verify no placeholder is a substring of any other.
+    #[test]
+    fn placeholders_are_pairwise_distinct() {
+        let all: &[(&str, &str)] = &[
+            ("ANTHROPIC_ACCESS", ANTHROPIC_ACCESS_PLACEHOLDER),
+            ("ANTHROPIC_REFRESH", ANTHROPIC_REFRESH_PLACEHOLDER),
+            ("OPENAI_ACCESS", OPENAI_ACCESS_PLACEHOLDER),
+            ("OPENAI_REFRESH", OPENAI_REFRESH_PLACEHOLDER),
+            ("OPENAI_ID", OPENAI_ID_PLACEHOLDER),
+            ("OPENCODE_ACCESS", OPENCODE_OPENAI_ACCESS_PLACEHOLDER),
+            ("OPENCODE_REFRESH", OPENCODE_OPENAI_REFRESH_PLACEHOLDER),
+            ("GH_TOKEN", GH_TOKEN_PLACEHOLDER),
+        ];
+        for (a_name, a) in all {
+            for (b_name, b) in all {
+                if a_name == b_name {
+                    continue;
+                }
+                assert!(
+                    !a.contains(b) && !b.contains(a),
+                    "placeholder {a_name:?} ({a:?}) and {b_name:?} ({b:?}) overlap as substrings — substitution would swap the wrong token"
+                );
+            }
+        }
+    }
+
+    // ── hash_file ─────────────────────────────────────────────────
+
+    #[test]
+    fn hash_file_returns_none_for_missing_path() {
+        let missing = Path::new("/this/path/very/definitely/does/not/exist/anywhere");
+        assert_eq!(hash_file(missing), None);
+    }
+
+    #[test]
+    fn hash_file_is_deterministic_for_known_input() {
+        use std::io::Write as _;
+        let tmpdir = std::env::temp_dir().join(format!(
+            "agent-vm-hash-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("known");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Capital T is the famous one (`d7a8fbb...`).
+        f.write_all(b"The quick brown fox jumps over the lazy dog").unwrap();
+        drop(f);
+        let h = hash_file(&path).unwrap();
+        assert_eq!(
+            h,
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    // ── decode_id_token_account ───────────────────────────────────
+
+    fn make_jwt(payload_json: &str, alphabet: base64::engine::general_purpose::GeneralPurpose) -> String {
+        use base64::Engine as _;
+        // Header doesn't matter; payload is what we test.
+        let header = alphabet.encode(b"{\"alg\":\"none\",\"typ\":\"JWT\"}");
+        let payload = alphabet.encode(payload_json.as_bytes());
+        // Trim padding when present — JWTs are unpadded.
+        let h = header.trim_end_matches('=');
+        let p = payload.trim_end_matches('=');
+        format!("{h}.{p}.sig")
+    }
+
+    #[test]
+    fn decode_id_token_account_urlsafe_jwt() {
+        let payload = r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"abc-123"}}"#;
+        let jwt = make_jwt(payload, base64::engine::general_purpose::URL_SAFE_NO_PAD);
+        let json = serde_json::json!({"tokens": {"id_token": jwt}});
+        assert_eq!(
+            decode_id_token_account(&json).as_deref(),
+            Some("abc-123"),
+        );
+    }
+
+    #[test]
+    fn decode_id_token_account_standard_alphabet_falls_back() {
+        // Some libraries emit JWTs with standard-alphabet base64
+        // (`+`/`/`) instead of URL-safe (`-`/`_`). The decoder must
+        // try STANDARD as a fallback. Construct a payload whose
+        // base64 encoding includes a `+` or `/` — most easily by
+        // embedding bytes that base64 to those chars.
+        let payload = r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct?+/"}}"#;
+        let jwt = make_jwt(payload, base64::engine::general_purpose::STANDARD);
+        let json = serde_json::json!({"tokens": {"id_token": jwt}});
+        assert_eq!(
+            decode_id_token_account(&json).as_deref(),
+            Some("acct?+/"),
+        );
+    }
+
+    #[test]
+    fn decode_id_token_account_returns_none_for_missing_fields() {
+        // No tokens.id_token at all.
+        assert_eq!(decode_id_token_account(&serde_json::json!({})), None);
+        // tokens present but id_token missing.
+        assert_eq!(
+            decode_id_token_account(&serde_json::json!({"tokens": {}})),
+            None
+        );
+        // id_token present but malformed (no `.`).
+        assert_eq!(
+            decode_id_token_account(&serde_json::json!({"tokens": {"id_token": "garbage"}})),
+            None
+        );
+        // id_token decodes but the OpenAI-auth claim is missing.
+        let payload = r#"{"something": "else"}"#;
+        let jwt = make_jwt(payload, base64::engine::general_purpose::URL_SAFE_NO_PAD);
+        let json = serde_json::json!({"tokens": {"id_token": jwt}});
+        assert_eq!(decode_id_token_account(&json), None);
+    }
+
+    // ── write_default_opencode_config merge semantics ─────────────
+
+    #[test]
+    fn opencode_config_first_write_creates_with_defaults() {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "agent-vm-oc-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("opencode.json");
+
+        write_default_opencode_config(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["model"], "openai/gpt-5.5");
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(v["autoupdate"], false);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn opencode_config_preserves_user_model_override() {
+        // A user who sets model = "openai/gpt-5-turbo" must not have
+        // it clobbered on a subsequent launch.
+        let tmpdir = std::env::temp_dir().join(format!(
+            "agent-vm-oc-cfg-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("opencode.json");
+
+        std::fs::write(
+            &path,
+            r#"{"model": "openai/gpt-5-turbo", "extra": "user-data"}"#,
+        )
+        .unwrap();
+
+        write_default_opencode_config(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["model"], "openai/gpt-5-turbo", "user override survived");
+        assert_eq!(v["extra"], "user-data", "user-set field preserved");
+        // Our defaults still filled in where the user didn't set them.
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(v["autoupdate"], false);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
     }
 }

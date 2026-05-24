@@ -1087,6 +1087,65 @@ mod tests {
         assert!(!s.contains(secrets::GH_TOKEN_PLACEHOLDER));
     }
 
+    // ── parse_http_request ────────────────────────────────────────
+
+    #[test]
+    fn parse_http_request_basic_get_no_body() {
+        let req = b"GET /repos/o/r HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: gh/2\r\n\r\n";
+        let (method, path, headers, body) = parse_http_request(req).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/repos/o/r");
+        assert!(body.is_empty());
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("Host".into(), "api.github.com".into()));
+        assert_eq!(headers[1], ("User-Agent".into(), "gh/2".into()));
+    }
+
+    #[test]
+    fn parse_http_request_post_with_body() {
+        let req = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"query\":1}";
+        let (method, path, headers, body) = parse_http_request(req).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/graphql");
+        assert_eq!(body, b"{\"query\":1}");
+        assert_eq!(headers.len(), 3);
+    }
+
+    #[test]
+    fn parse_http_request_header_value_with_colons_preserved() {
+        // Authorization values commonly contain `:` — verify the
+        // header split keeps everything after the first `:`.
+        let req = b"GET /x HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz:extra\r\n\r\n";
+        let (_m, _p, headers, _b) = parse_http_request(req).unwrap();
+        let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Authorization"));
+        assert_eq!(
+            auth.map(|(_, v)| v.as_str()),
+            Some("Basic dXNlcjpwYXNz:extra")
+        );
+    }
+
+    #[test]
+    fn parse_http_request_errors_on_missing_separator() {
+        // No \r\n\r\n anywhere — can't find header/body boundary.
+        let req = b"GET /x HTTP/1.1\r\nHost: api.github.com\r\n";
+        assert!(parse_http_request(req).is_err());
+    }
+
+    #[test]
+    fn parse_http_request_errors_on_empty_request_line() {
+        let req = b"\r\nHost: api.github.com\r\n\r\n";
+        let err = parse_http_request(req);
+        assert!(err.is_err(), "empty request line must error");
+    }
+
+    #[test]
+    fn parse_http_request_handles_extra_whitespace_in_headers() {
+        // Header values are trimmed of surrounding whitespace.
+        let req = b"GET /x HTTP/1.1\r\nFoo:   bar  \r\n\r\n";
+        let (_m, _p, headers, _b) = parse_http_request(req).unwrap();
+        assert_eq!(headers[0], ("Foo".into(), "bar".into()));
+    }
+
     #[test]
     fn auth_substitute_basic_no_placeholder_passes_through() {
         // A `Basic ...` value that doesn't carry our placeholder

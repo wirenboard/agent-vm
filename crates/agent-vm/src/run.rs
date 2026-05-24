@@ -355,6 +355,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                 // dangle but nothing references them.)
                 .symlink("/agent-vm-state/gitconfig", "/root/.gitconfig", true)
                 .symlink("/agent-vm-state/gh-config", "/root/.config/gh", true)
+                // Persistent per-project bash history. secrets::refresh
+                // touches `<state>/bash_history` so the symlink target
+                // exists on first launch. Bash saves on exit (clean
+                // `exit` or Ctrl-D, NOT Ctrl-C of the launcher).
+                .symlink(
+                    "/agent-vm-state/bash_history",
+                    "/root/.bash_history",
+                    true,
+                )
         })
         .env("CODEX_HOME", "/agent-vm-state/codex")
         .replace();
@@ -817,11 +826,18 @@ fn parse_github_slug(url: &str) -> Option<String> {
     } else {
         return None;
     };
-    let trimmed = rest.trim_end_matches('/').trim_end_matches(".git");
+    let trimmed = rest.trim_end_matches('/');
     let mut parts = trimmed.split('/');
     let owner = parts.next()?;
-    let repo = parts.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    let repo_raw = parts.next()?;
+    if owner.is_empty() || repo_raw.is_empty() {
+        return None;
+    }
+    // Strip exactly ONE trailing `.git` (the git URL convention).
+    // `trim_end_matches` here would be greedy — `repo.git.git`
+    // would round-trip as `repo` and miss the actual repo name.
+    let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
+    if repo.is_empty() {
         return None;
     }
     Some(format!("{owner}/{repo}"))
@@ -855,6 +871,172 @@ mod tests {
         assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
         assert_eq!(shell_escape("don't"), "'don'\\''t'");
         assert_eq!(shell_escape(""), "''");
+    }
+
+    // ── parse_github_slug ────────────────────────────────────────
+
+    #[test]
+    fn parse_github_slug_https_with_and_without_dot_git() {
+        assert_eq!(
+            parse_github_slug("https://github.com/wirenboard/agent-vm.git"),
+            Some("wirenboard/agent-vm".into())
+        );
+        assert_eq!(
+            parse_github_slug("https://github.com/wirenboard/agent-vm"),
+            Some("wirenboard/agent-vm".into())
+        );
+        // Extra path components beyond the repo are ignored.
+        assert_eq!(
+            parse_github_slug("https://github.com/wirenboard/agent-vm/tree/main"),
+            Some("wirenboard/agent-vm".into())
+        );
+        // http also works.
+        assert_eq!(
+            parse_github_slug("http://github.com/o/r.git"),
+            Some("o/r".into())
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_scp_and_ssh_url_forms() {
+        // scp-like: git@github.com:owner/repo[.git]
+        assert_eq!(
+            parse_github_slug("git@github.com:wirenboard/agent-vm.git"),
+            Some("wirenboard/agent-vm".into())
+        );
+        assert_eq!(
+            parse_github_slug("git@github.com:wirenboard/agent-vm"),
+            Some("wirenboard/agent-vm".into())
+        );
+        // URL form with /
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com/wirenboard/agent-vm.git"),
+            Some("wirenboard/agent-vm".into())
+        );
+        // URL form with port: ssh://git@github.com:22/owner/repo
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com:22/wirenboard/agent-vm"),
+            Some("wirenboard/agent-vm".into())
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_rejects_non_github_urls() {
+        assert_eq!(parse_github_slug("https://gitlab.com/o/r"), None);
+        assert_eq!(parse_github_slug("https://example.com/github.com/o/r"), None);
+        assert_eq!(parse_github_slug(""), None);
+        assert_eq!(parse_github_slug("not a url"), None);
+    }
+
+    #[test]
+    fn parse_github_slug_handles_dot_git_only_once() {
+        // Regression: `trim_end_matches(".git")` (greedy) would strip
+        // both, yielding `o/repo` instead of `o/repo.git`. With
+        // `strip_suffix` we strip exactly one.
+        assert_eq!(
+            parse_github_slug("https://github.com/o/repo.git.git"),
+            Some("o/repo.git".into())
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_rejects_empty_owner_or_repo() {
+        assert_eq!(parse_github_slug("https://github.com/"), None);
+        assert_eq!(parse_github_slug("https://github.com/owner"), None);
+        assert_eq!(parse_github_slug("https://github.com/owner/"), None);
+        assert_eq!(parse_github_slug("https://github.com//repo"), None);
+        // Only `.git` after the owner means an empty repo segment.
+        assert_eq!(parse_github_slug("https://github.com/owner/.git"), None);
+    }
+
+    // ── parse_extra_mounts ───────────────────────────────────────
+
+    #[test]
+    fn parse_extra_mounts_mirror_form() {
+        // Mirror form: HOST alone → guest = host. Resolve against
+        // cwd so the host path canonicalize succeeds in the test.
+        // Use `/` which always exists.
+        let parsed = parse_extra_mounts(&["/".into()]).expect("ok");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].host, std::path::Path::new("/"));
+        assert_eq!(parsed[0].guest, std::path::Path::new("/"));
+    }
+
+    #[test]
+    fn parse_extra_mounts_remap_form() {
+        let parsed = parse_extra_mounts(&["/:/guest-mount".into()]).expect("ok");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].host, std::path::Path::new("/"));
+        assert_eq!(parsed[0].guest, std::path::Path::new("/guest-mount"));
+    }
+
+    #[test]
+    fn parse_extra_mounts_rejects_relative_paths() {
+        assert!(parse_extra_mounts(&["relative-host".into()]).is_err());
+        assert!(parse_extra_mounts(&["/abs-host:relative-guest".into()]).is_err());
+        assert!(parse_extra_mounts(&["relative-host:/abs-guest".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_extra_mounts_rejects_empty_side() {
+        assert!(parse_extra_mounts(&[":/guest".into()]).is_err());
+        assert!(parse_extra_mounts(&["/host:".into()]).is_err());
+        assert!(parse_extra_mounts(&["".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_extra_mounts_rejects_nonexistent_host_path_at_canonicalize() {
+        // canonicalize fails on missing paths → Err propagates.
+        let r = parse_extra_mounts(&["/this/path/does/not/exist/anywhere".into()]);
+        assert!(r.is_err());
+    }
+
+    // ── mkdir_chain ──────────────────────────────────────────────
+
+    #[test]
+    fn mkdir_chain_yields_path_prefixes() {
+        let chain = mkdir_chain(std::path::Path::new("/home/user/proj"));
+        assert_eq!(chain, vec!["/home", "/home/user", "/home/user/proj"]);
+    }
+
+    #[test]
+    fn mkdir_chain_root_is_empty() {
+        let chain = mkdir_chain(std::path::Path::new("/"));
+        assert_eq!(chain, Vec::<String>::new());
+    }
+
+    #[test]
+    fn mkdir_chain_single_segment() {
+        let chain = mkdir_chain(std::path::Path::new("/workspace"));
+        assert_eq!(chain, vec!["/workspace"]);
+    }
+
+    // ── guest_path_is_safe ───────────────────────────────────────
+
+    #[test]
+    fn guest_path_safe_for_normal_paths() {
+        assert!(guest_path_is_safe(std::path::Path::new("/home/u/proj")));
+        assert!(guest_path_is_safe(std::path::Path::new("/workspace")));
+        assert!(guest_path_is_safe(std::path::Path::new("/opt/foo")));
+    }
+
+    #[test]
+    fn guest_path_unsafe_under_tmpfs_prefixes() {
+        // The guest tmpfs-mounts these at boot, wiping any bake-time
+        // mount point — so we can't mirror them.
+        assert!(!guest_path_is_safe(std::path::Path::new("/tmp")));
+        assert!(!guest_path_is_safe(std::path::Path::new("/tmp/anything")));
+        assert!(!guest_path_is_safe(std::path::Path::new("/run")));
+        assert!(!guest_path_is_safe(std::path::Path::new("/run/user/1000")));
+        assert!(!guest_path_is_safe(std::path::Path::new("/dev/shm")));
+        assert!(!guest_path_is_safe(std::path::Path::new("/var/run/foo")));
+    }
+
+    #[test]
+    fn guest_path_safe_for_lookalikes_outside_tmpfs() {
+        // /tmpfoo is NOT under /tmp/ — must remain safe.
+        assert!(guest_path_is_safe(std::path::Path::new("/tmpfoo")));
+        assert!(guest_path_is_safe(std::path::Path::new("/run-extra")));
     }
 }
 
