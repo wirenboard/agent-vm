@@ -84,11 +84,20 @@ async fn main() -> Result<()> {
 }
 
 /// Wire `tracing` so `RUST_LOG=agent_vm=debug,microsandbox=info` works.
-/// Default level is `warn` — keeps normal output clean, but anything from
-/// the microsandbox stack surfaces when you ask for it.
+/// Default level is `warn` for most crates, but the network proxy
+/// modules default to `info` so per-connection lifecycle records
+/// (duration, bytes, close reason) show up out of the box — these
+/// are the breadcrumbs that distinguish "Claude API hung" from
+/// "Claude's pooled HTTP/2 conn died after hours of idle". They land
+/// in `~/.microsandbox/sandboxes/<name>/logs/msb.stderr.log` thanks
+/// to the spawn-side tee.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,microsandbox_network::proxy=info,microsandbox_network::tls::proxy=info",
+        )
+    });
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

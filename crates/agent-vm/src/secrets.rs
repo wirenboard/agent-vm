@@ -28,10 +28,10 @@ use crate::host_paths::{
 // for the real value at the network layer on the way out, and forged
 // into OAuth refresh responses by `intercept_hook`.
 
-pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1";
-pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1";
-pub const OPENAI_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_ACCESS_TOKEN_v1";
-pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOKEN_v1";
+pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "msb-anthropic-placeholder-a-v2";
+pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "msb-anthropic-placeholder-r-v2";
+pub const OPENAI_ACCESS_PLACEHOLDER: &str = "msb-openai-placeholder-a-v2";
+pub const OPENAI_REFRESH_PLACEHOLDER: &str = "msb-openai-placeholder-r-v2";
 /// Synthetic JWT (alg:none) carrying only placeholder fields. Codex
 /// parses `tokens.id_token` client-side at startup, so the placeholder
 /// has to be structurally a JWT or codex refuses to load — but it has
@@ -45,11 +45,11 @@ pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOK
 ///                       "https://api.openai.com/auth":{"chatgpt_account_id":"00000000-0000-0000-0000-000000000000",
 ///                       "chatgpt_plan_type":"placeholder","chatgpt_subscription_active_until":"9999-12-31T00:00:00+00:00",
 ///                       "chatgpt_user_id":"user-placeholder"},"sub":"placeholder|0"}')
-/// sig     = "MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1"  (kept literal so a
-///           string grep for the v1 marker still flags any place this
-///           leaks; the JWT spec allows arbitrary characters in the
-///           signature segment under alg:none)
-pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1";
+/// sig     = "msb-openai-placeholder-id-v2". Keep this marker
+///           non-token-shaped: Claude/Anthropic may reset requests that
+///           contain token-looking sentinel values copied from shell output
+///           into a transcript.
+pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.msb-openai-placeholder-id-v2";
 /// Synthetic JWT used as the placeholder for OpenCode's OAuth `access`
 /// field. OpenCode sends `Authorization: Bearer <access>` to
 /// api.openai.com, so this string is the exact byte sequence the proxy
@@ -69,11 +69,11 @@ pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ
 /// timed out before relay sent bytes`. Add fields here only if
 /// OpenCode actually parses them and chokes on absence.
 pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.MSB_OPENCODE_v1";
-pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENCODE_OPENAI_REFRESH_v1";
+pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "msb-opencode-placeholder-r-v2";
 /// Placeholder for the host's `gh auth token`. The in-guest `gh` /
 /// git credential helper sees this string; the proxy substitutes the
 /// real bearer on outbound traffic to GitHub.
-pub const GH_TOKEN_PLACEHOLDER: &str = "MSB_PLACEHOLDER_GH_TOKEN_v1";
+pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any

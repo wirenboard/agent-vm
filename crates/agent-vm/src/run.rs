@@ -622,10 +622,26 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
         eprintln!("==> Attaching to {inner_cmd}");
-        sandbox
-            .attach(cmd, agent_args)
-            .await
-            .with_context(|| format!("attaching to {inner_cmd}"))?
+        match sandbox.attach(cmd, agent_args).await {
+            Ok(code) => code,
+            Err(err) => {
+                // Print a focused pointer to the post-mortem logs the
+                // runtime now writes (spawn.rs tees msb's stderr;
+                // handle.rs appends to msb-exit.log on reap). The
+                // raw-mode scopeguard inside attach_inner has already
+                // restored the terminal by the time we see this Err.
+                eprintln!("==> attach failed: {err:#}");
+                eprintln!(
+                    "==> VM post-mortem (if a death happened, the cause is usually in one of these):"
+                );
+                let log_dir = msb_sandbox_log_dir(&session.sandbox_name);
+                eprintln!("      {}/runtime.log     (msb tracing / panic)", log_dir.display());
+                eprintln!("      {}/msb.stderr.log  (libkrun / kernel printk / OOM)", log_dir.display());
+                eprintln!("      {}/msb-exit.log    (exit status of each boot)", log_dir.display());
+                eprintln!("      dmesg -T | tail    (host-side OOM-kill of the msb process)");
+                return Err(err).with_context(|| format!("attaching to {inner_cmd}"));
+            }
+        }
     } else {
         // No host TTY (piped, redirected, smoke-tested under `sg`/`sudo` etc.).
         // attach() needs a real /dev/tty for raw-mode stdin, so use the
@@ -701,6 +717,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // any `?`-propagated error path.
 
     Ok(exit)
+}
+
+/// Best-effort guess at where msb writes per-sandbox runtime logs.
+/// Mirrors `microsandbox_utils::resolve_home()` / `sandboxes_dir()`:
+/// `$MSB_HOME` or `~/.microsandbox`, then `sandboxes/<name>/logs`.
+/// Used only for human-readable post-mortem hints, so a stale guess
+/// (e.g. caller overrode the home via config) just makes the hint
+/// slightly off rather than breaking anything.
+fn msb_sandbox_log_dir(sandbox_name: &str) -> PathBuf {
+    let home = env::var_os("MSB_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".microsandbox")))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/microsandbox"));
+    home.join("sandboxes").join(sandbox_name).join("logs")
 }
 
 /// One `--mount HOST[:GUEST]` argument resolved into separate paths.
