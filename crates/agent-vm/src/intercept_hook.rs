@@ -155,11 +155,11 @@ async fn forward_github_api(
     let (method, path, headers, body) = parse_http_request(request)
         .context("parsing intercepted github request")?;
 
-    if !github_path_allowed(&path, allowed_repos) {
+    if !github_path_allowed(&method, &path, allowed_repos) {
         return Ok(error_response(
             403,
             &format!(
-                "agent-vm: path {path:?} blocked by per-launch repo allow-list. Allowed repos: {}",
+                "agent-vm: {method} {path:?} blocked by per-launch repo allow-list (read access is unrestricted; writes/mutations are scoped). Allowed repos: {}",
                 if allowed_repos.is_empty() {
                     "(none — pass --repo OWNER/NAME or run inside a project with a github remote)".into()
                 } else {
@@ -297,65 +297,68 @@ fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String
     Ok((method, path, headers, body))
 }
 
-/// Path-based allow-list check for api.github.com requests.
+/// Method+path-based allow-list check for api.github.com requests.
 ///
-/// Accepts (case-insensitive on owner/repo):
-/// - `/repos/<owner>/<repo>[/...]` where `<owner>/<repo>` is in the
-///   allow-list, after rejecting any `..` traversal segment so a
-///   crafted path like `/repos/<allowed>/<repo>/../../<victim>/<private>`
-///   can't pass the surface check and let GitHub resolve `..`
-///   upstream.
-/// - `/user` and `/user/...` — gh CLI auth-status, current-user info.
-///   Limited to the small set gh actually needs: /user (auth probe),
-///   /user/orgs (org membership). Excludes /user/repos, /user/keys,
-///   /user/emails, /user/gpg_keys to avoid leaking full inventory /
-///   PII.
-/// - **`/graphql`** — gh CLI's `gh pr create`, `gh issue create`,
-///   `gh repo view --json` all use GraphQL mutations. We DO NOT body-
-///   filter the GraphQL request: per-repo scoping doesn't reach into
-///   the JSON body in v1. Accept that an agent that crafts arbitrary
-///   GraphQL queries can read anything the token can; the practical
-///   trade-off is "gh CLI works" vs. "no GraphQL".
-/// - `/search/...`, `/rate_limit`, `/meta`, `/markdown` — small
-///   utility endpoints gh CLI uses ambiently.
-/// - `/orgs/<org>` (no further path) — gh CLI reads org metadata to
-///   resolve `gh repo view org/...`.
-fn github_path_allowed(path: &str, allowed: &[String]) -> bool {
+/// **Policy:** read-only access is unrestricted (agents commonly need
+/// to read arbitrary public/private GitHub state — browse a different
+/// repo, look up an API, fetch a README, check who reviewed a PR).
+/// Only **write / management** operations are scoped to the per-launch
+/// allow-list, mirroring the user's actual concern: "don't let the
+/// agent push to / mutate repos I didn't list."
+///
+/// Allowed unconditionally:
+/// - Any `GET` or `HEAD` request (read-only).
+/// - `POST /graphql` (gh PR/issue/etc. creation uses this). We do
+///   **not** body-filter GraphQL mutations — that needs the request
+///   body which the streaming intercept path doesn't see. Documented
+///   gap: an agent that crafts a GraphQL mutation can do anything the
+///   token can.
+/// - `POST /markdown` (utility, no state change).
+/// - `POST /user/repos`, `POST /repos/<owner>/<repo>/forks`,
+///   `POST /repos/<owner>/<repo>/transfer` and similar repo-creation
+///   shapes: these create new repos owned by the user — not "mutating
+///   someone else's repo." Allowed.
+///
+/// Write methods on `/repos/<owner>/<repo>/*`:
+/// - Allowed only when `<owner>/<repo>` (case-insensitive) is in
+///   the allow-list. Catches PR creation, issue creation, comments,
+///   merges, branch protection edits, releases, deletes — anything
+///   that mutates a specific repo's state.
+///
+/// Traversal: any `..` path segment is rejected up front so a
+/// crafted `/repos/<allowed>/<repo>/../../<victim>/<private>` can't
+/// pass the prefix check and let GitHub resolve `..` upstream.
+///
+/// Anything else (write methods to paths outside /repos/ that aren't
+/// in the explicit allow list above) → deny by default.
+fn github_path_allowed(method: &str, path: &str, allowed: &[String]) -> bool {
     let p = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
 
-    // Reject traversal anywhere in the path. GitHub normalises `..`
-    // upstream and would otherwise serve a different (blocked) repo.
+    // Reject `..` traversal anywhere. GitHub server-normalises `..`
+    // and would otherwise resolve to a different repo than the one
+    // we checked.
     for seg in p.split('/') {
         if seg == ".." {
             return false;
         }
     }
 
-    // Narrow /user/* surface to what gh actually needs for auth +
-    // org-membership checks. Excludes /user/repos, /user/keys,
-    // /user/emails, /user/gpg_keys (PII / full-inventory leak).
-    if p == "/user" || p == "/user/orgs" || p.starts_with("/user/orgs/") {
+    // Reads — unrestricted.
+    if matches!(method, "GET" | "HEAD") {
         return true;
     }
-    // Utility endpoints — read-only, no per-repo state.
-    if matches!(p, "/rate_limit" | "/meta" | "/markdown") {
-        return true;
-    }
-    if p == "/search" || p.starts_with("/search/") {
-        return true;
-    }
-    if p == "/orgs" {
-        return false; // listing orgs isn't useful and exposes membership
-    }
-    // gh resolves `gh repo view org/x` via /orgs/<org> first; allow
-    // bare org-info reads (no /repos sub-path which would be a list).
-    if let Some(rest) = p.strip_prefix("/orgs/") {
-        return !rest.is_empty() && !rest.contains('/');
-    }
-    // GraphQL: gh PR/issue creation. No body-filter — see fn doc.
+
+    // GraphQL: allow (no body-level filtering in v1).
     if p == "/graphql" {
         return true;
     }
+
+    // Utility / write-but-not-other-repo-mutating endpoints.
+    if matches!(p, "/markdown" | "/user/repos") {
+        return true;
+    }
+
+    // Repo-scoped writes: only against the allow-list.
     if let Some(rest) = p.strip_prefix("/repos/") {
         let mut it = rest.split('/');
         let owner = it.next().unwrap_or("");
@@ -364,10 +367,12 @@ fn github_path_allowed(path: &str, allowed: &[String]) -> bool {
             return false;
         }
         let slug = format!("{owner}/{repo}");
-        return allowed
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(&slug));
+        return allowed.iter().any(|a| a.eq_ignore_ascii_case(&slug));
     }
+
+    // Anything else (writes outside the explicit allow set above) is
+    // denied. Reaching here means a write to e.g. /user/keys, /orgs/X
+    // settings, /admin/* — none of which is a normal gh CLI flow.
     false
 }
 
@@ -385,17 +390,22 @@ enum GithubSmartDecision {
 }
 
 /// Check the first line of `request` against the per-launch repo
-/// allow-list. github.com smart-HTTP URLs look like:
+/// allow-list, applying the same read-unrestricted / writes-scoped
+/// policy as the REST API: clone and fetch (`git-upload-pack`,
+/// codeload archives, raw blobs) are allowed against any repo;
+/// push (`git-receive-pack`) is scoped.
 ///
-///   GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack
-///   POST /<owner>/<repo>.git/git-upload-pack
-///   POST /<owner>/<repo>.git/git-receive-pack
+/// github.com smart-HTTP URLs (in scope for filtering):
+///
+///   GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack   ← read
+///   POST /<owner>/<repo>.git/git-upload-pack                      ← read
+///   GET  /<owner>/<repo>.git/info/refs?service=git-receive-pack  ← write (push handshake)
+///   POST /<owner>/<repo>.git/git-receive-pack                     ← write (push data)
 ///
 /// codeload, raw, objects host paths look like
-/// `/<owner>/<repo>/...`. The first two path segments are always the
-/// owner+repo (with optional `.git` suffix on github.com smart paths).
-/// We strip the `.git` suffix from the repo name and check the
-/// `<owner>/<repo>` slug case-insensitively against `allowed_repos`.
+/// `/<owner>/<repo>/...` and are always read-only — `git clone` /
+/// `git fetch` and tarball downloads. Allowed unconditionally; no
+/// owner/repo check.
 fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmartDecision {
     let line_end = match request.windows(2).position(|w| w == b"\r\n") {
         Some(p) => p,
@@ -405,9 +415,9 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
         Ok(s) => s,
         Err(_) => return GithubSmartDecision::Malformed,
     };
-    // GET /<owner>/<repo>... HTTP/1.1
+    // METHOD path HTTP/1.1
     let mut parts = line.split_ascii_whitespace();
-    let _method = match parts.next() {
+    let method = match parts.next() {
         Some(m) => m,
         None => return GithubSmartDecision::Malformed,
     };
@@ -415,11 +425,14 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
         Some(p) => p,
         None => return GithubSmartDecision::Malformed,
     };
-    // Strip query string + leading slash for splitting.
-    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let (path_no_query, query) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    };
     let trimmed = path_no_query.trim_start_matches('/');
 
-    // Reject `..` traversal up front (mirrors github_path_allowed).
+    // Reject `..` traversal up front. Server normalisation would
+    // otherwise pick a different repo than the one we checked.
     for seg in trimmed.split('/') {
         if seg == ".." {
             return GithubSmartDecision::Deny(format!(
@@ -428,25 +441,38 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
         }
     }
 
+    // Identify the *operation*. Only the write paths need an allow-
+    // list check; everything else (reads, browsing, archive downloads)
+    // passes through.
+    let is_push_data = method == "POST" && path_no_query.ends_with("/git-receive-pack");
+    let is_push_handshake = method == "GET"
+        && path_no_query.ends_with("/info/refs")
+        && query.split('&').any(|kv| kv == "service=git-receive-pack");
+    if !(is_push_data || is_push_handshake) {
+        // Read / clone / fetch / browse / archive — allowed against
+        // any repo.
+        return GithubSmartDecision::Passthrough;
+    }
+
+    // It's a push. Extract owner/repo from the first two path
+    // segments and check the allow-list.
     let mut it = trimmed.split('/');
     let owner = it.next().unwrap_or("");
     let repo_raw = it.next().unwrap_or("");
     if owner.is_empty() || repo_raw.is_empty() {
         return GithubSmartDecision::Deny(format!(
-            "agent-vm: path {path:?} doesn't name an owner/repo"
+            "agent-vm: push path {path:?} doesn't name an owner/repo"
         ));
     }
-    // git smart-HTTP paths put the repo as `<repo>.git`. trim_end_matches
-    // strips repeated suffixes — fine because GitHub doesn't accept
-    // `.git.git` as a real repo, but as a safety we only strip ONE
-    // suffix.
+    // Strip a single trailing `.git`; git smart paths are
+    // `<repo>.git/...`. `strip_suffix` removes exactly one.
     let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
     let slug = format!("{owner}/{repo}");
     if allowed_repos.iter().any(|a| a.eq_ignore_ascii_case(&slug)) {
         GithubSmartDecision::Passthrough
     } else {
         GithubSmartDecision::Deny(format!(
-            "agent-vm: {slug:?} not in per-launch repo allow-list. Allowed: {}",
+            "agent-vm: push to {slug:?} blocked by per-launch repo allow-list (reads are unrestricted; pushes are scoped). Allowed: {}",
             if allowed_repos.is_empty() {
                 "(none)".into()
             } else {
