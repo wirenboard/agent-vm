@@ -12,6 +12,13 @@ license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
 
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 16
+lto = "thin"
 strip = true
+
+# For distribution builds where binary size / runtime perf matter most.
+# Slower to build (single-threaded LTO + 1 codegen unit). Use: `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
