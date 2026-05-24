@@ -101,84 +101,79 @@ jobs:
             --manifest-path vendor/microsandbox/Cargo.toml \
             -p microsandbox-cli --bin msb
 
-      - name: Resolve libkrunfw version from vendored source
-        id: lkv
+      - name: Resolve runtime-bundle versions from vendor/microsandbox
+        id: msb_ver
         shell: bash
         run: |
           set -euo pipefail
-          # Single source of truth: the upstream constants in
-          # crates/utils/lib/lib.rs. Bumping the submodule
-          # automatically bumps the bundled .so.
+          # Read the values straight from the vendored source of
+          # truth so the npm bundle stays aligned with what the
+          # patched msb expects to dynamically load. The crate uses
+          # `version.workspace = true`, so the canonical version
+          # lives in the workspace root Cargo.toml.
+          msb_version=$(awk -F\" '/^version *=/{print $2; exit}' \
+            vendor/microsandbox/Cargo.toml)
           libkrunfw_version=$(awk -F\" \
             '/^pub const LIBKRUNFW_VERSION *: *&str *= *"/{print $2; exit}' \
             vendor/microsandbox/crates/utils/lib/lib.rs)
           libkrunfw_abi=$(awk -F\" \
             '/^pub const LIBKRUNFW_ABI *: *&str *= *"/{print $2; exit}' \
             vendor/microsandbox/crates/utils/lib/lib.rs)
-          test -n "$libkrunfw_version" || { echo "::error::could not read LIBKRUNFW_VERSION"; exit 1; }
-          test -n "$libkrunfw_abi"     || { echo "::error::could not read LIBKRUNFW_ABI"; exit 1; }
-          echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
-          echo "libkrunfw_abi=$libkrunfw_abi"         >> "$GITHUB_OUTPUT"
-          # Hash that uniquely identifies a buildable libkrunfw —
-          # the source tree + the Makefile's kernel version line.
-          # Used as the cache key for the (slow) kernel build.
-          hash=$(git -C vendor/microsandbox/vendor/libkrunfw rev-parse HEAD)
-          echo "libkrunfw_src_hash=$hash" >> "$GITHUB_OUTPUT"
+          test -n "$msb_version" || { echo "::error::could not extract msb version"; exit 1; }
+          test -n "$libkrunfw_version" || { echo "::error::could not extract libkrunfw version"; exit 1; }
+          test -n "$libkrunfw_abi" || { echo "::error::could not extract libkrunfw abi"; exit 1; }
+          echo "msb_version=$msb_version"               >> "$GITHUB_OUTPUT"
+          echo "libkrunfw_version=$libkrunfw_version"   >> "$GITHUB_OUTPUT"
+          echo "libkrunfw_abi=$libkrunfw_abi"           >> "$GITHUB_OUTPUT"
+          echo "Resolved: msb=$msb_version libkrunfw=$libkrunfw_version abi=$libkrunfw_abi"
 
-      - name: Cache built libkrunfw.so
-        id: libkrunfw-cache
-        uses: actions/cache@v4
-        with:
-          # Cache miss → ~10-15 min kernel build.
-          # Cache hit  → ~5 s restore. Reused across release-npm
-          # runs until the libkrunfw sub-submodule moves.
-          path: vendor/microsandbox/vendor/libkrunfw/libkrunfw.so.${{ steps.lkv.outputs.libkrunfw_version }}
-          key: libkrunfw-${{ matrix.platform }}-${{ steps.lkv.outputs.libkrunfw_src_hash }}
-
-      - name: Install kernel build prereqs
-        if: steps.libkrunfw-cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison flex libelf-dev libssl-dev kmod cpio \
-            python3 python3-pyelftools xz-utils
-
-      - name: Build libkrunfw from source (cache miss)
-        if: steps.libkrunfw-cache.outputs.cache-hit != 'true'
+      - name: Fetch libkrunfw from upstream microsandbox release
         shell: bash
         env:
-          LK_ARCH: ${{ matrix.libkrunfw_arch }}
+          MSB_V:    ${{ steps.msb_ver.outputs.msb_version }}
+          LK_V:     ${{ steps.msb_ver.outputs.libkrunfw_version }}
+          LK_ABI:   ${{ steps.msb_ver.outputs.libkrunfw_abi }}
+          LK_ARCH:  ${{ matrix.libkrunfw_arch }}
         run: |
           set -euo pipefail
-          cd vendor/microsandbox/vendor/libkrunfw
-          # x86_64 builds natively; other arches use the Makefile's
-          # ARCH=/CROSS_COMPILE= protocol. linux-arm64 runner would
-          # build natively too — pass nothing then.
-          make_args=( -j"$(nproc)" )
-          if [[ "$LK_ARCH" == aarch64 && "$(uname -m)" != aarch64 ]]; then
-            make_args+=( ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- )
+          # Upstream publishes a per-arch tarball containing msb +
+          # libkrunfw. We need only libkrunfw — our own patched msb
+          # ships separately in this bundle.
+          # crates/utils/lib/lib.rs::bundle_download_url
+          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
+            os_tag=darwin
+          else
+            os_tag=linux
           fi
-          make "${make_args[@]}"
-
-      - name: Stage libkrunfw + ABI symlinks into platform subpackage
-        shell: bash
-        env:
-          LK_V:   ${{ steps.lkv.outputs.libkrunfw_version }}
-          LK_ABI: ${{ steps.lkv.outputs.libkrunfw_abi }}
-        run: |
-          set -euo pipefail
+          url="https://github.com/superradcompany/microsandbox/releases/download/v${MSB_V}/microsandbox-${os_tag}-${LK_ARCH}.tar.gz"
+          echo "Downloading $url"
           dst=npm-dist/agent-vm-${{ matrix.platform }}/lib
           mkdir -p "$dst"
-          src=vendor/microsandbox/vendor/libkrunfw
-          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
-            full="libkrunfw.${LK_V}.dylib"
-            abi="libkrunfw.${LK_ABI}.dylib"
-            cp -a "$src/$full" "$dst/$full"
-            ( cd "$dst" && ln -sf "$full" "$abi" )
+          tmp=$(mktemp -d)
+          curl -fsSL -o "$tmp/bundle.tar.gz" "$url"
+          # Extract just libkrunfw* into the lib/ dir, flat (drop any
+          # leading directory prefix from the tarball).
+          tar -xzf "$tmp/bundle.tar.gz" -C "$tmp"
+          shopt -s globstar nullglob
+          found=0
+          for f in "$tmp"/**/libkrunfw*; do
+            cp -a "$f" "$dst/"
+            found=$((found+1))
+          done
+          if [[ $found -eq 0 ]]; then
+            echo "::error::no libkrunfw* in $url"; ls -R "$tmp"; exit 1
+          fi
+          rm -rf "$tmp"
+
+          # Recreate the ABI symlinks the dynamic linker expects.
+          # Mirrors `libkrunfw_symlinks()` in vendor/microsandbox/
+          # crates/microsandbox/lib/setup/download.rs.
+          if [[ "$os_tag" == darwin ]]; then
+            full="libkrunfw.${LK_ABI}.dylib"
+            test -f "$dst/$full" || ln -s "libkrunfw.${LK_V}.dylib" "$dst/$full"
           else
             full="libkrunfw.so.${LK_V}"
             soname="libkrunfw.so.${LK_ABI}"
-            cp -a "$src/$full" "$dst/$full"
             ( cd "$dst" && ln -sf "$full" "$soname" && ln -sf "$soname" "libkrunfw.so" )
           fi
           ls -la "$dst"
