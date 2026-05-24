@@ -77,6 +77,34 @@ pub async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    // The git-smart-HTTP hosts (github.com, codeload, raw, objects)
+    // are wired with `rule_streaming` upstream so the hook sees only
+    // headers, not the (potentially MB-sized) pack body. We decide
+    // based on the path alone: in-allow-list → empty stdout
+    // (passthrough — proxy streams the rest to upstream with the
+    // network secret layer substituting the placeholder bearer);
+    // out-of-list → synthesized 403.
+    let github_smart_hosts: [&str; 4] = [
+        secrets::GITHUB_HOST,
+        secrets::GITHUB_CODELOAD_HOST,
+        secrets::GITHUB_RAW_HOST,
+        secrets::GITHUB_OBJECTS_HOST,
+    ];
+    if github_smart_hosts
+        .iter()
+        .any(|h| args.sni.eq_ignore_ascii_case(h))
+    {
+        let response = match github_smart_decision(&request, &args.allowed_repos) {
+            GithubSmartDecision::Passthrough => Vec::new(), // empty = passthrough
+            GithubSmartDecision::Deny(msg) => error_response(403, &msg),
+            GithubSmartDecision::Malformed => {
+                error_response(400, "agent-vm github smart-HTTP filter: malformed request")
+            }
+        };
+        write_response(&response)?;
+        return Ok(());
+    }
+
     if !looks_like_oauth_refresh(&request) {
         // Forward an opaque server error so the in-VM agent at least
         // gets a comprehensible failure rather than a hang. We don't
@@ -341,6 +369,91 @@ fn github_path_allowed(path: &str, allowed: &[String]) -> bool {
             .any(|a| a.eq_ignore_ascii_case(&slug));
     }
     false
+}
+
+/// Decision for a request to a git-smart-HTTP host (github.com /
+/// codeload / raw / objects).
+enum GithubSmartDecision {
+    /// Path matches the allow-list: tell the proxy to passthrough
+    /// (empty hook stdout).
+    Passthrough,
+    /// Path is outside the allow-list: synthesize a 403 with `reason`.
+    Deny(String),
+    /// Couldn't parse the request well enough to decide; fall back to
+    /// a 400. Rare, indicates a non-HTTP or truncated request.
+    Malformed,
+}
+
+/// Check the first line of `request` against the per-launch repo
+/// allow-list. github.com smart-HTTP URLs look like:
+///
+///   GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack
+///   POST /<owner>/<repo>.git/git-upload-pack
+///   POST /<owner>/<repo>.git/git-receive-pack
+///
+/// codeload, raw, objects host paths look like
+/// `/<owner>/<repo>/...`. The first two path segments are always the
+/// owner+repo (with optional `.git` suffix on github.com smart paths).
+/// We strip the `.git` suffix from the repo name and check the
+/// `<owner>/<repo>` slug case-insensitively against `allowed_repos`.
+fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmartDecision {
+    let line_end = match request.windows(2).position(|w| w == b"\r\n") {
+        Some(p) => p,
+        None => return GithubSmartDecision::Malformed,
+    };
+    let line = match std::str::from_utf8(&request[..line_end]) {
+        Ok(s) => s,
+        Err(_) => return GithubSmartDecision::Malformed,
+    };
+    // GET /<owner>/<repo>... HTTP/1.1
+    let mut parts = line.split_ascii_whitespace();
+    let _method = match parts.next() {
+        Some(m) => m,
+        None => return GithubSmartDecision::Malformed,
+    };
+    let path = match parts.next() {
+        Some(p) => p,
+        None => return GithubSmartDecision::Malformed,
+    };
+    // Strip query string + leading slash for splitting.
+    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let trimmed = path_no_query.trim_start_matches('/');
+
+    // Reject `..` traversal up front (mirrors github_path_allowed).
+    for seg in trimmed.split('/') {
+        if seg == ".." {
+            return GithubSmartDecision::Deny(format!(
+                "agent-vm: path {path:?} contains '..' (traversal rejected)"
+            ));
+        }
+    }
+
+    let mut it = trimmed.split('/');
+    let owner = it.next().unwrap_or("");
+    let repo_raw = it.next().unwrap_or("");
+    if owner.is_empty() || repo_raw.is_empty() {
+        return GithubSmartDecision::Deny(format!(
+            "agent-vm: path {path:?} doesn't name an owner/repo"
+        ));
+    }
+    // git smart-HTTP paths put the repo as `<repo>.git`. trim_end_matches
+    // strips repeated suffixes — fine because GitHub doesn't accept
+    // `.git.git` as a real repo, but as a safety we only strip ONE
+    // suffix.
+    let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
+    let slug = format!("{owner}/{repo}");
+    if allowed_repos.iter().any(|a| a.eq_ignore_ascii_case(&slug)) {
+        GithubSmartDecision::Passthrough
+    } else {
+        GithubSmartDecision::Deny(format!(
+            "agent-vm: {slug:?} not in per-launch repo allow-list. Allowed: {}",
+            if allowed_repos.is_empty() {
+                "(none)".into()
+            } else {
+                allowed_repos.join(", ")
+            }
+        ))
+    }
 }
 
 fn read_gh_token(state_dir: &Path) -> Result<String> {

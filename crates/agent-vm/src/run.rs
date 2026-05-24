@@ -473,6 +473,22 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
                         ix = ix.rule(GITHUB_API_HOST, method, "/");
                     }
+                    // Phase 6 round 2: streaming intercept for the git
+                    // smart-HTTP protocol on github.com. The hook
+                    // decides based on the request line alone (path
+                    // is `/<owner>/<repo>.git/...`); empty stdout =
+                    // passthrough → secret-substitution layer fills
+                    // in the real bearer for legitimate push/clone.
+                    // Non-empty = synthesized 403 for off-allow-list
+                    // repos. Without this the per-launch repo
+                    // allow-list would only bind api.github.com and
+                    // git push could reach anywhere.
+                    for method in ["GET", "POST"] {
+                        ix = ix.rule_streaming(GITHUB_HOST, method, "/");
+                        ix = ix.rule_streaming(GITHUB_CODELOAD_HOST, method, "/");
+                        ix = ix.rule_streaming(GITHUB_RAW_HOST, method, "/");
+                        ix = ix.rule_streaming(GITHUB_OBJECTS_HOST, method, "/");
+                    }
                 }
                 ix
             })
