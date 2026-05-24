@@ -108,6 +108,18 @@ pub struct Args {
     #[arg(long = "repo")]
     repo: Vec<String>,
 
+    /// Extra host directories to bind into the guest. Format:
+    /// `HOST[:GUEST]`. `GUEST` defaults to `HOST` (mirror at the
+    /// same absolute path). Repeatable.
+    ///
+    /// Each `--mount` consumes one virtio device — libkrun caps the
+    /// IRQ pool around 6, so we only have room for a couple of
+    /// extras on top of the project + state binds. The launcher will
+    /// error clearly if you cross the cap rather than failing at
+    /// boot.
+    #[arg(long = "mount")]
+    mount: Vec<String>,
+
     /// Args forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -209,6 +221,28 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             .context("writing guest gh/git config")?;
     }
 
+    // Phase 7: parse `--mount HOST[:GUEST]` extras. The libkrun IRQ
+    // pool is *tight* — empirically the project bind + state bind +
+    // network + agentd + OCI overlay already saturate it on this
+    // build, so any extra mount tends to trip a confusing
+    // `RegisterNetDevice(IrqsExhausted)` at boot. We let the user try
+    // and surface a friendly suggestion if libkrun rejects the
+    // config; we don't pre-cap because libkrun configurations vary.
+    // See discovered upstream issue #3.
+    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    for em in &extra_mounts {
+        if !em.host.exists() {
+            anyhow::bail!("--mount host path {:?} does not exist", em.host);
+        }
+    }
+    if !extra_mounts.is_empty() {
+        eprintln!(
+            "==> Note: {} --mount arg(s) — libkrun's virtio IRQ pool is tight; if you see \
+             RegisterNetDevice(IrqsExhausted) at boot, drop a mount or pass --no-git to free a slot.",
+            extra_mounts.len()
+        );
+    }
+
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
         .registry(|r| r.insecure())
@@ -217,7 +251,35 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .memory(memory_mib)
         .workdir(project_guest_path.clone())
         .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
-        .volume("/agent-vm-state", |m| m.bind(&session.state_dir))
+        .volume("/agent-vm-state", |m| m.bind(&session.state_dir));
+    // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
+    // .volume() — and we also have to mkdir the guest path in the
+    // patch builder so microsandbox's workdir/rootfs validation passes
+    // (same dance as the project bind above).
+    let mut extra_mount_mkdirs: Vec<String> = Vec::new();
+    for em in &extra_mounts {
+        eprintln!(
+            "==> Mounting {} -> {}",
+            em.host.display(),
+            em.guest.display()
+        );
+        let host = em.host.clone();
+        let guest_str = em
+            .guest
+            .to_str()
+            .context("--mount guest path must be UTF-8")?
+            .to_string();
+        builder = builder.volume(guest_str.clone(), move |m| m.bind(host.clone()));
+        extra_mount_mkdirs.extend(mkdir_chain(&em.guest));
+    }
+    builder = builder
+        .patch(|mut p| {
+            for parent in extra_mount_mkdirs.drain(..) {
+                p = p.mkdir(parent, None);
+            }
+            p
+        });
+    let mut builder = builder
         .patch(|mut p| {
             for parent in patch_builder_steps.drain(..) {
                 p = p.mkdir(parent, None);
@@ -533,6 +595,44 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     Ok(exit)
+}
+
+/// One `--mount HOST[:GUEST]` argument resolved into separate paths.
+struct ExtraMount {
+    host: PathBuf,
+    guest: PathBuf,
+}
+
+/// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
+/// `HOST` alone defaults `GUEST` to the same absolute path (mirror).
+/// `HOST:GUEST` lets you remap. Errors clearly on absolute-path
+/// requirements (relative paths are confusing across host/guest).
+fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let (host_s, guest_s) = match entry.split_once(':') {
+            Some((h, g)) => (h.trim().to_string(), g.trim().to_string()),
+            None => (entry.trim().to_string(), entry.trim().to_string()),
+        };
+        if host_s.is_empty() || guest_s.is_empty() {
+            anyhow::bail!("--mount value {entry:?} must be HOST[:GUEST] (non-empty)");
+        }
+        let host = PathBuf::from(&host_s);
+        let guest = PathBuf::from(&guest_s);
+        if !host.is_absolute() {
+            anyhow::bail!("--mount host path {host_s:?} must be absolute");
+        }
+        if !guest.is_absolute() {
+            anyhow::bail!("--mount guest path {guest_s:?} must be absolute");
+        }
+        // Canonicalize host so we follow symlinks; the bind target
+        // needs to be a real path on the host.
+        let host = host
+            .canonicalize()
+            .with_context(|| format!("canonicalizing --mount host {host_s:?}"))?;
+        out.push(ExtraMount { host, guest });
+    }
+    Ok(out)
 }
 
 /// Parse `git remote -v` in `project_dir` and pull out

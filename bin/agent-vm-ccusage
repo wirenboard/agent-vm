@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Phase 7: ccusage wrapper that unions the user's host ~/.claude
+# session dir plus every per-project agent-vm session dir on this host,
+# so `ccusage` reports tokens/cost across host AND sandbox sessions in
+# one summary.
+#
+# Mirrors the original Bash agent-vm's `bin/ccusage` 1:1 but resolves
+# the state root from the same precedence the Rust launcher uses.
+
+set -euo pipefail
+
+state_root="${AGENT_VM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm}"
+
+# Each per-project state dir has the Claude session history under
+# <hash>/claude (which is symlinked into the guest as ~/.claude).
+agent_vm_dirs=""
+if [ -d "$state_root" ]; then
+  agent_vm_dirs=$(find "$state_root" -maxdepth 2 -type d -name claude 2>/dev/null | paste -sd,)
+fi
+
+paths="$HOME/.claude,$HOME/.config/claude"
+if [ -n "$agent_vm_dirs" ]; then
+  paths="$paths,$agent_vm_dirs"
+fi
+
+export CLAUDE_CONFIG_DIR="$paths"
+exec npx -y ccusage@latest "$@"

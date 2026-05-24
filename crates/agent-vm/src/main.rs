@@ -1,5 +1,6 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod clipboard;
 mod host_paths;
 mod image_check;
 mod intercept_hook;
@@ -42,6 +43,10 @@ enum Cmd {
     /// Open a bash shell in a sandbox mounted at the project's host path.
     Shell(run::Args),
 
+    /// Exchange a string between the host and the per-project sandbox.
+    /// See `agent-vm clipboard --help`.
+    Clipboard(clipboard::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// refresh requests. Reads the request on stdin, writes an
     /// HTTP response on stdout. Not meant for direct use.
@@ -65,6 +70,7 @@ async fn main() -> Result<()> {
         Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
         Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
         Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
+        Cmd::Clipboard(args) => clipboard::run(args),
         Cmd::InterceptHook(args) => intercept_hook::run(args).await,
     }
 }

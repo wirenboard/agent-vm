@@ -24,6 +24,21 @@ RUN apt-get update \
         ripgrep fd-find \
  && rm -rf /var/lib/apt/lists/*
 
+# Chromium for the chrome-devtools MCP server (Phase 7). The MCP
+# launches it headless. Debian's chromium package is large (~400 MB)
+# but is the simplest source; users who don't want it can pass
+# AGENT_VM_NO_CHROME_MCP=1 to suppress the server entry in agent
+# settings.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        chromium \
+        fonts-liberation \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/chromium /usr/bin/google-chrome \
+ && ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable \
+ && mkdir -p /opt/google/chrome \
+ && ln -sf /usr/bin/chromium /opt/google/chrome/chrome
+
 # GitHub CLI from the official apt repo (Phase 6).
 RUN install -dm 755 /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

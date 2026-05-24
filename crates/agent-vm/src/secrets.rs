@@ -604,6 +604,25 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
         .entry("history".to_string())
         .or_insert_with(|| serde_json::json!([]));
 
+    // Phase 7: Chrome DevTools MCP server. Force-set this entry so
+    // the in-VM Claude can drive a real headless Chromium for tasks
+    // that need browser interaction. The user-set `mcpServers` map
+    // is preserved otherwise. Opt out via AGENT_VM_NO_CHROME_MCP=1.
+    if std::env::var("AGENT_VM_NO_CHROME_MCP").is_err() {
+        let mcp = obj
+            .entry("mcpServers".to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .context("~/.claude.json mcpServers is not an object")?;
+        mcp.insert(
+            "chrome-devtools".into(),
+            serde_json::json!({
+                "command": "npx",
+                "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"],
+            }),
+        );
+    }
+
     atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
     Ok(())
 }
