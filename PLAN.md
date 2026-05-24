@@ -378,7 +378,7 @@ if any of them changed outside the Phase 4 refresh-hook path (which we
 real host (analogous to the Codex e2e in Phase 4 verification 2026-05-
 24); the security snapshot fires on a synthetic mid-run mutation.
 
-### Phase 6 — gh / git credential injection + per-launch repo allow-list [done — commit `396011b`]
+### Phase 6 — gh / git credential injection + per-launch repo allow-list [done — commits `396011b`, `4479b1f`, `29c0ccc`, `62c9eb6` (and upstream `vendor/microsandbox@deeda39`)]
 
 Without this the in-VM agent can read the project but can't `git push`,
 can't `gh pr create`, can't fetch a private dependency from GitHub.
