@@ -338,6 +338,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     "/root/.local/share/opencode",
                     true,
                 )
+                // OpenCode reads its config from $XDG_CONFIG_HOME/opencode/
+                // (=~/.config/opencode/), file `opencode.json`. Distinct
+                // from the data dir above — wire it separately.
+                .symlink(
+                    "/agent-vm-state/opencode-config",
+                    "/root/.config/opencode",
+                    true,
+                )
                 // Phase 6: gh/git config sits at /root/.gitconfig and
                 // /root/.config/gh. write_guest_gh_config writes both
                 // into state_dir; these symlinks expose them at the

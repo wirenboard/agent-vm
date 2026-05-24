@@ -358,6 +358,20 @@ fn write_agent_config_defaults(state_dir: &Path, project_guest_path: &str) -> Re
     std::fs::create_dir_all(&codex_dir)?;
     write_default_codex_config(&codex_dir.join("config.toml"))?;
 
+    // OpenCode reads its config from ~/.config/opencode/opencode.json
+    // (XDG config dir, file named opencode.json — NOT the data dir
+    // and NOT config.json). The launcher symlinks
+    // /root/.config/opencode → /agent-vm-state/opencode-config so
+    // this file lands at the right path inside the guest. Without an
+    // explicit `model`, OpenCode defaults to `openai/gpt-5.5-pro`,
+    // which OpenAI rejects for ChatGPT-OAuth accounts with "model
+    // not supported when using Codex with a ChatGPT account." Pin a
+    // ChatGPT-supported model as the default; users can override
+    // per-run via `opencode run --model ...`.
+    let opencode_config_dir = state_dir.join("opencode-config");
+    std::fs::create_dir_all(&opencode_config_dir)?;
+    write_default_opencode_config(&opencode_config_dir.join("opencode.json"))?;
+
     Ok(())
 }
 
@@ -724,6 +738,32 @@ fn write_default_codex_config(path: &Path) -> Result<()> {
     let body = "sandbox_mode = \"danger-full-access\"\n\
                 approval_policy = \"never\"\n";
     f.write_all(body.as_bytes())?;
+    Ok(())
+}
+
+/// Write a minimal OpenCode config that pins the default model to one
+/// the ChatGPT-OAuth flow accepts. Merge-on-existing so the user's own
+/// settings (model overrides, MCP servers, etc.) survive across
+/// launches; only fields we manage are force-set.
+fn write_default_opencode_config(path: &Path) -> Result<()> {
+    let mut config: Value = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = config
+        .as_object_mut()
+        .context("opencode config.json is not an object")?;
+    obj.entry("$schema".to_string())
+        .or_insert(Value::String("https://opencode.ai/config.json".into()));
+    // ChatGPT-OAuth doesn't accept gpt-5.5-pro (OpenCode's built-in
+    // default); pin a model that does. Use `entry().or_insert` so a
+    // user who set `model` to something else doesn't get clobbered.
+    obj.entry("model".to_string())
+        .or_insert(Value::String("openai/gpt-5.5".into()));
+    obj.entry("autoupdate".to_string())
+        .or_insert(Value::Bool(false));
+    atomic_write(path, serde_json::to_vec(&config)?.as_slice(), 0o644)?;
     Ok(())
 }
 
