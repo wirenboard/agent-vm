@@ -306,42 +306,102 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("[profile] create: {:?}", t_create.elapsed());
     }
 
-    let cmd = agent.command();
+    let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
     // for Claude) unless the user already provided them.
-    let mut agent_args: Vec<String> = agent
+    let mut inner_args: Vec<String> = agent
         .default_args()
         .iter()
         .filter(|d| !args.agent_args.iter().any(|u| u == *d))
         .map(|s| s.to_string())
         .collect();
-    agent_args.extend(args.agent_args);
+    inner_args.extend(args.agent_args);
+
+    // Wrap the agent invocation in a tiny bash prelude that:
+    //
+    // 1. Strips IPv6 nameservers from /etc/resolv.conf before exec'ing
+    //    the agent. microsandbox's agentd writes both v4 and v6 gateway
+    //    DNS into the guest's /etc/resolv.conf at boot. The v6 entry was
+    //    observed unresponsive in at least one nested-libkrun setup
+    //    (gateway times out on v6 DNS queries), and codex's Rust async
+    //    resolver returns EAI_AGAIN ("Try again") in that case instead
+    //    of falling through to the working v4 resolver the way glibc's
+    //    getaddrinfo does. Result: codex hangs at startup with "failed
+    //    to lookup address information" for chatgpt.com, even though
+    //    `getent hosts chatgpt.com` returns immediately. Stripping the
+    //    v6 nameserver line makes the resolver single-stack, which is
+    //    fine for outbound traffic to public APIs. The regex matches
+    //    lines whose nameserver value contains a colon — IPv4 addresses
+    //    never do, IPv6 addresses always do.
+    //
+    // 2. Redirects stdin to /dev/null when not on a TTY. exec_with's
+    //    default `StdinMode::Null` was observed *not* to satisfy codex
+    //    0.133's `exec` subcommand: codex blocks indefinitely on what it
+    //    thinks is unbounded interactive input. Backgrounding codex (`&`)
+    //    fixed it (bash auto-redirects stdin to /dev/null for background
+    //    jobs) but we can't background the user's agent. An explicit
+    //    `exec < /dev/null` gives codex a real /dev/null fd and it
+    //    proceeds. `[ -t 0 ]` keeps interactive TTY launches unaffected.
+    let prelude = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
+[ -t 0 ] || exec < /dev/null"#;
+    let mut shell_line = String::from(prelude);
+    shell_line.push_str("; exec ");
+    shell_line.push_str(&shell_escape(inner_cmd));
+    for a in &inner_args {
+        shell_line.push(' ');
+        shell_line.push_str(&shell_escape(a));
+    }
+    let cmd = "bash";
+    let agent_args: Vec<String> = vec!["-c".into(), shell_line];
+
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
-        eprintln!("==> Attaching to {cmd}");
+        eprintln!("==> Attaching to {inner_cmd}");
         sandbox
             .attach(cmd, agent_args)
             .await
-            .with_context(|| format!("attaching to {cmd}"))?
+            .with_context(|| format!("attaching to {inner_cmd}"))?
     } else {
         // No host TTY (piped, redirected, smoke-tested under `sg`/`sudo` etc.).
-        // attach() needs a real /dev/tty for raw-mode stdin, so fall back to
-        // collected exec. Output is forwarded once the command exits.
-        eprintln!("==> Running {cmd} in sandbox (no TTY; output appears after exit)");
+        // attach() needs a real /dev/tty for raw-mode stdin, so use the
+        // streaming exec API instead: write stdout/stderr to ours as they
+        // arrive. That keeps progress visible on long-running agent
+        // commands (codex exec can take >30s for a single response) and
+        // lets us inspect partial output when the user Ctrl-Cs or the
+        // shell times out.
+        eprintln!("==> Running {inner_cmd} in sandbox (no TTY; streaming output)");
+        use microsandbox::sandbox::exec::ExecEvent;
         use tokio::io::AsyncWriteExt as _;
-        let output = sandbox
-            .exec_with(cmd, |e| {
+        let mut handle = sandbox
+            .exec_stream_with(cmd, |e| {
                 e.args(agent_args).cwd(project_guest_path.clone())
             })
             .await
-            .with_context(|| format!("running {cmd} in sandbox"))?;
+            .with_context(|| format!("running {inner_cmd} in sandbox"))?;
         let mut stdout = tokio::io::stdout();
-        stdout.write_all(output.stdout_bytes()).await.ok();
-        stdout.flush().await.ok();
         let mut stderr = tokio::io::stderr();
-        stderr.write_all(output.stderr_bytes()).await.ok();
-        stderr.flush().await.ok();
-        output.status().code
+        let mut code: i32 = 1;
+        while let Some(event) = handle.recv().await {
+            match event {
+                ExecEvent::Stdout(b) => {
+                    stdout.write_all(&b).await.ok();
+                    stdout.flush().await.ok();
+                }
+                ExecEvent::Stderr(b) => {
+                    stderr.write_all(&b).await.ok();
+                    stderr.flush().await.ok();
+                }
+                ExecEvent::Exited { code: c } => {
+                    code = c;
+                    break;
+                }
+                ExecEvent::Failed(payload) => {
+                    anyhow::bail!("exec session failed: {payload:?}");
+                }
+                ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
+            }
+        }
+        code
     };
 
     if profile {
@@ -361,6 +421,37 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     Ok(exit)
+}
+
+/// Single-quote `s` for use as a single argv element in a `bash -c`
+/// line. Embedded single quotes are split out with the standard
+/// `'\''` trick. Adequate for forwarding arbitrary user-supplied agent
+/// args through the resolv.conf prelude wrapper.
+fn shell_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_escape_handles_simple_and_quoted() {
+        assert_eq!(shell_escape("foo"), "'foo'");
+        assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
+        assert_eq!(shell_escape("don't"), "'don'\\''t'");
+        assert_eq!(shell_escape(""), "''");
+    }
 }
 
 async fn notify_if_update_available(image: &str) {
