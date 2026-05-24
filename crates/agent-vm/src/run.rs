@@ -597,10 +597,31 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // docker compose up, env-var exports). Runs once per launch with
     // PWD set to the project dir; non-zero exit aborts the launch
     // with the same exit code.
+    // 3. Adds the microsandbox MITM CA to the `chrome` user's NSS DB
+    //    so chromium (launched by chrome-devtools-mcp under that user
+    //    via /usr/local/bin/agent-vm-chrome-mcp) verifies the
+    //    intercepted TLS chain instead of failing every HTTPS page
+    //    with ERR_CERT_AUTHORITY_INVALID. The CA file
+    //    `/usr/local/share/ca-certificates/microsandbox-ca.crt` is
+    //    written into the guest by agentd at boot, so this can't be
+    //    baked into the image — the per-boot CA is what we have to
+    //    inject. `certutil -A` of an already-present nickname is a
+    //    no-op (we re-run on every launch but the cost is one fork +
+    //    one sqlite open), so we don't bother gating on "did we
+    //    already do this?". `|| true` keeps a missing chrome user
+    //    (AGENT_VM_NO_CHROME_MCP build, or a future image variant
+    //    without the MCP) from breaking the prelude.
     let project_guest_path_escaped = shell_escape(&project_guest_path);
     let prelude = format!(
         "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
          [ -t 0 ] || exec < /dev/null\n\
+         if [ -f /usr/local/share/ca-certificates/microsandbox-ca.crt ] \\\n\
+                 && [ -d /home/chrome/.pki/nssdb ]; then\n\
+         \tsudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \\\n\
+         \t\t-t TC -n microsandbox \\\n\
+         \t\t-i /usr/local/share/ca-certificates/microsandbox-ca.crt \\\n\
+         \t\t2>/dev/null || true\n\
+         fi\n\
          _hook={path}/.agent-vm.runtime.sh\n\
          if [ -f \"$_hook\" ]; then\n\
          \techo \"==> sourcing $_hook\" >&2\n\

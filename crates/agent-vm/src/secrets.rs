@@ -650,6 +650,29 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     // the in-VM Claude can drive a real headless Chromium for tasks
     // that need browser interaction. The user-set `mcpServers` map
     // is preserved otherwise. Opt out via AGENT_VM_NO_CHROME_MCP=1.
+    //
+    // The MCP runs under the dedicated `chrome` user via the
+    // `agent-vm-chrome-mcp` wrapper baked into the image. Two reasons
+    // we don't just `command: "npx"` like a normal MCP:
+    //
+    // - **Sandbox preservation.** chromium's user-namespace sandbox
+    //   refuses to initialize as root; if we launch it as root the
+    //   CDP target dies immediately and every tool call returns
+    //   `Protocol error (Target.setDiscoverTargets): Target closed`.
+    //   The microVM is already the outer security boundary, but
+    //   keeping chromium's nested sandbox is real defence-in-depth
+    //   for content the agent navigates to. Running the MCP under a
+    //   non-root user makes the sandbox work without `--no-sandbox`.
+    // - **Scoped CA trust.** Every outbound HTTPS connection from
+    //   the guest is MITM'd by microsandbox's intercept proxy. curl
+    //   and openssl trust the proxy's `microsandbox CA` because
+    //   debian's `update-ca-certificates` runs at guest boot. Chromium
+    //   on Linux ignores the system bundle and only honours its
+    //   built-in root store + the per-user NSS DB, so we need to
+    //   install just our one CA into chrome's NSS DB
+    //   (`/home/chrome/.pki/nssdb/`, populated by the launcher's bash
+    //   prelude at boot). With that, no `--acceptInsecureCerts` (which
+    //   would accept *any* untrusted cert) — only our CA is trusted.
     if std::env::var("AGENT_VM_NO_CHROME_MCP").is_err() {
         let mcp = obj
             .entry("mcpServers".to_string())
@@ -659,8 +682,14 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
         mcp.insert(
             "chrome-devtools".into(),
             serde_json::json!({
-                "command": "npx",
-                "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"],
+                "command": "/usr/local/bin/agent-vm-chrome-mcp",
+                "args": [
+                    "npx",
+                    "-y",
+                    "chrome-devtools-mcp@latest",
+                    "--headless=true",
+                    "--isolated=true",
+                ],
             }),
         );
     }
