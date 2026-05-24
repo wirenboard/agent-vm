@@ -95,6 +95,19 @@ pub struct Args {
     #[arg(long, env = "AGENT_VM_CPUS", default_value_t = 2)]
     cpus: u8,
 
+    /// Don't inject host gh/git credentials into the guest. With this
+    /// set, no gh auth flows through the proxy and the guest agent
+    /// can't `git push` / `gh pr create` etc. Useful for one-off
+    /// throwaway sessions on a repo you don't trust the agent with.
+    #[arg(long = "no-git", default_value_t = false)]
+    no_git: bool,
+
+    /// Add a GitHub `owner/repo` slug to the per-launch allow-list
+    /// (repeatable). The cwd's `git remote -v` GitHub entries are
+    /// always included; use this to widen for cross-repo work.
+    #[arg(long = "repo")]
+    repo: Vec<String>,
+
     /// Args forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -168,8 +181,33 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Claude's per-folder trust list (~/.claude.json `projects.<path>.
     // hasTrustDialogAccepted = true`), suppressing the "do you trust
     // this folder?" wizard on first launch in each project.
-    let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path)
+    // Phase 6: build the per-launch GitHub repo allow-list from the
+    // cwd's `git remote -v` plus any `--repo` overrides. Used both to
+    // decide whether to bother capturing host gh auth (no repos →
+    // nothing to talk to) and to constrain api.github.com requests
+    // server-side via the intercept hook.
+    let mut allowed_repos: Vec<String> = Vec::new();
+    if !args.no_git {
+        allowed_repos.extend(detect_github_repos_in_cwd(&session.project_dir));
+        for r in &args.repo {
+            let r = r.trim().to_string();
+            if !r.is_empty() && !allowed_repos.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+                allowed_repos.push(r);
+            }
+        }
+    }
+    let use_github = !args.no_git && !allowed_repos.is_empty();
+
+    let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
         .context("snapshotting host credentials")?;
+
+    // Phase 6: write guest-side gh/git config that reaches for the
+    // placeholder bearer the proxy will substitute on outbound. Only
+    // wired when we actually captured a gh token.
+    if creds.gh_token_file.is_some() {
+        crate::secrets::write_guest_gh_config(&session.state_dir)
+            .context("writing guest gh/git config")?;
+    }
 
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
@@ -186,6 +224,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             }
             p.mkdir("/root/.local", None)
                 .mkdir("/root/.local/share", None)
+                .mkdir("/root/.config", None)
                 .symlink("/agent-vm-state/claude", "/root/.claude", true)
                 // Onboarding-state file lives at $HOME root, not in
                 // .claude/. Without persistence the in-VM Claude
@@ -196,6 +235,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     "/root/.local/share/opencode",
                     true,
                 )
+                // Phase 6: gh/git config sits at /root/.gitconfig and
+                // /root/.config/gh. write_guest_gh_config writes both
+                // into state_dir; these symlinks expose them at the
+                // standard paths inside the guest. (Symlink targets
+                // are valid only when the underlying file/dir was
+                // written; if no gh token was captured, the symlinks
+                // dangle but nothing references them.)
+                .symlink("/agent-vm-state/gitconfig", "/root/.gitconfig", true)
+                .symlink("/agent-vm-state/gh-config", "/root/.config/gh", true)
         })
         .env("CODEX_HOME", "/agent-vm-state/codex")
         .replace();
@@ -211,11 +259,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the VM at all (microsandbox's violation detector would block it
     // otherwise), even though substitution there is a no-op because
     // the body's refresh_token is a placeholder, not a header.
-    if creds.anthropic_token_file.is_some() || creds.openai_token_file.is_some() {
+    if creds.anthropic_token_file.is_some()
+        || creds.openai_token_file.is_some()
+        || creds.gh_token_file.is_some()
+    {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
         let opencode = creds.opencode_openai_access_token_file.clone();
+        let gh = creds.gh_token_file.clone();
+        let has_gh = gh.is_some();
+        let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
         builder = builder.network(move |mut n| {
@@ -259,15 +313,51 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .allow_host(OPENAI_CHATGPT_HOST)
                 });
             }
+            // Phase 6: gh CLI sends `Authorization: token <token>` (or
+            // Bearer); git uses Basic auth (base64(x-access-token:tok)).
+            // `inject_basic_auth(true)` covers the Basic-auth path. We
+            // accept the perf hit (basic_auth disables the per-chunk
+            // fast path) because GitHub connections aren't WebSocket.
+            if let Some(file) = gh {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_GH_UNUSED")
+                        .value(file)
+                        .placeholder(GH_TOKEN_PLACEHOLDER)
+                        .inject_basic_auth(true)
+                        .allow_host(GITHUB_API_HOST)
+                        .allow_host(GITHUB_HOST)
+                        .allow_host(GITHUB_CODELOAD_HOST)
+                        .allow_host(GITHUB_RAW_HOST)
+                        .allow_host(GITHUB_OBJECTS_HOST)
+                });
+            }
             n.intercept(|i| {
-                i.hook([
+                let mut hook_argv: Vec<String> = vec![
                     self_path.to_string_lossy().to_string(),
                     "_intercept-hook".to_string(),
                     "--state-dir".to_string(),
                     state_dir.to_string_lossy().to_string(),
-                ])
-                .rule(ANTHROPIC_OAUTH_HOST, "POST", ANTHROPIC_OAUTH_TOKEN_PATH)
-                .rule(OPENAI_OAUTH_HOST, "POST", OPENAI_OAUTH_TOKEN_PATH)
+                ];
+                for repo in &allowed_repos_for_hook {
+                    hook_argv.push("--allowed-repo".to_string());
+                    hook_argv.push(repo.clone());
+                }
+                let mut ix = i
+                    .hook(hook_argv)
+                    .rule(ANTHROPIC_OAUTH_HOST, "POST", ANTHROPIC_OAUTH_TOKEN_PATH)
+                    .rule(OPENAI_OAUTH_HOST, "POST", OPENAI_OAUTH_TOKEN_PATH);
+                // Phase 6: intercept every method gh CLI uses on
+                // api.github.com so the hook can enforce the repo
+                // allow-list. Path "/" matches everything (prefix
+                // semantics in handler.rs). Only fires when we have
+                // a host gh token; otherwise the hook has nothing to
+                // forward with and there's no risk of a leak.
+                if has_gh {
+                    for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
+                        ix = ix.rule(GITHUB_API_HOST, method, "/");
+                    }
+                }
+                ix
             })
         });
     }
@@ -443,6 +533,71 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     Ok(exit)
+}
+
+/// Parse `git remote -v` in `project_dir` and pull out
+/// `owner/repo` slugs for every github.com remote (https or ssh, with
+/// or without trailing `.git`). Failure modes (no `.git`, not a repo,
+/// non-github remote) just yield an empty list — caller passes
+/// `--repo` to widen.
+fn detect_github_repos_in_cwd(project_dir: &Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(project_dir)
+        .args(["remote", "-v"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut slugs: Vec<String> = Vec::new();
+    for line in text.lines() {
+        // line format: "<name>\t<url> (<fetch|push>)"
+        let url = match line.split_ascii_whitespace().nth(1) {
+            Some(u) => u,
+            None => continue,
+        };
+        if let Some(slug) = parse_github_slug(url) {
+            if !slugs.iter().any(|s| s.eq_ignore_ascii_case(&slug)) {
+                slugs.push(slug);
+            }
+        }
+    }
+    slugs
+}
+
+/// Pull `owner/repo` from a GitHub remote URL. Returns `None` for
+/// non-GitHub URLs. Strips a trailing `.git`. Handles both:
+/// - `https://github.com/owner/repo[.git]`
+/// - `git@github.com:owner/repo[.git]`
+/// - `ssh://git@github.com/owner/repo[.git]`
+fn parse_github_slug(url: &str) -> Option<String> {
+    let rest = if let Some(r) = url.strip_prefix("https://github.com/") {
+        r
+    } else if let Some(r) = url.strip_prefix("http://github.com/") {
+        r
+    } else if let Some(r) = url.strip_prefix("git@github.com:") {
+        r
+    } else if let Some(r) = url.strip_prefix("ssh://git@github.com/") {
+        r
+    } else if let Some(r) = url.strip_prefix("ssh://git@github.com:") {
+        // some hosts include a port-style colon; strip until next /
+        r.split_once('/').map(|(_, p)| p)?
+    } else {
+        return None;
+    };
+    let trimmed = rest.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = trimmed.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 /// Single-quote `s` for use as a single argv element in a `bash -c`

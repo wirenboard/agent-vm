@@ -70,6 +70,10 @@ pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ
 /// OpenCode actually parses them and chokes on absence.
 pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.MSB_OPENCODE_v1";
 pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENCODE_OPENAI_REFRESH_v1";
+/// Placeholder for the host's `gh auth token`. The in-guest `gh` /
+/// git credential helper sees this string; the proxy substitutes the
+/// real bearer on outbound traffic to GitHub.
+pub const GH_TOKEN_PLACEHOLDER: &str = "MSB_PLACEHOLDER_GH_TOKEN_v1";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -80,6 +84,12 @@ pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";
 pub const OPENAI_API_HOST: &str = "api.openai.com";
 pub const OPENAI_CHATGPT_HOST: &str = "chatgpt.com";
 pub const OPENAI_OAUTH_HOST: &str = "auth.openai.com";
+
+pub const GITHUB_API_HOST: &str = "api.github.com";
+pub const GITHUB_HOST: &str = "github.com";
+pub const GITHUB_CODELOAD_HOST: &str = "codeload.github.com";
+pub const GITHUB_RAW_HOST: &str = "raw.githubusercontent.com";
+pub const GITHUB_OBJECTS_HOST: &str = "objects.githubusercontent.com";
 
 pub const ANTHROPIC_OAUTH_TOKEN_PATH: &str = "/v1/oauth/token";
 pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
@@ -96,6 +106,11 @@ pub struct CredsState {
     pub anthropic_token_file: Option<PathBuf>,
     pub openai_token_file: Option<PathBuf>,
     pub opencode_openai_access_token_file: Option<PathBuf>,
+    /// File holding the host's `gh auth token` (a GitHub user OAuth
+    /// token). The proxy substitutes `GH_TOKEN_PLACEHOLDER` for this
+    /// on outbound traffic to GitHub. Only `Some` when the user has
+    /// `gh` logged in *and* `--no-git` was not passed.
+    pub gh_token_file: Option<PathBuf>,
     pub snapshot: Option<HostCredsSnapshot>,
 }
 
@@ -141,6 +156,10 @@ pub fn openai_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir(state_dir).join("openai")
 }
 
+pub fn gh_token_path(state_dir: &Path) -> PathBuf {
+    host_secret_dir(state_dir).join("gh")
+}
+
 /// OpenCode reuses the same OpenAI access token file: both Codex and
 /// OpenCode hit api.openai.com / chatgpt.com and the proxy substitutes
 /// each provider's distinct placeholder string for the same real
@@ -153,7 +172,11 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretValue::File config.
-pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState> {
+pub fn refresh(
+    state_dir: &Path,
+    project_guest_path: &str,
+    use_github: bool,
+) -> Result<CredsState> {
     // The token files hold the host's *real* access tokens, so their
     // directory must never be bind-mounted into the guest. Create it
     // 0700 in the host-only sibling location (see `host_secret_dir`).
@@ -202,6 +225,19 @@ pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState>
         None
     };
 
+    // Phase 6: capture the user's `gh auth token` (if any and not
+    // suppressed via `--no-git`). The launcher passes
+    // `--no-git`/use_github=false when the user opted out or when no
+    // GitHub remote was found and no `--repo` overrides were given.
+    let gh_token_file = if use_github {
+        refresh_gh(state_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "gh credential capture failed; skipping");
+            None
+        })
+    } else {
+        None
+    };
+
     // SHA-256 snapshot of host credential files for post-run mutation
     // detection. Phase 4's refresh hook *legitimately* rewrites these;
     // anything else doing so is a bug to investigate. See
@@ -212,8 +248,41 @@ pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState>
         anthropic_token_file,
         openai_token_file,
         opencode_openai_access_token_file,
+        gh_token_file,
         snapshot,
     })
+}
+
+/// Capture `gh auth token` from the host into a 0600 file under
+/// `<state>.secrets/gh`. Returns `None` if `gh` isn't installed or the
+/// user isn't logged in. The proxy substitutes `GH_TOKEN_PLACEHOLDER`
+/// for this file's content on outbound GitHub traffic.
+fn refresh_gh(state_dir: &Path) -> Result<Option<PathBuf>> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        // gh not on PATH — fine, just skip
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("running `gh auth token`"),
+    };
+    if !out.status.success() {
+        // Most likely "not logged in" — non-fatal.
+        return Ok(None);
+    }
+    let token = String::from_utf8(out.stdout)
+        .context("`gh auth token` output is not UTF-8")?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let token_file = gh_token_path(state_dir);
+    atomic_write(&token_file, token.as_bytes(), 0o600)?;
+    Ok(Some(token_file))
 }
 
 /// SHA-256 the three host credential files. Files that don't exist or
@@ -536,6 +605,50 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
         .or_insert_with(|| serde_json::json!([]));
 
     atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
+    Ok(())
+}
+
+/// Phase 6: write the gh/git config the guest agent uses to talk to
+/// GitHub. Files land under `state_dir` so they're available inside
+/// the guest via the existing bind mount + symlinks (see run.rs
+/// patch builder).
+///
+/// - `<state>/gitconfig` → symlinked to `/root/.gitconfig` in the
+///   guest. A `credential.helper` echoes `username=x-access-token`
+///   and `password=<placeholder>` so `git push` to GitHub goes out
+///   as `Authorization: Basic base64(x-access-token:placeholder)`,
+///   which the proxy substitutes on the wire.
+/// - `<state>/gh-config/hosts.yml` → symlinked to `/root/.config/gh`
+///   in the guest. The placeholder is what gh CLI sends; the proxy
+///   substitutes outbound to api.github.com.
+pub fn write_guest_gh_config(state_dir: &Path) -> Result<()> {
+    let gitconfig = format!(
+        // The credential helper is a shell snippet; git invokes it
+        // with `get` and reads `username=`/`password=` lines.
+        "[credential \"https://github.com\"]\n\
+         \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
+         [credential \"https://gist.github.com\"]\n\
+         \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
+         [url \"https://github.com/\"]\n\
+         \tinsteadOf = git@github.com:\n\
+         [user]\n\
+         \tname = agent-vm\n\
+         \temail = agent-vm@msb.local\n",
+        tok = GH_TOKEN_PLACEHOLDER,
+    );
+    atomic_write(&state_dir.join("gitconfig"), gitconfig.as_bytes(), 0o600)?;
+
+    let gh_dir = state_dir.join("gh-config");
+    std::fs::create_dir_all(&gh_dir)?;
+    let hosts_yml = format!(
+        "github.com:\n\
+         \\x20\\x20user: agent-vm\n\
+         \\x20\\x20oauth_token: {tok}\n\
+         \\x20\\x20git_protocol: https\n",
+        tok = GH_TOKEN_PLACEHOLDER,
+    )
+    .replace("\\x20", " ");
+    atomic_write(&gh_dir.join("hosts.yml"), hosts_yml.as_bytes(), 0o600)?;
     Ok(())
 }
 

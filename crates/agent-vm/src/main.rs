@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
         Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
         Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
-        Cmd::InterceptHook(args) => intercept_hook::run(args),
+        Cmd::InterceptHook(args) => intercept_hook::run(args).await,
     }
 }
 
