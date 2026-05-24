@@ -28,10 +28,10 @@ use crate::host_paths::{
 // for the real value at the network layer on the way out, and forged
 // into OAuth refresh responses by `intercept_hook`.
 
-pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_ACCESS_TOKEN_v1";
-pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1";
-pub const OPENAI_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_ACCESS_TOKEN_v1";
-pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOKEN_v1";
+pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "msb-anthropic-placeholder-a-v2";
+pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "msb-anthropic-placeholder-r-v2";
+pub const OPENAI_ACCESS_PLACEHOLDER: &str = "msb-openai-placeholder-a-v2";
+pub const OPENAI_REFRESH_PLACEHOLDER: &str = "msb-openai-placeholder-r-v2";
 /// Synthetic JWT (alg:none) carrying only placeholder fields. Codex
 /// parses `tokens.id_token` client-side at startup, so the placeholder
 /// has to be structurally a JWT or codex refuses to load — but it has
@@ -45,11 +45,11 @@ pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOK
 ///                       "https://api.openai.com/auth":{"chatgpt_account_id":"00000000-0000-0000-0000-000000000000",
 ///                       "chatgpt_plan_type":"placeholder","chatgpt_subscription_active_until":"9999-12-31T00:00:00+00:00",
 ///                       "chatgpt_user_id":"user-placeholder"},"sub":"placeholder|0"}')
-/// sig     = "MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1"  (kept literal so a
-///           string grep for the v1 marker still flags any place this
-///           leaks; the JWT spec allows arbitrary characters in the
-///           signature segment under alg:none)
-pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1";
+/// sig     = "msb-openai-placeholder-id-v2". Keep this marker
+///           non-token-shaped: Claude/Anthropic may reset requests that
+///           contain token-looking sentinel values copied from shell output
+///           into a transcript.
+pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.msb-openai-placeholder-id-v2";
 /// Synthetic JWT used as the placeholder for OpenCode's OAuth `access`
 /// field. OpenCode sends `Authorization: Bearer <access>` to
 /// api.openai.com, so this string is the exact byte sequence the proxy
@@ -61,19 +61,21 @@ pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ
 /// header  = base64url('{"alg":"none","typ":"JWT"}')
 /// payload = base64url('{"exp":9999999999,
 ///                       "chatgpt_account_id":"00000000-0000-0000-0000-000000000000"}')
-/// sig     = "MSB_OPENCODE_v1"
+/// sig     = "msb-opencode-placeholder-a-v2"  (non-token-shaped to
+///           match the rest of the placeholder family; see the warning
+///           on `OPENAI_ID_PLACEHOLDER`)
 ///
 /// **Kept short on purpose:** an earlier ~480-char payload (with
 /// iss/aud/scp/email/sub claims) triggered upstream issue #8 — long
 /// placeholders fail sandbox boot with `handshake read id_offset:
 /// timed out before relay sent bytes`. Add fields here only if
 /// OpenCode actually parses them and chokes on absence.
-pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.MSB_OPENCODE_v1";
-pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENCODE_OPENAI_REFRESH_v1";
+pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.msb-opencode-placeholder-a-v2";
+pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "msb-opencode-placeholder-r-v2";
 /// Placeholder for the host's `gh auth token`. The in-guest `gh` /
 /// git credential helper sees this string; the proxy substitutes the
 /// real bearer on outbound traffic to GitHub.
-pub const GH_TOKEN_PLACEHOLDER: &str = "MSB_PLACEHOLDER_GH_TOKEN_v1";
+pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -655,17 +657,53 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     // the in-VM Claude can drive a real headless Chromium for tasks
     // that need browser interaction. The user-set `mcpServers` map
     // is preserved otherwise. Opt out via AGENT_VM_NO_CHROME_MCP=1.
-    if std::env::var("AGENT_VM_NO_CHROME_MCP").is_err() {
-        let mcp = obj
-            .entry("mcpServers".to_string())
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .context("~/.claude.json mcpServers is not an object")?;
+    //
+    // The MCP runs under the dedicated `chrome` user via the
+    // `agent-vm-chrome-mcp` wrapper baked into the image. Two reasons
+    // we don't just `command: "npx"` like a normal MCP:
+    //
+    // - **Sandbox preservation.** chromium's user-namespace sandbox
+    //   refuses to initialize as root; if we launch it as root the
+    //   CDP target dies immediately and every tool call returns
+    //   `Protocol error (Target.setDiscoverTargets): Target closed`.
+    //   The microVM is already the outer security boundary, but
+    //   keeping chromium's nested sandbox is real defence-in-depth
+    //   for content the agent navigates to. Running the MCP under a
+    //   non-root user makes the sandbox work without `--no-sandbox`.
+    // - **Scoped CA trust.** Every outbound HTTPS connection from
+    //   the guest is MITM'd by microsandbox's intercept proxy. curl
+    //   and openssl trust the proxy's `microsandbox CA` because
+    //   debian's `update-ca-certificates` runs at guest boot. Chromium
+    //   on Linux ignores the system bundle and only honours its
+    //   built-in root store + the per-user NSS DB, so we need to
+    //   install just our one CA into chrome's NSS DB
+    //   (`/home/chrome/.pki/nssdb/`, populated by the launcher's bash
+    //   prelude at boot). With that, no `--acceptInsecureCerts` (which
+    //   would accept *any* untrusted cert) — only our CA is trusted.
+    // The map is created (or reused) regardless so the opt-out can
+    // also REMOVE a previously-written entry — without this, setting
+    // AGENT_VM_NO_CHROME_MCP after a launch without it would leave
+    // the stale entry in the on-disk claude.json and the MCP would
+    // keep spawning. We always own this key.
+    let mcp = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("~/.claude.json mcpServers is not an object")?;
+    if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
+        mcp.remove("chrome-devtools");
+    } else {
         mcp.insert(
             "chrome-devtools".into(),
             serde_json::json!({
-                "command": "npx",
-                "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"],
+                "command": "/usr/local/bin/agent-vm-chrome-mcp",
+                "args": [
+                    "npx",
+                    "-y",
+                    "chrome-devtools-mcp@latest",
+                    "--headless=true",
+                    "--isolated=true",
+                ],
             }),
         );
     }
