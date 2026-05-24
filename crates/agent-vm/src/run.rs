@@ -230,13 +230,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
         .context("snapshotting host credentials")?;
 
-    // Phase 6: write guest-side gh/git config that reaches for the
-    // placeholder bearer the proxy will substitute on outbound. Only
-    // wired when we actually captured a gh token.
-    if creds.gh_token_file.is_some() {
-        crate::secrets::write_guest_gh_config(&session.state_dir)
-            .context("writing guest gh/git config")?;
-    }
+    // Phase 6/9: always write the guest gitconfig (carries the
+    // unconditional `safe.directory = *` so git inside the guest
+    // accepts the host-bind-mounted project despite the UID
+    // mismatch). The credential-helper / gh hosts.yml stanzas are
+    // gated on having actually captured a host gh token.
+    crate::secrets::write_guest_gh_config(&session.state_dir, creds.gh_token_file.is_some())
+        .context("writing guest gh/git config")?;
 
     // Phase 7: parse `--mount HOST[:GUEST]` extras. The libkrun IRQ
     // pool is *tight* — empirically the project bind + state bind +

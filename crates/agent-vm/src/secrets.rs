@@ -627,47 +627,69 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     Ok(())
 }
 
-/// Phase 6: write the gh/git config the guest agent uses to talk to
-/// GitHub. Files land under `state_dir` so they're available inside
-/// the guest via the existing bind mount + symlinks (see run.rs
-/// patch builder).
+/// Phase 6/9: write the guest's gitconfig and (if `has_gh_token`)
+/// gh/git credential plumbing. Always called so the
+/// `safe.directory = *` line is in place — without it, git inside the
+/// guest fails with "fatal: detected dubious ownership in repository"
+/// because the host-owned bind-mounted project is read by the guest's
+/// root user (different UID).
+///
+/// Files land under `state_dir` so they're available inside the guest
+/// via the existing bind mount + symlinks (see run.rs patch builder).
 ///
 /// - `<state>/gitconfig` → symlinked to `/root/.gitconfig` in the
-///   guest. A `credential.helper` echoes `username=x-access-token`
-///   and `password=<placeholder>` so `git push` to GitHub goes out
-///   as `Authorization: Basic base64(x-access-token:placeholder)`,
-///   which the proxy substitutes on the wire.
+///   guest. Always contains `safe.directory = *`. When the host has
+///   gh auth, also contains a `credential.helper` that echoes
+///   `username=x-access-token` / `password=<placeholder>` so
+///   `git push` to GitHub goes out as
+///   `Authorization: Basic base64(x-access-token:placeholder)`, which
+///   the proxy substitutes on the wire.
 /// - `<state>/gh-config/hosts.yml` → symlinked to `/root/.config/gh`
-///   in the guest. The placeholder is what gh CLI sends; the proxy
-///   substitutes outbound to api.github.com.
-pub fn write_guest_gh_config(state_dir: &Path) -> Result<()> {
-    let gitconfig = format!(
-        // The credential helper is a shell snippet; git invokes it
-        // with `get` and reads `username=`/`password=` lines.
-        "[credential \"https://github.com\"]\n\
-         \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
-         [credential \"https://gist.github.com\"]\n\
-         \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
-         [url \"https://github.com/\"]\n\
-         \tinsteadOf = git@github.com:\n\
+///   in the guest. Only written when `has_gh_token`; the placeholder
+///   is what gh CLI sends and the proxy substitutes outbound to
+///   api.github.com.
+pub fn write_guest_gh_config(state_dir: &Path, has_gh_token: bool) -> Result<()> {
+    // safe.directory = * is unconditional: the guest IS the security
+    // boundary (microVM), so trusting every path is fine and git
+    // operating on the host-bind-mounted project requires it. Use
+    // wildcard form so any --mount extra also works without
+    // listing every path.
+    let mut gitconfig = String::from(
+        "[safe]\n\
+         \tdirectory = *\n\
          [user]\n\
          \tname = agent-vm\n\
          \temail = agent-vm@msb.local\n",
-        tok = GH_TOKEN_PLACEHOLDER,
     );
+    if has_gh_token {
+        // git's credential helper for github.com pushes/clones. The
+        // helper is a shell snippet; git invokes it with `get` and
+        // reads `username=`/`password=` lines from stdout.
+        gitconfig.push_str(&format!(
+            "[credential \"https://github.com\"]\n\
+             \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
+             [credential \"https://gist.github.com\"]\n\
+             \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
+             [url \"https://github.com/\"]\n\
+             \tinsteadOf = git@github.com:\n",
+            tok = GH_TOKEN_PLACEHOLDER,
+        ));
+    }
     atomic_write(&state_dir.join("gitconfig"), gitconfig.as_bytes(), 0o600)?;
 
-    let gh_dir = state_dir.join("gh-config");
-    std::fs::create_dir_all(&gh_dir)?;
-    let hosts_yml = format!(
-        "github.com:\n\
-         \\x20\\x20user: agent-vm\n\
-         \\x20\\x20oauth_token: {tok}\n\
-         \\x20\\x20git_protocol: https\n",
-        tok = GH_TOKEN_PLACEHOLDER,
-    )
-    .replace("\\x20", " ");
-    atomic_write(&gh_dir.join("hosts.yml"), hosts_yml.as_bytes(), 0o600)?;
+    if has_gh_token {
+        let gh_dir = state_dir.join("gh-config");
+        std::fs::create_dir_all(&gh_dir)?;
+        let hosts_yml = format!(
+            "github.com:\n\
+             \\x20\\x20user: agent-vm\n\
+             \\x20\\x20oauth_token: {tok}\n\
+             \\x20\\x20git_protocol: https\n",
+            tok = GH_TOKEN_PLACEHOLDER,
+        )
+        .replace("\\x20", " ");
+        atomic_write(&gh_dir.join("hosts.yml"), hosts_yml.as_bytes(), 0o600)?;
+    }
     Ok(())
 }
 

@@ -235,17 +235,61 @@ fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String
 
 /// Path-based allow-list check for api.github.com requests.
 ///
-/// Accepts:
+/// Accepts (case-insensitive on owner/repo):
 /// - `/repos/<owner>/<repo>[/...]` where `<owner>/<repo>` is in the
-///   allow-list (case-insensitive).
-/// - `/user` and `/user/...` (gh CLI uses these to confirm auth +
-///   list accessible repos; doesn't expose specific-repo state).
-/// - `/repos/<owner>/<repo>` for the parent-fetch of a fork (we
-///   accept any owner here since the parent is read-only metadata —
-///   reconsider if this proves too permissive).
+///   allow-list, after rejecting any `..` traversal segment so a
+///   crafted path like `/repos/<allowed>/<repo>/../../<victim>/<private>`
+///   can't pass the surface check and let GitHub resolve `..`
+///   upstream.
+/// - `/user` and `/user/...` — gh CLI auth-status, current-user info.
+///   Limited to the small set gh actually needs: /user (auth probe),
+///   /user/orgs (org membership). Excludes /user/repos, /user/keys,
+///   /user/emails, /user/gpg_keys to avoid leaking full inventory /
+///   PII.
+/// - **`/graphql`** — gh CLI's `gh pr create`, `gh issue create`,
+///   `gh repo view --json` all use GraphQL mutations. We DO NOT body-
+///   filter the GraphQL request: per-repo scoping doesn't reach into
+///   the JSON body in v1. Accept that an agent that crafts arbitrary
+///   GraphQL queries can read anything the token can; the practical
+///   trade-off is "gh CLI works" vs. "no GraphQL".
+/// - `/search/...`, `/rate_limit`, `/meta`, `/markdown` — small
+///   utility endpoints gh CLI uses ambiently.
+/// - `/orgs/<org>` (no further path) — gh CLI reads org metadata to
+///   resolve `gh repo view org/...`.
 fn github_path_allowed(path: &str, allowed: &[String]) -> bool {
     let p = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
-    if p == "/user" || p.starts_with("/user/") {
+
+    // Reject traversal anywhere in the path. GitHub normalises `..`
+    // upstream and would otherwise serve a different (blocked) repo.
+    for seg in p.split('/') {
+        if seg == ".." {
+            return false;
+        }
+    }
+
+    // Narrow /user/* surface to what gh actually needs for auth +
+    // org-membership checks. Excludes /user/repos, /user/keys,
+    // /user/emails, /user/gpg_keys (PII / full-inventory leak).
+    if p == "/user" || p == "/user/orgs" || p.starts_with("/user/orgs/") {
+        return true;
+    }
+    // Utility endpoints — read-only, no per-repo state.
+    if matches!(p, "/rate_limit" | "/meta" | "/markdown") {
+        return true;
+    }
+    if p == "/search" || p.starts_with("/search/") {
+        return true;
+    }
+    if p == "/orgs" {
+        return false; // listing orgs isn't useful and exposes membership
+    }
+    // gh resolves `gh repo view org/x` via /orgs/<org> first; allow
+    // bare org-info reads (no /repos sub-path which would be a list).
+    if let Some(rest) = p.strip_prefix("/orgs/") {
+        return !rest.is_empty() && !rest.contains('/');
+    }
+    // GraphQL: gh PR/issue creation. No body-filter — see fn doc.
+    if p == "/graphql" {
         return true;
     }
     if let Some(rest) = p.strip_prefix("/repos/") {
