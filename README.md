@@ -1,171 +1,113 @@
-# agent-vm (microsandbox rewrite)
+# agent-vm
 
-Run AI coding agents (Claude Code, Codex CLI, OpenCode) inside per-project
-microVMs that boot in ~2 seconds, with the host's real OAuth tokens **never
-entering the VM** and a per-launch GitHub-repo allow-list for `git
-push` / `gh pr create`.
+Run Claude Code / Codex / OpenCode inside a per-project libkrun microVM,
+booting in ~2 seconds, with:
 
-This is the in-progress rewrite of
-[`wirenboard/agent-vm`](https://github.com/wirenboard/agent-vm) on top of
-[microsandbox](https://github.com/wirenboard/microsandbox). The original Bash
-implementation continues to live on `main`; the rewrite lives on
-`rewrite-microsandbox`.
+- **Host OAuth tokens never enter the VM.** The TLS-intercept proxy in
+  [microsandbox](https://github.com/wirenboard/microsandbox) substitutes
+  the real bearer for a placeholder on the way out. OAuth refresh is
+  MITM'd so multi-hour sessions survive token rotation.
+- **Per-launch GitHub repo allow-list.** Auto-detected from
+  `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
+  `git push` etc. are filtered at the proxy — off-list calls get a 403
+  before they reach GitHub.
+- **Sandbox is the boundary.** Root inside the VM, project bind-mounted
+  at its host path, `--dangerously-skip-permissions` set by default
+  (the microVM is the only thing actually keeping the agent on rails).
 
-## Why
-
-The original `agent-vm` is mature but heavy: ~30 s cold start, 16 GB disk
-template, host-side mitmproxy chain, balloon daemon, custom GitHub App. This
-rewrite uses microsandbox's libkrun-backed microVMs and built-in TLS-intercept
-+ placeholder-substituted secrets. ~2 s launches, ~17 MB runtime, no host
-proxy, and the "real tokens never enter the VM" guarantee is enforced at the
-network layer instead of by a Python middlebox.
-
-## Status
-
-Phases 0–7 + 9 are done. Each phase is one PR; see [PLAN.md](PLAN.md) for the
-running roadmap.
-
-- 0–2.x: scaffolding, image, launcher MVP, polish.
-- 3–4: host-rooted Claude / Codex credentials with OAuth-refresh support.
-- 5: OpenCode auth + host-cred mutation snapshot.
-- 6: gh / git credential injection with per-launch repo allow-list at the
-  proxy.
-- 7: `--mount`, clipboard bridge, `ccusage` wrapper, Chrome DevTools MCP.
-- 8: fast-launch via detached mode (deferred — product-shape decision).
-- 9: distribution + polish + docs.
-
-Verified end-to-end on Linux/KVM against real Claude (Anthropic) and Codex
-(ChatGPT OAuth) accounts.
+This is the Rust rewrite of the original Bash
+[`wirenboard/agent-vm`](https://github.com/wirenboard/agent-vm) on
+top of microsandbox. Living on `rewrite-microsandbox` until v1.
 
 ## Requirements
 
-- Linux with KVM (`/dev/kvm` readable/writable) — primary target. macOS-VZ
-  works at the microsandbox level but isn't exercised here.
-- Docker, for building the base OCI image and running the local registry.
-- A Rust toolchain (rustup stable) to build agent-vm + the patched `msb`.
-- `libcap-ng-dev` and `libdbus-1-dev` on the build host (transitive deps
-  of the microsandbox crate).
+- Linux with `/dev/kvm` (rw)
+- Docker, for building the base image + running the local registry
+- Rust toolchain (rustup stable)
+- `libcap-ng-dev`, `libdbus-1-dev`, `pkg-config`
 
-The microsandbox runtime libs (`~/.microsandbox/{bin/msb,
-lib/libkrunfw.so.5.x}`) are auto-installed on first launch — you don't
-need to download them by hand.
+`~/.microsandbox/{bin/msb, lib/libkrunfw.so.5.x}` auto-install on
+first launch.
 
-## Build
+## Quick start
 
 ```bash
-git clone https://github.com/wirenboard/agent-vm
+git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
 cd agent-vm
-git checkout rewrite-microsandbox
 git submodule update --init vendor/microsandbox
 sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
 cargo build --release -p agent-vm
 BIN=$(pwd)/target/release/agent-vm
-```
 
-`agent-vm setup` builds the base image (`localhost:5000/agent-vm:latest`),
-the patched `msb` from `vendor/microsandbox`, and verifies the image by
-booting a throwaway sandbox:
+"$BIN" setup                    # build + push image, build patched msb
 
-```bash
-"$BIN" setup
-```
-
-## Use
-
-```bash
 cd ~/your-project
-"$BIN" claude        # Claude Code TUI
-"$BIN" codex         # Codex CLI TUI
-"$BIN" opencode      # OpenCode TUI
-"$BIN" shell         # bash inside the sandbox
-
-# One-shots (no TTY, output streamed live):
-"$BIN" claude -p "fix the lint errors"
-"$BIN" codex exec --skip-git-repo-check "Reply OK"
-"$BIN" shell -- -c 'cargo test'
+"$BIN" claude                   # or codex / opencode / shell
 ```
 
-All four subcommands accept:
+## Subcommands
 
-- `--memory N` — VM memory in GiB (default 2)
-- `--cpus N` — vCPUs (default 2)
-- `--image REF` — override the OCI image
-- `--no-update-check` — skip the registry HEAD on launch
-- `--no-git` — opt out of gh / git injection
-- `--repo OWNER/NAME` — add to the GitHub allow-list (repeatable)
-- `--mount HOST[:GUEST]` — extra bind mount (subject to libkrun IRQ cap)
+```
+claude | codex | opencode | shell   launch an agent in a per-project sandbox
+pull                                refresh the cached image
+setup                               build base image + patched msb
+clipboard {get,put} [--sys]         exchange a string with the project sandbox
+```
 
-Plus:
+Each launcher accepts:
 
-- `"$BIN" pull` — fetch the latest image into the microsandbox cache.
-- `"$BIN" clipboard {get,put} [--sys]` — exchange a string with the
-  per-project sandbox via `<state>/clipboard.txt` (mounted at
-  `/agent-vm-state/clipboard.txt` in the guest). `--sys` also pulls from
-  / pushes to the host system clipboard.
-- `bin/agent-vm-ccusage` — wrapper that unions `~/.claude` and every
-  per-project session dir before running `npx ccusage@latest`.
+| flag | what |
+|---|---|
+| `--memory N` | VM memory GiB (default 2) |
+| `--cpus N` | vCPUs (default 2) |
+| `--image REF` | override the OCI image |
+| `--no-update-check` | skip the registry HEAD on launch |
+| `--no-git` | skip gh/git auth injection (still respects `--repo`) |
+| `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
+| `--mount HOST[:GUEST]` | extra bind mount (subject to libkrun IRQ cap) |
+
+Trailing args go to the agent: `agent-vm claude -p "say hi"`,
+`agent-vm shell -- -c 'cargo test'`.
 
 ## Credentials
 
-- **Claude**: reads `~/.claude/.credentials.json`. Sends a placeholder
-  bearer from the guest; the proxy swaps to the real token on outbound
-  api.anthropic.com traffic. OAuth refresh is MITM'd into a host-side
-  `claude -p` invocation so long sessions survive token rotation.
-- **Codex**: reads `~/.codex/auth.json`. Same model, with OpenAI's
-  `id_token` JWT replaced with an alg-none placeholder so no PII enters
-  the guest.
-- **OpenCode**: synthesizes an OpenCode-shaped `auth.json` from the host
-  Codex credentials (same OpenAI account); a synthetic placeholder JWT
-  goes into `tokens.openai.access` and is substituted on the wire.
-- **gh / git**: if `gh auth status` shows you're logged in, the host
-  token is injected into the guest's `~/.gitconfig` and
-  `~/.config/gh/hosts.yml` as a placeholder. The proxy substitutes for
-  the real bearer on outbound traffic to GitHub.
-  - **Per-launch repo allow-list.** `git remote -v` of the cwd gives the
-    initial set; `--repo OWNER/NAME` widens it; api.github.com requests
-    outside the list get a synthesized 403 from the proxy hook.
+Reads from the host:
 
-Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (mode 0700)
-on the host, **outside** the bind mount the guest sees. A SHA-256 snapshot
-of `~/.claude/.credentials.json`, `~/.codex/auth.json`, and
-`~/.local/share/opencode/auth.json` is taken at launch and re-checked on
-exit; any mutation outside the Phase 4 refresh path prints a warning.
+- `~/.claude/.credentials.json` (Claude)
+- `~/.codex/auth.json` (Codex, OpenCode)
+- `gh auth token` (git/gh)
+
+The guest gets placeholder strings; the proxy substitutes on the wire.
+Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (0700)
+on the host, **outside** the bind mount the guest sees. A SHA-256
+snapshot of the three credential files is taken at launch and
+re-checked on exit; unexpected mutations print a warning.
+
+For Claude/Codex, when the in-VM agent's bearer expires the
+hook MITMs the OAuth refresh, runs `claude -p`/`codex exec` on the
+host to rotate, and feeds the new placeholder back to the guest — no
+re-attach required.
 
 ## Project hook
 
-If the project root contains an executable `.agent-vm.runtime.sh`, the
-launcher `source`s it inside the guest at the project's bind path before
-exec'ing the agent. Use it for `npm install`, env exports, dev-server
-startup, etc.
-
-```sh
-# .agent-vm.runtime.sh
-set -e
-npm install --silent
-export FOO=bar
-```
+If the project root contains an executable `.agent-vm.runtime.sh`,
+the launcher sources it inside the guest before exec'ing the agent.
+Use for `npm install`, env exports, dev-server startup. Non-zero
+exit aborts the launch.
 
 ## Troubleshooting
 
-- **`RegisterNetDevice(IrqsExhausted)` on boot:** libkrun's IRQ pool is
-  tight. Drop a `--mount` or pass `--no-git`.
-- **`runtime error: handshake read id_offset: timed out`:** check
-  `free -h` — boot needs more memory than the host has free. Try
-  `--memory 1`.
-- **Codex hangs at "Reading additional input from stdin...":** kill,
-  re-run. The launcher forces stdin to `/dev/null` in non-TTY mode;
-  if you piped real input, codex consumed it before printing the
-  banner.
-- **`gh api` returns "Bad credentials" but the same call works on
-  host:** you're in a doubly-nested setup where an *outer* agent-vm
-  bridge replaced your host token with its own placeholder. The
-  inner substitution is working; the outer bridge isn't
-  re-substituting on the nested VM's egress. Run from a non-nested
-  host.
+- **`RegisterNetDevice(IrqsExhausted)` at boot** — libkrun's virtio
+  IRQ pool is saturated by project + state + net + secrets. Drop a
+  `--mount` or pass `--no-git`.
+- **`handshake read id_offset: timed out`** — `free -h`; the VM needs
+  more memory than is available. Try `--memory 1`.
+- **GitHub 403 from the proxy** — repo isn't in the allow-list.
+  Pass `--repo OWNER/NAME` or run from a project with the right
+  remote.
 
-## Docs
+## See also
 
-- [PLAN.md](PLAN.md) — phased roadmap with what landed when and what's
-  still open.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — per-phase design notes; the
-  source of truth for *why* something looks the way it does.
+- [PLAN.md](PLAN.md) — phased roadmap, what's done, what's deferred.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
+  the way they do.
