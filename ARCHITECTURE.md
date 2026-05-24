@@ -117,8 +117,8 @@ to the sandbox builder as `.image("localhost:5000/agent-vm:latest")
 The price is that we now run a Docker daemon and a `registry:2` container on
 the host. Acceptable: every dev who needs to *build* the image already needs
 Docker, and the registry container is ~30 MB and starts in <1 s. End users who
-only pull a prebuilt image won't run the local registry at all (Phase 5+
-territory).
+only pull a prebuilt image won't run the local registry at all (Phase 9
+distribution territory).
 
 ### Image content: deliberately minimal
 
@@ -240,8 +240,8 @@ The launcher checks `std::io::stdin().is_terminal()` and branches:
   completion, then forwards collected stdout/stderr and the exit code.
 
 Non-TTY mode loses the live streaming TUI experience but gives the caller a
-clean `stdout | other-tool` story. Streaming exec output during run is on
-the Phase 5 polish list.
+clean `stdout | other-tool` story. Streaming stdout/stderr during run landed
+in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
 ### Credentials: env-var only, deliberately
 
@@ -267,8 +267,9 @@ bin:/usr/bin:/bin`). Otherwise `agent-vm claude` would `ENOENT` immediately.
 ### Tunables: env-var-driven for now
 
 `AGENT_VM_IMAGE_TAG`, `AGENT_VM_MEMORY_MIB`, `AGENT_VM_CPUS` cover the three
-knobs you actually want to change session-to-session. Promoting these to
-proper clap flags is deferred to Phase 5 polish — env-var-only keeps the
+knobs you actually want to change session-to-session. `--memory` and
+`--cpus` were promoted to clap flags (`1817391`); `--image` and friends are
+on the Phase 9 polish list. Env-var-only kept the
 Phase 2 surface small and means we don't have to design the `--memory 4G`
 vs `--memory 4096` ergonomics yet.
 

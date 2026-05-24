@@ -20,28 +20,39 @@ infrastructure becomes either unnecessary or moves into a small Rust binary.
 ## v1 scope (in)
 
 - Subcommands: `setup`, `claude`, `codex`, `opencode`, `shell`.
-- Project working directory mounted into the sandbox as `/workspace`.
+- Project working directory mounted into the sandbox at the project's host
+  path (with `/workspace` fallback for tmpfs-rooted paths).
 - Per-project session persistence for `~/.claude/`, `~/.codex/`,
   `~/.local/share/opencode/` under `${XDG_STATE_HOME}/agent-vm/<project-hash>/`.
 - Host-rooted credentials with refresh: real tokens never enter the VM; host
   `claude -p` / `codex exec` are used to rotate; the VM picks up the new token
-  on the next request without restarting the sandbox.
+  on the next request without restarting the sandbox. Covers Claude, Codex,
+  and OpenCode (which auths against OpenAI like Codex does).
 - Pre-baked Debian-based OCI image with the three agent CLIs and dev tools.
 - Interactive attach for the agent TUIs.
+- Host `gh` / `git` auth reused inside the guest with **per-launch repo
+  allow-list**: agents can `git push` and `gh pr create` only to repos
+  derived from the cwd's remote(s) plus `--repo owner/name` overrides; the
+  request-interceptor hook returns synthesized 403s for any other repo.
+- Security snapshot of host credential files: detect unexpected mutations
+  that aren't from the Phase 4 refresh hook.
+- `--mount HOST:GUEST` for additional host directories.
+- Clipboard bridge between host and guest.
+- `agent-vm-ccusage` wrapper that unions per-project Claude session dirs.
+- Chrome DevTools MCP — Chromium in the image, MCP config injected into the
+  agents' settings (so the in-VM agent can drive a real headless browser).
 
 ## v1 scope (out, may revisit)
 
-- GitHub App device flow + per-repo scoped tokens.
+- GitHub App device flow + per-repo scoped tokens (we reuse the user's
+  existing `gh` auth instead — see "v1 scope (in)" above).
+- GitHub Copilot CLI subcommand and Copilot token acquisition.
 - USB passthrough.
-- Dynamic memory / balloon daemon.
-- Clipboard bridge.
-- `ccusage` wrapper.
-- Chrome DevTools MCP wiring.
-- GitHub Copilot API token acquisition.
-- `--mount` for extra host directories.
+- Dynamic memory / virtio-balloon daemon.
 - `AI_HTTPS_PROXY` upstream proxy chaining.
 - Apple Silicon / macOS-VZ specifics.
 - WSL2-on-Windows specifics.
+- Setup-time `--minimal` / `--disk` flags (image is built once, fixed shape).
 
 ## Phased roadmap
 
@@ -191,7 +202,7 @@ verified on the nested test host because of an outer credential bridge
 that itself substitutes placeholders. Structurally equivalent to the
 original Bash agent-vm's credential-proxy flow.
 
-### Phase 4 — Refresh semantics [done — committed `8e262c0`..`c7f7386`; end-to-end verified + leak fixed this session]
+### Phase 4 — Refresh semantics [done — committed `8e262c0`..`85ffd34`; Codex+Claude verified end-to-end against real credentials, leaks fixed]
 
 Tokens rotate; long-running sandbox sessions must survive that without
 re-attaching. Phase 3 makes the access token swappable in principle;
@@ -268,7 +279,232 @@ against a real host Claude credential. Findings:
   the codex CLI (now 0.133.0) is present in the verified image, but a
   host with real Codex credentials is needed to confirm it end-to-end.
 
-### Phase 5 — Fast-launch (deferred — wrong instrument for the job)
+**Verification session (2026-05-24):** the user ran `codex login` to
+populate `~/.codex/auth.json`, and we drove the full Codex flow until
+it actually returned a real gpt-5.5 response. Three additional fixes
+landed:
+
+- **`id_token` JWT leak in `<state>/codex/auth.json`.** `secrets.rs`
+  was substituting `access_token` and `refresh_token` but leaving the
+  OpenAI `id_token` JWT verbatim — that JWT decodes to user email,
+  chatgpt account id, plan type, org list, user_id. Replaced the
+  static `OPENAI_ID_PLACEHOLDER` string with a structurally valid
+  alg-none JWT carrying clearly-fake fields, so codex 0.133's
+  client-side JWT parse succeeds and no PII enters the guest. Leak
+  grep for the host email, real access/refresh/id token prefixes
+  inside the guest mount: all absent.
+- **IPv6 nameserver in `/etc/resolv.conf` hung codex's resolver.**
+  microsandbox's agentd writes both v4 and v6 gateway DNS at boot. In
+  this nested-libkrun config the v6 gateway times out on UDP/53
+  queries; glibc's `getaddrinfo` silently skips it and uses v4, but
+  codex's Rust async resolver returns `EAI_AGAIN` and fails. `getent
+  hosts chatgpt.com` returned immediately while codex hung at "failed
+  to lookup address information". `run.rs` now wraps the agent
+  command in a tiny bash prelude that `sed`s the colon-bearing
+  nameserver line out of `/etc/resolv.conf` before exec.
+- **codex 0.133 `exec` blocks on stdin unless it's `/dev/null`.**
+  `exec_with`'s `StdinMode::Null` was not enough; codex waited
+  indefinitely for what it thought was unbounded interactive input.
+  Backgrounding (`&` in bash) worked because that auto-redirects
+  stdin. The prelude now does `[ -t 0 ] || exec < /dev/null` so
+  interactive TTY launches are unaffected.
+- **Streaming output** in non-TTY mode (switched the launcher from
+  `exec_with` to `exec_stream_with`). Long-running agent commands
+  used to look completely silent until exit; now stdout/stderr stream
+  live and partial output survives Ctrl-C / timeout. Independent of
+  the codex fix but uncovered by the same debugging.
+
+End-to-end on a real `gpt-5.5` host credential: `agent-vm codex exec
+--skip-git-repo-check "Reply with: CODEX_DIRECT_OK"` returns
+`CODEX_DIRECT_OK` in ~7 s (boot 2.4 s + run 4.3 s), with no host
+token, refresh token, id_token JWT or user PII anywhere under
+`/agent-vm-state`. Claude path was re-tested and still hits the
+documented nested-host 401; that's not a regression — same outer-
+bridge limit as Phase 3.
+
+**Still untested before Phase 4 can claim its "Done when":**
+
+- **Actual mid-session rotation.** The substitution + refresh-hook
+  *infrastructure* is verified, but no run has yet crossed a real
+  token-expiry boundary and survived. The OpenAI ChatGPT access token
+  lives ~24 h; we need a long-running session that goes through at
+  least one rotation event without re-attaching. The hook code path
+  (host CLI rotates → re-read file → synthesize placeholder response
+  → guest writes placeholder → next request uses fresh real token)
+  has not actually fired in anger.
+- **Single-flight on the host-CLI invocation.** Listed under
+  "Design" but not yet implemented in `intercept_hook.rs` — two
+  concurrent in-guest refresh attempts could each spawn `claude -p`
+  or `codex exec` on the host. Host CLI's own file lock prevents
+  corruption, so the worst case is one extra rotation invocation,
+  but it's worth a `<state>.secrets/.refresh.lock` flock once we see
+  it bite.
+
+### Phase 5 — OpenCode auth + security snapshot [pending]
+
+Two small completions of the auth/secret story:
+
+**OpenCode auth.** Phase 4 covered Claude and Codex; OpenCode is the
+third in-scope agent and was deferred. OpenCode authenticates against
+OpenAI but uses its own file shape — original is at
+`claude-vm.sh:996` (`_opencode_vm_build_oauth_auth_json`):
+`{type:"oauth", refresh, access, expires, accountId}` where `access`
+is a JWT with `iss/aud/exp/scp/chatgpt_account_id/chatgpt_plan_type`.
+
+Extend `secrets.rs`:
+
+- Read `~/.local/share/opencode/auth.json` if it exists; otherwise derive
+  the account/email/plan fields from `~/.codex/auth.json` (same OpenAI
+  account, different on-disk format).
+- Write a placeholder `<state>/opencode/auth.json` whose `access` is a
+  synthetic alg-none JWT carrying placeholder-only payload fields (same
+  pattern as Phase 4's `OPENAI_ID_PLACEHOLDER`). `refresh` is a static
+  placeholder string.
+- Register the real OpenAI access token as a second `SecretValue::File`
+  entry keyed off a distinct placeholder so api.openai.com /
+  chatgpt.com requests from OpenCode get substituted (same allow-host
+  set as Codex).
+
+**Security snapshot.** Cheap safety net for "did agent-vm itself, or a
+bug in the refresh hook, mutate my host tokens in some way I didn't
+expect?" At launcher start, take SHA-256 of
+`~/.claude/.credentials.json`, `~/.codex/auth.json`,
+`~/.local/share/opencode/auth.json`; on sandbox exit, re-hash and warn
+if any of them changed outside the Phase 4 refresh-hook path (which we
+*do* expect to mutate them). Original is `claude-vm.sh:1560`
+(`_claude_vm_security_snapshot/check`).
+
+**Done when:** OpenCode authenticates to OpenAI through the proxy on a
+real host (analogous to the Codex e2e in Phase 4 verification 2026-05-
+24); the security snapshot fires on a synthetic mid-run mutation.
+
+### Phase 6 — gh / git credential injection + per-launch repo allow-list [pending]
+
+Without this the in-VM agent can read the project but can't `git push`,
+can't `gh pr create`, can't fetch a private dependency from GitHub.
+With it, agents become useful for actual development work.
+
+**Design:**
+
+1. **Reuse host gh auth — don't mint new tokens.** Read `gh auth token`
+   (or parse `~/.config/gh/hosts.yml`) on the host at launch. Register
+   it as a `SecretValue::File` (same primitive Phase 4 uses for
+   Claude/Codex) so a host-side `gh auth refresh` propagates to the
+   guest without a relaunch. The in-VM `gh` / `git` see a placeholder
+   token; microsandbox's TLS-intercept proxy substitutes on the way
+   out. Allow-host set: `api.github.com`, `github.com`, `codeload.
+   github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.
+   com`, plus the SSH endpoint for HTTPS pushes that the gh credential
+   helper handles.
+
+2. **Per-launch repo allow-list — enforced at the proxy.** A real gh
+   OAuth token typically has `repo` scope (read+write to every repo
+   the user can see). We don't want an off-rails agent pushing to all
+   of them. So:
+
+   - Build the allow-list at launch:
+     - Parse `git remote -v` in the cwd (logic ports from
+       `_claude_vm_parse_github_remote` at `claude-vm.sh:1432`).
+     - Append any `--repo owner/name` overrides from the CLI
+       (repeatable).
+     - `--no-git` skips the whole gh path (no token, no hosts.yml,
+       no allow-list).
+   - Extend the request-interceptor hook (`crates/agent-vm/src/
+     intercept_hook.rs`) with a third route family: `api.github.com`
+     and friends. Phase 4's hook fires on `(host, method, path
+     prefix)`; for GitHub we match on host=`api.github.com`,
+     any-method, all paths, and inside the hook reject anything
+     whose path doesn't start with `/repos/<allowed-owner>/<allowed-
+     repo>/`, `/user`, `/user/repos`, `/orgs/<allowed-org>/`,
+     `/notifications` (read-only), etc. Denied requests return a
+     synthesized 403 with a clear body so the in-VM `gh`/`git`
+     surfaces a comprehensible error instead of a hang or 5xx.
+   - `codeload.github.com` / `raw.githubusercontent.com` filter on
+     `/<allowed-owner>/<allowed-repo>/...` similarly.
+
+3. **In-guest config injection.** Write `~/.gitconfig` (uses the gh
+   credential helper that forwards to placeholder token) and
+   `~/.config/gh/hosts.yml` (placeholder token, real user). Same shape
+   as `_claude_vm_inject_git_credentials` + `_inject_gh_credentials`
+   at `claude-vm.sh:682,706`.
+
+4. **CLI flags.** `--no-git` (skip everything), `--repo OWNER/NAME`
+   (repeatable; allow-list addition).
+
+**Open question:** the OAuth proxy hook in Phase 4 sees buffered
+plaintext HTTP request bytes via stdin — that's what we need for
+path-based filtering too. Confirm `intercept/handler.rs` rule
+matching supports "any method, any path" wildcards or extend it.
+
+**What we explicitly are NOT doing** (per user direction):
+- No GitHub App device flow.
+- No per-repo scoped token minting.
+- No Copilot CLI / Copilot API plumbing.
+
+**Done when:** `agent-vm claude -p "...do work then commit and push..."`
+in a real GitHub project lands a commit on the remote; an agent attempt
+to push to a *different* repo gets a clean 403 from the proxy hook
+rather than reaching GitHub.
+
+### Phase 7 — DX additions: `--mount`, clipboard, ccusage, Chrome DevTools MCP [pending]
+
+A grab-bag of original-agent-vm capabilities the user wants in v1.
+Each is independent and lands as its own PR per the working agreement.
+
+**`--mount HOST:GUEST`** (repeatable). Pass extra host directories
+through to the guest as bind mounts. The launcher already mounts the
+project at its host path + the per-project state dir at
+`/agent-vm-state`; add user-supplied extras. **Mind the libkrun
+virtio-IRQ cap** (~6 devices; see Discovered Upstream Issue #3) — print
+a clear error if the user crosses it, *don't* silently fail at boot.
+
+**Clipboard bridge.** Original `clipboard-pty.py` does a live PTY
+bridge; that's more than we need. v1 design: a per-project
+`<state>/clipboard.{txt,png}` bind-mounted into the guest at a known
+path (e.g. `/agent-vm-state/clipboard.*`), plus:
+- In-guest helper `/usr/local/bin/agent-vm-clip` (baked into the image)
+  that reads/writes those files.
+- Host-side subcommand: `agent-vm clipboard get|put` which exchanges
+  with the host clipboard via `xclip` / `wl-copy` / `pbpaste`,
+  resolving the active sandbox's state dir from cwd. Defer live two-way
+  sync — the file-based pull/push covers "agent emits a code block,
+  I copy it into another app" and vice versa.
+
+**`agent-vm-ccusage` wrapper.** Port verbatim from `bin/ccusage` in
+the original (4 lines): set `CLAUDE_CONFIG_DIR` to the comma-joined
+union of `~/.claude` + every per-project session dir under
+`${XDG_STATE_HOME}/agent-vm`, then `exec npx ccusage@latest`. Ship as
+a separate shell script in `bin/` and reference from README.
+
+**Chrome DevTools MCP.** Original at `claude-vm.sh:385` installs
+Chromium into the image with `google-chrome` symlinks, then writes the
+MCP server entry into `~/.claude.json` / Codex settings:
+
+```json
+"chrome-devtools": {
+  "command": "npx",
+  "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"]
+}
+```
+
+In the rewrite:
+- Add `chromium` + the `google-chrome` symlink dance to `images/
+  Dockerfile`.
+- Extend `secrets::write_default_claude_settings` (and equivalents for
+  Codex `config.toml` / OpenCode `config.json`) to inject the
+  MCP server entry into the merged settings. Merge semantics already in
+  place: user-set MCP servers survive, the chrome-devtools entry is
+  force-set.
+- `AGENT_VM_NO_CHROME_MCP=1` opt-out for users who don't want
+  Chromium running in the guest.
+
+**Done when:** `--mount` round-trips a file into a guest path of the
+user's choice; `agent-vm clipboard put` then in-guest `cat
+/agent-vm-state/clipboard.txt` shows the same string; `agent-vm-
+ccusage` reports usage across all project sessions; in-VM Claude
+opens a real URL via the MCP and screenshots it.
+
+### Phase 8 — Fast-launch (deferred — wrong instrument for the job)
 
 Originally framed around `Sandbox::from_snapshot(...)` on the assumption
 that microsandbox snapshots checkpoint VM memory (à la Firecracker's
@@ -302,7 +538,7 @@ Deferred pending a clear product call. The architectural payoff of
 microsandbox is keeping tokens out of the VM (Phase 3), and current
 1.5 s launch is acceptable.
 
-### Phase 6 — Distribution + polish + docs [pending]
+### Phase 9 — Distribution + polish + docs [pending]
 
 The "ready to share with a teammate" phase.
 
@@ -322,6 +558,12 @@ The "ready to share with a teammate" phase.
   `agent-vm setup --no-verify`, and `agent-vm shell -- -c 'echo ok'`.
 - **macOS/aarch64 binary.** Cross-compile or native-build on each
   platform microsandbox supports.
+- **Upstream-fix or formalize the IPv6 DNS workaround.** The launcher
+  currently sed's the v6 nameserver out of `/etc/resolv.conf` every
+  launch (see Phase 4 verification 2026-05-24, upstream issue #5).
+  Either get the v6 gateway DNS path working in microsandbox or expose
+  a config flag — landing one of those lets us drop the bash prelude
+  back to just the stdin redirect.
 
 **Done when:** README is publishable, CI smoke green on at least linux-amd64,
 binary works from a fresh checkout on a host where microsandbox runtime is
@@ -351,6 +593,33 @@ or fixed in `wirenboard/microsandbox`:
    the SDK doesn't expose either as "ask the registry what's there now"
    so we end up doing raw HTTP. A `Image::resolve(reference) -> RemoteRef`
    helper would clean this up.
+5. **IPv6 gateway DNS is unresponsive in at least one libkrun config.**
+   `agentd` writes both v4 and v6 gateway nameservers into
+   `/etc/resolv.conf` (`crates/agentd/lib/network.rs:556`), but UDP/53
+   queries to the v6 gateway time out while v4 works. glibc's
+   `getaddrinfo` hides this by skipping the broken resolver; strict
+   async resolvers (codex / hickory-style) hang with `EAI_AGAIN`. We
+   work around it in agent-vm by sed'ing colon-bearing nameserver
+   lines out of `/etc/resolv.conf` before exec'ing the agent. Right
+   fix is either (a) make the v6 gateway DNS path actually work, or
+   (b) expose a `network.dns(|d| d.disable_ipv6(true))` knob so the
+   guest only sees v4 nameservers.
+6. **`exec_with` default `StdinMode::Null` doesn't read as `/dev/null`
+   to every client.** codex 0.133's `exec` subcommand blocks
+   indefinitely on what it considers an open stdin pipe under
+   `StdinMode::Null`, but reads EOF correctly when we explicitly
+   redirect to `/dev/null` from inside the bash wrapper. Suggests the
+   fd that gets handed to the in-guest process is something other than
+   `/dev/null` (maybe a closed pipe, maybe a pipe that hasn't been
+   closed on the sender side). Worth tracing what `StdinMode::Null`
+   ends up as inside the guest.
+7. **High-level `exec_with` is buffer-until-exit only.** It returns a
+   completed `ExecOutput`, so a hung child plus an external timeout
+   leaves the caller with zero observable output — making "is it
+   stuck or just slow?" indistinguishable. We switched to
+   `exec_stream_with` (which exists and works), but the wrapper API
+   should probably stream by default and offer a `.collect()` adapter
+   for the rare buffer-it-all case.
 
 ## Working agreements
 

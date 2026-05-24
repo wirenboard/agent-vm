@@ -30,11 +30,18 @@ until v1 of the rewrite ships.
   placeholder dance.
 - Phase 4 (token-refresh semantics: rebuilt `msb`, file-backed
   secrets, OAuth-endpoint interception): done. Long sessions survive
-  host token rotation without manual intervention.
-- Phase 5 (fast-launch via detached mode): deferred — see PLAN.md;
+  host token rotation without manual intervention. End-to-end verified
+  for Claude and Codex against real host credentials (2026-05-24).
+- Phase 5 (OpenCode auth + security snapshot): pending.
+- Phase 6 (gh/git credential injection + per-launch repo allow-list):
+  pending. Reuses host `gh` auth; agents can push only to allow-listed
+  repos.
+- Phase 7 (DX additions — `--mount`, clipboard, `ccusage` wrapper,
+  Chrome DevTools MCP): pending.
+- Phase 8 (fast-launch via detached mode): deferred — see PLAN.md;
   snapshots don't help launch time, detached mode is a product-shape
   decision.
-- Phase 6 (distribution + polish + docs): pending.
+- Phase 9 (distribution + polish + docs): pending.
 
 ## Building
 
