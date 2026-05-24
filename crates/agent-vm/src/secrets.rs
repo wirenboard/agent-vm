@@ -29,7 +29,24 @@ pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_ACCESS
 pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_ANTHROPIC_REFRESH_TOKEN_v1";
 pub const OPENAI_ACCESS_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_ACCESS_TOKEN_v1";
 pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOKEN_v1";
-pub const OPENAI_ID_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1";
+/// Synthetic JWT (alg:none) carrying only placeholder fields. Codex
+/// parses `tokens.id_token` client-side at startup, so the placeholder
+/// has to be structurally a JWT or codex refuses to load — but it has
+/// no real PII. `email`, `chatgpt_account_id`, `chatgpt_plan_type`,
+/// `chatgpt_subscription_active_until`, `chatgpt_user_id` are the
+/// fields codex reads from the payload; values here are clearly-fake
+/// so they're obvious in logs.
+///
+/// header  = base64url('{"alg":"none","typ":"JWT"}')
+/// payload = base64url('{"email":"placeholder@msb.local","exp":9999999999,"iat":1700000000,
+///                       "https://api.openai.com/auth":{"chatgpt_account_id":"00000000-0000-0000-0000-000000000000",
+///                       "chatgpt_plan_type":"placeholder","chatgpt_subscription_active_until":"9999-12-31T00:00:00+00:00",
+///                       "chatgpt_user_id":"user-placeholder"},"sub":"placeholder|0"}')
+/// sig     = "MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1"  (kept literal so a
+///           string grep for the v1 marker still flags any place this
+///           leaks; the JWT spec allows arbitrary characters in the
+///           signature segment under alg:none)
+pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -251,6 +268,18 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
             tokens.insert(
                 "refresh_token".into(),
                 Value::String(OPENAI_REFRESH_PLACEHOLDER.into()),
+            );
+        }
+        // The ChatGPT auth flow also stores an `id_token` JWT — it
+        // carries the user's email, org list, plan type, etc. and is
+        // itself a credential at OIDC-protected endpoints. Leaving it
+        // verbatim would leak that into the guest's auth.json; the
+        // refresh hook already uses OPENAI_ID_PLACEHOLDER for the
+        // synthesized response, so do the same on initial snapshot.
+        if tokens.contains_key("id_token") {
+            tokens.insert(
+                "id_token".into(),
+                Value::String(OPENAI_ID_PLACEHOLDER.into()),
             );
         }
     }
