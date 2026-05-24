@@ -403,12 +403,23 @@ fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
         return GithubAccess::Anonymous;
     }
 
-    // Utility endpoints — small, low-risk, gh-tooling-friendly.
-    if matches!(
-        p,
-        "/graphql" | "/rate_limit" | "/meta" | "/markdown" | "/notifications"
-    ) || p.starts_with("/search")
+    // Search and notifications are user-scoped under auth and would
+    // leak private repo inventory / personal state to the agent.
+    // Strip auth so the agent gets exactly what a third party sees:
+    // /search/* → public-only results; /notifications → 401.
+    // Agents needing in-private-repo search can `git grep` inside
+    // the bind-mounted project (works directly on disk).
+    if p == "/notifications"
+        || p.starts_with("/notifications/")
+        || p == "/search"
+        || p.starts_with("/search/")
     {
+        return GithubAccess::Anonymous;
+    }
+
+    // Other utility endpoints are not user-scoped and are safe to
+    // forward authenticated (gh tooling uses them).
+    if matches!(p, "/graphql" | "/rate_limit" | "/meta" | "/markdown") {
         return GithubAccess::Authenticated;
     }
 
@@ -871,20 +882,38 @@ mod tests {
 
     #[test]
     fn gh_access_utility_endpoints_authenticated() {
+        // Non-user-scoped utility surfaces: gh tooling friendly,
+        // safe to forward with auth.
         let allowed = al(&[]);
-        for path in [
-            "/graphql",
-            "/rate_limit",
-            "/meta",
-            "/markdown",
-            "/notifications",
-            "/search/issues?q=foo",
-            "/search/repositories",
-        ] {
+        for path in ["/graphql", "/rate_limit", "/meta", "/markdown"] {
             assert!(
                 matches!(github_access("POST", path, &allowed), GithubAccess::Authenticated)
                     || matches!(github_access("GET", path, &allowed), GithubAccess::Authenticated),
                 "{path} should be Authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_access_search_and_notifications_are_anonymous() {
+        // Per spec: third-party model. Authenticated search hits
+        // private repos the user has access to → leaks private repo
+        // inventory + code + issues. /notifications is inherently
+        // user-scoped (your own notification feed) — third party
+        // gets 401, which is the right answer.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for path in [
+            "/search",
+            "/search/code?q=foo+repo:any/repo",
+            "/search/issues?q=is:open",
+            "/search/repositories?q=stars:>1000",
+            "/notifications",
+            "/notifications/threads/123",
+        ] {
+            assert_eq!(
+                github_access("GET", path, &allowed),
+                GithubAccess::Anonymous,
+                "{path} should be Anonymous (third-party access)"
             );
         }
     }
