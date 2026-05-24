@@ -525,31 +525,37 @@ fn strip_authorization_from_request(request: &[u8]) -> Vec<u8> {
     let (head, rest) = request.split_at(hdr_end);
     // rest starts with "\r\n\r\n"; keep that + body verbatim.
 
-    let mut out: Vec<u8> = Vec::with_capacity(request.len());
+    // Collect lines (request line + headers) that we want to keep.
+    // Note: the LAST line in `head` has no trailing \r\n in `head`
+    // (that \r\n is part of the \r\n\r\n in `rest`). We collect lines
+    // verbatim then join with \r\n at the end — that way dropping the
+    // last line is naturally handled: the previous line we kept does
+    // not get a trailing \r\n, and `rest` supplies the \r\n that
+    // terminates the last kept header.
+    let mut kept: Vec<&[u8]> = Vec::new();
     let mut cursor = 0usize;
-    // Iterate header lines, skipping any whose name is "authorization".
-    // Note: the LAST header in `head` typically has no trailing \r\n
-    // (its CRLF is in `rest` as part of the \r\n\r\n separator) — so
-    // we handle that case explicitly, checking auth before deciding
-    // whether to emit it.
     while cursor < head.len() {
-        let (line, next_cursor, has_trailing_crlf) =
-            match head[cursor..].windows(2).position(|w| w == b"\r\n") {
-                Some(p) => (&head[cursor..cursor + p], cursor + p + 2, true),
-                None => (&head[cursor..], head.len(), false),
-            };
+        let (line, next_cursor) = match head[cursor..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => (&head[cursor..cursor + p], cursor + p + 2),
+            None => (&head[cursor..], head.len()),
+        };
         let is_auth = line
             .iter()
             .position(|&b| b == b':')
             .map(|colon| line[..colon].eq_ignore_ascii_case(b"authorization"))
             .unwrap_or(false);
         if !is_auth {
-            out.extend_from_slice(line);
-            if has_trailing_crlf {
-                out.extend_from_slice(b"\r\n");
-            }
+            kept.push(line);
         }
         cursor = next_cursor;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(request.len());
+    for (i, line) in kept.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(line);
     }
     // Append the body separator + body unchanged.
     out.extend_from_slice(rest);
@@ -1164,6 +1170,35 @@ mod tests {
         // missing, pass through unchanged so the proxy at least
         // forwards SOMETHING.
         assert_eq!(out, r);
+    }
+
+    /// Regression: when Authorization is the LAST header (its line
+    /// has no trailing \r\n in `head` — that \r\n is part of the
+    /// \r\n\r\n separator in `rest`), an earlier implementation
+    /// dropped the line but kept the previous header's trailing \r\n,
+    /// and then appended `rest` which itself starts with \r\n\r\n.
+    /// Result: three consecutive \r\n between headers and body,
+    /// shifting body content by 2 bytes and breaking Content-Length
+    /// or poisoning the next request on a keep-alive connection.
+    #[test]
+    fn strip_auth_when_authorization_is_last_header_no_extra_crlf() {
+        let r = b"GET / HTTP/1.1\r\n\
+                  Host: api.github.com\r\n\
+                  Authorization: Bearer LAST\r\n\
+                  \r\n\
+                  body-bytes";
+        let out = strip_authorization_from_request(r);
+        let s = std::str::from_utf8(&out).unwrap();
+        // Header/body separator must be exactly one \r\n\r\n.
+        assert!(
+            s.contains("Host: api.github.com\r\n\r\nbody-bytes"),
+            "expected exactly one CRLFCRLF between headers and body; got:\n{s:?}"
+        );
+        assert!(!s.contains("\r\n\r\n\r\n"), "no triple CRLF; got:\n{s:?}");
+        assert!(!s.to_ascii_lowercase().contains("authorization:"));
+        // Body is preserved verbatim and starts immediately after the
+        // single \r\n\r\n.
+        assert!(s.ends_with("\r\n\r\nbody-bytes"));
     }
 
     #[test]
