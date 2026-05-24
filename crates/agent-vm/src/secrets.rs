@@ -81,6 +81,11 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "MSB_PLACEHOLDER_GH_TOKEN_v1";
 
 pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";
+/// Claude Code's MCP relay endpoint. Claude Code's HTTP client sends
+/// the same Anthropic access token here, so the secret substitution
+/// has to allow this destination too — otherwise the placeholder
+/// trips the violation scan and the conn gets dropped, breaking MCP.
+pub const ANTHROPIC_MCP_PROXY_HOST: &str = "mcp-proxy.anthropic.com";
 pub const OPENAI_API_HOST: &str = "api.openai.com";
 pub const OPENAI_CHATGPT_HOST: &str = "chatgpt.com";
 pub const OPENAI_OAUTH_HOST: &str = "auth.openai.com";
