@@ -40,6 +40,13 @@ pub fn host_codex_auth_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".codex/auth.json"))
 }
 
+/// `$HOME/.local/share/opencode/auth.json`. Same not-found convention.
+/// OpenCode auths against OpenAI like Codex does, but stores its own
+/// auth file in the XDG data dir.
+pub fn host_opencode_auth_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share/opencode/auth.json"))
+}
+
 /// Write `data` to `path` atomically (write a sibling tmp file, then
 /// `rename`) with the given Unix mode. The tmp file uses a fixed
 /// extension so a crashed run leaves an obvious orphan rather than a

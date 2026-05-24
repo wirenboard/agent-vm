@@ -17,8 +17,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::host_paths::{atomic_write, host_claude_creds_path, host_codex_auth_path};
+use crate::host_paths::{
+    atomic_write, host_claude_creds_path, host_codex_auth_path, host_opencode_auth_path,
+};
 
 // ---------------------------------------------------------------------------
 // Placeholder strings the guest sees instead of real tokens. Substituted
@@ -47,6 +50,26 @@ pub const OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENAI_REFRESH_TOK
 ///           leaks; the JWT spec allows arbitrary characters in the
 ///           signature segment under alg:none)
 pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InBsYWNlaG9sZGVyQG1zYi5sb2NhbCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNzAwMDAwMDAwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbGFjZWhvbGRlciIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6Ijk5OTktMTItMzFUMDA6MDA6MDArMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBsYWNlaG9sZGVyIn0sInN1YiI6InBsYWNlaG9sZGVyfDAifQ.MSB_PLACEHOLDER_OPENAI_ID_TOKEN_v1";
+/// Synthetic JWT used as the placeholder for OpenCode's OAuth `access`
+/// field. OpenCode sends `Authorization: Bearer <access>` to
+/// api.openai.com, so this string is the exact byte sequence the proxy
+/// scans for and substitutes with the real OpenAI access token (kept
+/// in the same host-only token file as Codex uses). Must be distinct
+/// from `OPENAI_ID_PLACEHOLDER` so that substituting one doesn't
+/// accidentally substitute the other in unrelated request bytes.
+///
+/// header  = base64url('{"alg":"none","typ":"JWT"}')
+/// payload = base64url('{"exp":9999999999,
+///                       "chatgpt_account_id":"00000000-0000-0000-0000-000000000000"}')
+/// sig     = "MSB_OPENCODE_v1"
+///
+/// **Kept short on purpose:** an earlier ~480-char payload (with
+/// iss/aud/scp/email/sub claims) triggered upstream issue #8 — long
+/// placeholders fail sandbox boot with `handshake read id_offset:
+/// timed out before relay sent bytes`. Add fields here only if
+/// OpenCode actually parses them and chokes on absence.
+pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.MSB_OPENCODE_v1";
+pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "MSB_PLACEHOLDER_OPENCODE_OPENAI_REFRESH_v1";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -63,10 +86,28 @@ pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 
 /// Result of [`refresh`]. `*_token_file` paths only exist if the host
 /// credential file was found and parsed successfully.
+///
+/// `opencode_openai_access_token_file` shares the same on-disk file as
+/// `openai_token_file` (both substitute to the same real OpenAI access
+/// token) — it's `Some` whenever the launcher should register a
+/// proxy-substitution entry for OpenCode's synthetic-JWT placeholder.
 #[derive(Debug, Default, Clone)]
 pub struct CredsState {
     pub anthropic_token_file: Option<PathBuf>,
     pub openai_token_file: Option<PathBuf>,
+    pub opencode_openai_access_token_file: Option<PathBuf>,
+    pub snapshot: Option<HostCredsSnapshot>,
+}
+
+/// SHA-256 of each host credential file at launcher start. Compared
+/// after the sandbox exits to flag unexpected mutations — the Phase 4
+/// refresh hook may legitimately rewrite these files; anything else
+/// touching them is a smell. See `verify_snapshot`.
+#[derive(Debug, Default, Clone)]
+pub struct HostCredsSnapshot {
+    pub claude: Option<(PathBuf, String)>,
+    pub codex: Option<(PathBuf, String)>,
+    pub opencode: Option<(PathBuf, String)>,
 }
 
 /// Host-only directory holding the real access-token files the proxy
@@ -98,6 +139,14 @@ pub fn anthropic_token_path(state_dir: &Path) -> PathBuf {
 
 pub fn openai_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir(state_dir).join("openai")
+}
+
+/// OpenCode reuses the same OpenAI access token file: both Codex and
+/// OpenCode hit api.openai.com / chatgpt.com and the proxy substitutes
+/// each provider's distinct placeholder string for the same real
+/// bearer. Same file, two registered placeholders.
+pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
+    openai_token_path(state_dir)
 }
 
 /// Read host credentials, write the token file (atomically, 0600) and
@@ -135,11 +184,84 @@ pub fn refresh(state_dir: &Path, project_guest_path: &str) -> Result<CredsState>
         tracing::warn!(error = %e, "openai credential refresh failed; skipping");
         None
     });
+    // OpenCode auths against OpenAI like Codex does. If the user has
+    // host Codex/OpenAI credentials, we synthesize an OpenCode-shaped
+    // `auth.json` whose `access` field is a placeholder JWT — the
+    // proxy substitutes that placeholder for the same real OpenAI
+    // access token on outbound traffic. So OpenCode shares the
+    // `openai_token_file` with Codex.
+    let opencode_openai_access_token_file = if openai_token_file.is_some() {
+        match refresh_opencode(state_dir) {
+            Ok(_) => Some(opencode_openai_token_path(state_dir)),
+            Err(e) => {
+                tracing::warn!(error = %e, "opencode credential refresh failed; skipping");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // SHA-256 snapshot of host credential files for post-run mutation
+    // detection. Phase 4's refresh hook *legitimately* rewrites these;
+    // anything else doing so is a bug to investigate. See
+    // `verify_snapshot`.
+    let snapshot = Some(snapshot_host_creds());
 
     Ok(CredsState {
         anthropic_token_file,
         openai_token_file,
+        opencode_openai_access_token_file,
+        snapshot,
     })
+}
+
+/// SHA-256 the three host credential files. Files that don't exist or
+/// can't be read are recorded as `None` — only files that successfully
+/// hash become anchors for [`verify_snapshot`].
+pub fn snapshot_host_creds() -> HostCredsSnapshot {
+    HostCredsSnapshot {
+        claude: host_claude_creds_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
+        codex: host_codex_auth_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
+        opencode: host_opencode_auth_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
+    }
+}
+
+/// Diff the saved [`HostCredsSnapshot`] against the current file
+/// state. Emits a one-line summary to stderr listing the host cred
+/// files that mutated during the session — the Phase 4 OAuth refresh
+/// hook may legitimately rewrite them, but any other mutation is
+/// worth surfacing. Non-fatal.
+pub fn verify_snapshot(before: &HostCredsSnapshot) {
+    let mut changed: Vec<&str> = Vec::new();
+    for (label, entry) in [
+        ("claude", &before.claude),
+        ("codex", &before.codex),
+        ("opencode", &before.opencode),
+    ] {
+        if let Some((path, before_hash)) = entry {
+            let now = hash_file(path);
+            match now.as_deref() {
+                Some(after) if after == before_hash => {}
+                Some(_) => changed.push(label),
+                None => changed.push(label), // disappeared
+            }
+        }
+    }
+    if !changed.is_empty() {
+        eprintln!(
+            "==> host credential file(s) changed during sandbox: {} (expected only on Phase 4 OAuth refresh; investigate if you didn't trigger one)",
+            changed.join(", "),
+        );
+    }
+}
+
+fn hash_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let digest = h.finalize();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Drop the per-agent bypass files (Claude's onboarding flags + Codex's
@@ -207,6 +329,85 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     )?;
 
     Ok(Some(token_file))
+}
+
+/// Write `<state>/opencode/auth.json` shaped for OpenCode's OAuth
+/// flow, but with placeholder strings everywhere. The `openai.access`
+/// field carries our synthetic JWT placeholder; the proxy substitutes
+/// it with the real OpenAI access token (from the file shared with
+/// Codex) on outbound traffic. `accountId` is derived from the host
+/// Codex JWT when available, so OpenCode picks the right account
+/// without us hard-coding anything user-specific.
+///
+/// Requires that `refresh_openai` has already run (so a host codex
+/// auth file existed and was parseable). Returns `None` if not.
+fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
+    let Some(host_path) = host_codex_auth_path() else {
+        return Ok(None);
+    };
+    let raw = match std::fs::read_to_string(&host_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
+    };
+    let json: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", host_path.display()))?;
+
+    // account_id: from tokens.account_id directly when present,
+    // otherwise pull from the id_token JWT's `chatgpt_account_id`.
+    let account_id = json
+        .pointer("/tokens/account_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| decode_id_token_account(&json))
+        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
+
+    // Far-future expires_in (ms); OpenCode treats this as a hint of
+    // when to refresh. The proxy substitution is always live anyway,
+    // so a long expiry just suppresses opencode's own refresh
+    // attempts (which would fail against our synthetic JWT).
+    let expires_ms: u64 = 9_999_999_999_000;
+
+    let auth = serde_json::json!({
+        "openai": {
+            "type": "oauth",
+            "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+            "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+            "expires": expires_ms,
+            "accountId": account_id,
+        }
+    });
+
+    let opencode_dir = state_dir.join("opencode");
+    std::fs::create_dir_all(&opencode_dir)?;
+    atomic_write(
+        &opencode_dir.join("auth.json"),
+        serde_json::to_vec(&auth)?.as_slice(),
+        0o600,
+    )?;
+
+    Ok(Some(()))
+}
+
+/// Decode an OpenAI id_token JWT (alg=RS256, but we don't verify) and
+/// pull the `chatgpt_account_id` out of its payload's
+/// `https://api.openai.com/auth` claim. Used as a fallback when the
+/// codex auth.json doesn't carry `tokens.account_id` directly.
+fn decode_id_token_account(json: &Value) -> Option<String> {
+    let id_token = json
+        .pointer("/tokens/id_token")
+        .and_then(|v| v.as_str())?;
+    let payload_b64 = id_token.split('.').nth(1)?;
+    let padded = format!("{}{}", payload_b64, "=".repeat((4 - payload_b64.len() % 4) % 4));
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE
+        .decode(padded.as_bytes())
+        .ok()?;
+    let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
+    payload
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 fn write_default_claude_settings(path: &Path) -> Result<()> {

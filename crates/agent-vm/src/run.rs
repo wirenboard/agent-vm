@@ -215,6 +215,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
+        let opencode = creds.opencode_openai_access_token_file.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
         builder = builder.network(move |mut n| {
@@ -243,6 +244,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .allow_host(OPENAI_API_HOST)
                         .allow_host(OPENAI_CHATGPT_HOST)
                         .allow_host(OPENAI_OAUTH_HOST)
+                });
+            }
+            // OpenCode sends Authorization: Bearer <synthetic JWT> to
+            // api.openai.com; the proxy swaps the JWT for the real
+            // OpenAI access token (same on-disk file as Codex uses).
+            if let Some(file) = opencode {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED")
+                        .value(file)
+                        .placeholder(OPENCODE_OPENAI_ACCESS_PLACEHOLDER)
+                        .inject_basic_auth(false)
+                        .allow_host(OPENAI_API_HOST)
+                        .allow_host(OPENAI_CHATGPT_HOST)
                 });
             }
             n.intercept(|i| {
@@ -418,6 +432,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     Sandbox::remove(&session.sandbox_name).await.ok();
     if profile {
         eprintln!("[profile] remove: {:?}", t_remove.elapsed());
+    }
+
+    // Phase 5 safety net: diff the host credential files against the
+    // SHA-256 snapshot we took at launch. The Phase 4 refresh hook may
+    // legitimately rewrite them mid-session; anything else changing
+    // them is a smell worth surfacing.
+    if let Some(snap) = creds.snapshot.as_ref() {
+        crate::secrets::verify_snapshot(snap);
     }
 
     Ok(exit)

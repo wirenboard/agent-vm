@@ -620,6 +620,18 @@ or fixed in `wirenboard/microsandbox`:
    `exec_stream_with` (which exists and works), but the wrapper API
    should probably stream by default and offer a `.collect()` adapter
    for the rare buffer-it-all case.
+8. **Long secret placeholders break sandbox boot.** Registering a
+   ~480-byte placeholder string (a JWT-shaped synthetic with full
+   OpenAI auth claims) caused `runtime error: handshake read
+   id_offset: timed out before relay sent bytes` at sandbox create
+   time, before agentd ever runs in the guest. Same setup with the
+   placeholder shrunk to ~150 bytes boots fine. Boot failure happens
+   long before the substitution proxy is exercised, so the limit must
+   sit in the config-delivery / runtime-handshake path rather than the
+   secret scanner itself. Worth tracing — Phase 5 works around it by
+   keeping OpenCode's synthetic JWT minimal (3-claim payload, short
+   sig), but anything in agent-vm or downstream that wants placeholders
+   above a few hundred bytes will silently fail.
 
 ## Working agreements
 
