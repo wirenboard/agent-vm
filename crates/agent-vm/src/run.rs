@@ -422,19 +422,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             // accept the perf hit (basic_auth disables the per-chunk
             // fast path) because GitHub connections aren't WebSocket.
             //
-            // **Known gap (review #1).** The per-launch repo allow-list
-            // is enforced by the intercept hook on api.github.com only.
-            // The gh secret also allows github.com / codeload / raw /
-            // objects so `git push` / `git clone` can reach them with
-            // the substituted token — but no intercept rule filters
-            // those paths. A malicious in-VM agent that knows how to
-            // craft git smart-HTTP requests can push to any repo the
-            // host token has access to. Filtering git protocol over
-            // HTTPS requires a streaming intercept primitive that
-            // microsandbox doesn't have yet (intercept buffers the
-            // full request, capped at 64 KiB — git push pack data
-            // exceeds that). Until then, the threat model assumes the
-            // agent is well-intentioned but possibly mistaken.
+            // The per-launch repo allow-list binds api.github.com
+            // (full-buffer hook below) AND the git smart-HTTP hosts
+            // (streaming `rule_streaming` rules below). The smart-
+            // HTTP path uses microsandbox's headers-only dispatch
+            // primitive — the hook decides based on the request
+            // line alone, so multi-MB git push pack data never hits
+            // the 64 KiB intercept buffer.
             if let Some(file) = gh {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_GH_UNUSED")
