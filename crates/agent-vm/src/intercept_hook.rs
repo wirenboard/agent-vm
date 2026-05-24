@@ -378,6 +378,7 @@ fn github_path_allowed(method: &str, path: &str, allowed: &[String]) -> bool {
 
 /// Decision for a request to a git-smart-HTTP host (github.com /
 /// codeload / raw / objects).
+#[cfg_attr(test, derive(Debug))]
 enum GithubSmartDecision {
     /// Path matches the allow-list: tell the proxy to passthrough
     /// (empty hook stdout).
@@ -689,4 +690,414 @@ fn build_response(code: u16, reason: &str, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(body);
     out
+}
+
+// ─── tests ────────────────────────────────────────────────────────────
+//
+// Focus: the per-launch GitHub allow-list policy. This is the security
+// surface — getting it wrong silently lets an in-VM agent push to or
+// mutate repos the user didn't list. Cover the matrix:
+//
+//   axis            | values
+//   ----------------|-----------------------------------------------
+//   method          | GET, HEAD, POST, PATCH, PUT, DELETE
+//   path category   | /repos/<o>/<r>/..., /graphql, /user, /user/repos,
+//                   |   /user/keys, /markdown, /search, /admin, /...
+//   allow-list      | empty, contains slug, contains other slug
+//   traversal       | clean, .. anywhere
+//   case            | uppercase/lowercase owner/repo
+//
+// For git smart-HTTP: discriminate clone/fetch (allow) from push
+// (allow-list). Method+path+query distinguish them.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn al(slugs: &[&str]) -> Vec<String> {
+        slugs.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── github_path_allowed: reads ────────────────────────────────
+
+    #[test]
+    fn gh_reads_are_unrestricted_any_repo() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        // GET on a NOT-allow-listed repo: allow.
+        assert!(github_path_allowed("GET", "/repos/octocat/Hello-World", &allowed));
+        assert!(github_path_allowed("GET", "/repos/octocat/Hello-World/issues", &allowed));
+        assert!(github_path_allowed("GET", "/repos/some-other/repo/contents/README.md", &allowed));
+        assert!(github_path_allowed("HEAD", "/repos/anyone/anything", &allowed));
+        // /user/* reads — including the ones the previous policy
+        // narrowed away.
+        assert!(github_path_allowed("GET", "/user", &allowed));
+        assert!(github_path_allowed("GET", "/user/repos", &allowed));
+        assert!(github_path_allowed("GET", "/user/keys", &allowed));
+        assert!(github_path_allowed("GET", "/user/emails", &allowed));
+        // Search, /orgs/<x>, /notifications all read-only — allow.
+        assert!(github_path_allowed("GET", "/search/issues?q=foo", &allowed));
+        assert!(github_path_allowed("GET", "/orgs/some-org", &allowed));
+        assert!(github_path_allowed("GET", "/notifications", &allowed));
+    }
+
+    // ── github_path_allowed: writes ──────────────────────────────
+
+    #[test]
+    fn gh_writes_to_allow_listed_repo_pass() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for m in ["POST", "PATCH", "PUT", "DELETE"] {
+            assert!(
+                github_path_allowed(m, "/repos/wirenboard/agent-vm/issues", &allowed),
+                "{m} on allow-listed repo should pass"
+            );
+            assert!(github_path_allowed(
+                m,
+                "/repos/wirenboard/agent-vm/pulls/1/merge",
+                &allowed
+            ));
+        }
+    }
+
+    #[test]
+    fn gh_writes_to_other_repo_are_denied() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for m in ["POST", "PATCH", "PUT", "DELETE"] {
+            assert!(
+                !github_path_allowed(m, "/repos/octocat/Hello-World/issues", &allowed),
+                "{m} on non-allow-listed repo should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_allow_list_match_is_case_insensitive() {
+        let allowed = al(&["WirenBoard/Agent-VM"]);
+        assert!(github_path_allowed(
+            "POST",
+            "/repos/wirenboard/agent-vm/issues",
+            &allowed
+        ));
+        assert!(github_path_allowed(
+            "DELETE",
+            "/repos/WIRENBOARD/AGENT-VM",
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn gh_graphql_post_is_allowed() {
+        // GraphQL is the v1 gap (no body-level filtering); allow.
+        assert!(github_path_allowed("POST", "/graphql", &[]));
+        assert!(github_path_allowed("POST", "/graphql", &al(&["x/y"])));
+    }
+
+    #[test]
+    fn gh_utility_writes_are_allowed() {
+        // POST /markdown: server-side rendering, no state change.
+        assert!(github_path_allowed("POST", "/markdown", &[]));
+        // POST /user/repos: create a new repo owned by the user.
+        // Not a mutation of someone else's repo.
+        assert!(github_path_allowed("POST", "/user/repos", &[]));
+    }
+
+    #[test]
+    fn gh_write_to_unlisted_user_endpoints_denied() {
+        // The previous policy narrowed /user/* reads; the new policy
+        // allows reads everywhere but writes to /user/keys, /user/emails
+        // etc. should still be denied — they're not in the explicit
+        // utility-write allow set.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        assert!(!github_path_allowed("POST", "/user/keys", &allowed));
+        assert!(!github_path_allowed("DELETE", "/user/keys/123", &allowed));
+        assert!(!github_path_allowed("PATCH", "/user/emails", &allowed));
+        assert!(!github_path_allowed("POST", "/admin/users", &allowed));
+    }
+
+    #[test]
+    fn gh_traversal_segments_are_rejected_for_any_method() {
+        // Even reads should fail-closed on `..` because the underlying
+        // proxy substitution layer would still hand the real bearer
+        // upstream and GitHub would normalise the path.
+        let allowed = al(&["allowed/repo"]);
+        assert!(!github_path_allowed(
+            "GET",
+            "/repos/allowed/repo/../../victim/private/contents",
+            &allowed
+        ));
+        assert!(!github_path_allowed(
+            "POST",
+            "/repos/allowed/repo/../../victim/private/issues",
+            &allowed
+        ));
+        assert!(!github_path_allowed("GET", "/../etc/passwd", &allowed));
+    }
+
+    #[test]
+    fn gh_query_string_is_stripped_before_checks() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        assert!(github_path_allowed(
+            "GET",
+            "/repos/wirenboard/agent-vm?ref=main",
+            &allowed
+        ));
+        assert!(github_path_allowed(
+            "POST",
+            "/repos/wirenboard/agent-vm/issues?foo=bar",
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn gh_repos_with_empty_owner_or_repo_denied() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        // Write methods to malformed /repos/ paths must not pass.
+        assert!(!github_path_allowed("POST", "/repos/", &allowed));
+        assert!(!github_path_allowed("POST", "/repos/owner", &allowed));
+        assert!(!github_path_allowed("POST", "/repos/owner/", &allowed));
+        assert!(!github_path_allowed("POST", "/repos//repo", &allowed));
+    }
+
+    // ── github_smart_decision: smart-HTTP ─────────────────────────
+
+    fn req(line: &str) -> Vec<u8> {
+        format!("{line}\r\nHost: github.com\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn smart_clone_fetch_is_unrestricted() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        // Clone handshake.
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /octocat/Hello-World.git/info/refs?service=git-upload-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // Clone pack data POST.
+        assert!(matches!(
+            github_smart_decision(
+                &req("POST /octocat/Hello-World.git/git-upload-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // codeload archive.
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /octocat/Hello-World/zip/refs/heads/master HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // raw blob.
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /octocat/Hello-World/main/README.md HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+    }
+
+    #[test]
+    fn smart_push_handshake_checked_against_allow_list() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        // info/refs?service=git-receive-pack is the push handshake.
+        // Allow-listed → Passthrough.
+        assert!(matches!(
+            github_smart_decision(
+                &req(
+                    "GET /wirenboard/agent-vm.git/info/refs?service=git-receive-pack HTTP/1.1"
+                ),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // Non-allow-listed → Deny.
+        let v = github_smart_decision(
+            &req("GET /octocat/Hello-World.git/info/refs?service=git-receive-pack HTTP/1.1"),
+            &allowed,
+        );
+        match v {
+            GithubSmartDecision::Deny(msg) => assert!(msg.contains("octocat/Hello-World")),
+            _ => panic!("expected Deny, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn smart_push_data_checked_against_allow_list() {
+        let allowed = al(&["wirenboard/agent-vm"]);
+        // git-receive-pack POST is the actual push.
+        assert!(matches!(
+            github_smart_decision(
+                &req("POST /wirenboard/agent-vm.git/git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        assert!(matches!(
+            github_smart_decision(
+                &req("POST /octocat/Hello-World.git/git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Deny(_),
+        ));
+    }
+
+    #[test]
+    fn smart_dot_git_suffix_is_stripped_once_only() {
+        // GitHub doesn't accept `<repo>.git.git` so this is mostly a
+        // safety net, but make sure the strip is the precise
+        // `strip_suffix` form (one match), not `trim_end_matches`
+        // (greedy).
+        let allowed = al(&["owner/repo.git"]);
+        // Allow-list is literally `owner/repo.git` (silly but legal).
+        // smart path is `/owner/repo.git.git/...` (also silly). After
+        // stripping ONE .git, slug = `owner/repo.git`, matches.
+        assert!(matches!(
+            github_smart_decision(
+                &req("POST /owner/repo.git.git/git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+    }
+
+    #[test]
+    fn smart_traversal_in_push_is_rejected() {
+        let allowed = al(&["allowed/repo"]);
+        assert!(matches!(
+            github_smart_decision(
+                &req(
+                    "POST /allowed/repo.git/../../victim/private.git/git-receive-pack HTTP/1.1"
+                ),
+                &allowed,
+            ),
+            GithubSmartDecision::Deny(_),
+        ));
+    }
+
+    #[test]
+    fn smart_case_insensitive_allow_list() {
+        let allowed = al(&["WirenBoard/Agent-VM"]);
+        assert!(matches!(
+            github_smart_decision(
+                &req("POST /wirenboard/agent-vm.git/git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+    }
+
+    #[test]
+    fn smart_malformed_request_is_flagged() {
+        // No CRLF anywhere.
+        assert!(matches!(
+            github_smart_decision(b"GET /foo HTTP/1.1", &al(&["x/y"])),
+            GithubSmartDecision::Malformed,
+        ));
+        // Empty.
+        assert!(matches!(
+            github_smart_decision(b"", &al(&["x/y"])),
+            GithubSmartDecision::Malformed,
+        ));
+        // Only one whitespace-separated token on the request line.
+        assert!(matches!(
+            github_smart_decision(b"GET\r\n", &al(&["x/y"])),
+            GithubSmartDecision::Malformed,
+        ));
+    }
+
+    #[test]
+    fn smart_info_refs_without_receive_pack_is_passthrough() {
+        // info/refs with NO service= or service=git-upload-pack: a
+        // read. Should never be checked against the allow-list.
+        let allowed = al(&["only/this"]);
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /other/repo.git/info/refs HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /other/repo.git/info/refs?service=git-upload-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // Multi-param query with service= somewhere middle.
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /other/repo.git/info/refs?foo=bar&service=git-upload-pack&baz=qux HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Passthrough,
+        ));
+        // Same shape but service=git-receive-pack → Deny on non-listed.
+        assert!(matches!(
+            github_smart_decision(
+                &req("GET /other/repo.git/info/refs?foo=bar&service=git-receive-pack HTTP/1.1"),
+                &allowed,
+            ),
+            GithubSmartDecision::Deny(_),
+        ));
+    }
+
+    // ── substitute_authorization_header ───────────────────────────
+
+    #[test]
+    fn auth_substitute_bearer_is_literal_replace() {
+        let out = substitute_authorization_header(
+            &format!("Bearer {}", secrets::GH_TOKEN_PLACEHOLDER),
+            "real_token_xyz",
+        );
+        assert_eq!(out, "Bearer real_token_xyz");
+    }
+
+    #[test]
+    fn auth_substitute_token_form_is_literal_replace() {
+        let out = substitute_authorization_header(
+            &format!("token {}", secrets::GH_TOKEN_PLACEHOLDER),
+            "real_token_xyz",
+        );
+        assert_eq!(out, "token real_token_xyz");
+    }
+
+    #[test]
+    fn auth_substitute_basic_decodes_encodes() {
+        use base64::Engine as _;
+        let basic_value = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{}", secrets::GH_TOKEN_PLACEHOLDER).as_bytes())
+        );
+        let out = substitute_authorization_header(&basic_value, "real_xyz");
+        // Round-trip: decode the result and check it contains the real token.
+        let stripped = out.strip_prefix("Basic ").expect("Basic prefix preserved");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(stripped.as_bytes())
+            .expect("output is valid base64");
+        let s = std::str::from_utf8(&decoded).expect("utf8");
+        assert_eq!(s, "x-access-token:real_xyz");
+        // And the placeholder is NOT in the output at any layer.
+        assert!(!out.contains(secrets::GH_TOKEN_PLACEHOLDER));
+        assert!(!s.contains(secrets::GH_TOKEN_PLACEHOLDER));
+    }
+
+    #[test]
+    fn auth_substitute_basic_no_placeholder_passes_through() {
+        // A `Basic ...` value that doesn't carry our placeholder
+        // should not be re-encoded; preserve verbatim so we don't
+        // silently mangle the caller's credentials.
+        use base64::Engine as _;
+        let untouched_basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(b"alice:hunter2")
+        );
+        let out = substitute_authorization_header(&untouched_basic, "real_xyz");
+        assert_eq!(out, untouched_basic);
+    }
 }
