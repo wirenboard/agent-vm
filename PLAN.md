@@ -340,7 +340,7 @@ bridge limit as Phase 3.
   but it's worth a `<state>.secrets/.refresh.lock` flock once we see
   it bite.
 
-### Phase 5 — OpenCode auth + security snapshot [pending]
+### Phase 5 — OpenCode auth + security snapshot [done — commit `f66a0b6`]
 
 Two small completions of the auth/secret story:
 
@@ -378,7 +378,7 @@ if any of them changed outside the Phase 4 refresh-hook path (which we
 real host (analogous to the Codex e2e in Phase 4 verification 2026-05-
 24); the security snapshot fires on a synthetic mid-run mutation.
 
-### Phase 6 — gh / git credential injection + per-launch repo allow-list [pending]
+### Phase 6 — gh / git credential injection + per-launch repo allow-list [done — commit `396011b`]
 
 Without this the in-VM agent can read the project but can't `git push`,
 can't `gh pr create`, can't fetch a private dependency from GitHub.
@@ -446,7 +446,7 @@ in a real GitHub project lands a commit on the remote; an agent attempt
 to push to a *different* repo gets a clean 403 from the proxy hook
 rather than reaching GitHub.
 
-### Phase 7 — DX additions: `--mount`, clipboard, ccusage, Chrome DevTools MCP [pending]
+### Phase 7 — DX additions: `--mount`, clipboard, ccusage, Chrome DevTools MCP [done — commit `5c5bf22`]
 
 A grab-bag of original-agent-vm capabilities the user wants in v1.
 Each is independent and lands as its own PR per the working agreement.
@@ -538,7 +538,7 @@ Deferred pending a clear product call. The architectural payoff of
 microsandbox is keeping tokens out of the VM (Phase 3), and current
 1.5 s launch is acceptable.
 
-### Phase 9 — Distribution + polish + docs [pending]
+### Phase 9 — Distribution + polish + docs [partially done — commit `f6020f1`; CI workflow + cross-arch binaries still pending]
 
 The "ready to share with a teammate" phase.
 
