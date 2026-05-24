@@ -1,7 +1,9 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod clipboard;
+mod defaults;
 mod host_paths;
+mod image_api_version;
 mod image_check;
 mod intercept_hook;
 mod msb_install;
@@ -57,18 +59,18 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    // Phase 4: prefer our locally-built msb that knows about
-    // SecretValue::File and the request-interceptor hook. No-op if
-    // the binary hasn't been built yet (run `agent-vm setup` to
-    // build it).
-    msb_install::point_at_workspace_msb();
     let cli = Cli::parse();
-    // Phase 9: auto-install the upstream microsandbox runtime libs
-    // (libkrunfw + a fallback prebuilt msb) into ~/.microsandbox if
-    // missing. Idempotent. Skip the check for the intercept-hook
-    // subcommand (it runs as a child of an already-booted sandbox,
-    // so the runtime is by definition present).
+    // Locate and pin our patched msb binary via MSB_PATH so a user's
+    // separate `~/.microsandbox/bin/msb` can't shadow ours. The hook
+    // subcommand runs as a child of msb itself (the binary is
+    // already resolved); the clipboard subcommand also runs in
+    // contexts where the bundled msb may not be available
+    // (e.g. inside the guest VM), so skip the check there too.
     if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
+        msb_install::point_at_msb()?;
+        // Phase 9: auto-install the upstream microsandbox runtime
+        // libs (libkrunfw) into ~/.microsandbox if missing.
+        // Idempotent.
         msb_install::ensure_runtime_installed().await?;
     }
     match cli.cmd {

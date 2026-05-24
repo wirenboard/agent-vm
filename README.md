@@ -21,15 +21,31 @@ top of microsandbox. Living on `rewrite-microsandbox` until v1.
 
 ## Requirements
 
-- Linux with `/dev/kvm` (rw)
-- Docker, for building the base image + running the local registry
-- Rust toolchain (rustup stable)
-- `libcap-ng-dev`, `libdbus-1-dev`, `pkg-config`
+- Linux with `/dev/kvm` (rw) — your user must be in the `kvm`
+  group: `sudo usermod -aG kvm $USER` and re-login.
+- Node.js 18+ (already there if you use Claude Code / Codex CLI /
+  OpenCode — they're all npm-distributed).
 
-`~/.microsandbox/{bin/msb, lib/libkrunfw.so.5.x}` auto-install on
-first launch.
+`~/.microsandbox/lib/libkrunfw.so.5.x` auto-installs on first
+launch.
 
 ## Quick start
+
+```bash
+npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
+
+agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
+
+cd ~/your-project
+agent-vm claude           # or codex / opencode / shell
+```
+
+The npm package bundles a prebuilt `agent-vm` binary, the patched
+`msb`, and libkrunfw. agent-vm finds them via
+`current_exe()`-relative paths, so a user's separate
+`~/.microsandbox/bin/msb` (if any) never shadows the patched build.
+
+## Build from source
 
 ```bash
 git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
@@ -37,22 +53,37 @@ cd agent-vm
 git submodule update --init vendor/microsandbox
 sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
 cargo build --release -p agent-vm
-BIN=$(pwd)/target/release/agent-vm
-
-"$BIN" setup                    # build + push image, build patched msb
-
-cd ~/your-project
-"$BIN" claude                   # or codex / opencode / shell
+cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
+    -p microsandbox-cli --bin msb
+./target/release/agent-vm setup       # uses the locally-built msb sibling
 ```
+
+`agent-vm setup` pulls
+`ghcr.io/wirenboard/agent-vm:latest` by default; pass
+`--image localhost:5000/agent-vm:latest` to use a local image
+you've built via `images/build.sh`.
 
 ## Subcommands
 
 ```
 claude | codex | opencode | shell   launch an agent in a per-project sandbox
 pull                                refresh the cached image
-setup                               build base image + patched msb
+setup                               pull base image + verify boot
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
+
+## Image release cadence
+
+The base OCI image (`ghcr.io/wirenboard/agent-vm:latest`) is
+rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
+and OpenCode releases automatically. Pin a specific build with
+`--image ghcr.io/wirenboard/agent-vm:YYYY-MM-DDTHH` (date tags are
+immutable; the last 14 days are retained).
+
+The agent-vm binary and the image are version-locked through an
+**image-API-version** integer
+(`/etc/agent-vm-image-version` inside the image). Mismatch → clean
+error at launch instead of mysterious in-VM failures.
 
 Each launcher accepts:
 

@@ -1,0 +1,195 @@
+name: release-npm
+
+# Build the agent-vm binary + patched msb + bundle libkrunfw for each
+# supported platform, then publish the main package and per-platform
+# subpackages to npm. Tagged releases only — `v<semver>` (e.g. v1.2.3).
+#
+# The image is published on a separate cadence (see build-image.yml);
+# binary releases pin the default image to the moving `:latest` tag.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without leading v). Required when running manually.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write   # for npm provenance
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
+            v="${{ inputs.version }}"
+          else
+            # tag form: v1.2.3 -> 1.2.3
+            v="${GITHUB_REF_NAME#v}"
+          fi
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::version $v is not a valid semver"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build-platform:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            cargo_target: x86_64-unknown-linux-gnu
+            # libkrunfw distributed in the upstream microsandbox runtime
+            # bundle (downloaded by SDK::setup::install). We extract it
+            # at build time and bundle alongside the binaries.
+          # - platform: linux-arm64
+          #   runner: ubuntu-24.04-arm
+          #   cargo_target: aarch64-unknown-linux-gnu
+          # - platform: darwin-arm64
+          #   runner: macos-14
+          #   cargo_target: aarch64-apple-darwin
+          #   (macOS needs microsandbox-VZ backend before binaries are useful;
+          #    npm package builds work but won't boot a VM yet.)
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.cargo_target }}
+
+      - name: Install build prereqs (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            vendor/microsandbox/target
+          key: cargo-${{ matrix.platform }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.platform }}-
+
+      - name: Build agent-vm
+        run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
+
+      - name: Build patched msb
+        run: |
+          cargo build --release --target ${{ matrix.cargo_target }} \
+            --manifest-path vendor/microsandbox/Cargo.toml \
+            -p microsandbox-cli --bin msb
+
+      - name: Fetch libkrunfw runtime bundle
+        run: |
+          # Download the upstream microsandbox release bundle and
+          # extract just the libkrunfw shared library. Version
+          # tracks vendor/microsandbox.
+          mkdir -p npm-dist/agent-vm-${{ matrix.platform }}/lib
+          # TODO: replace with an authoritative path / scripted
+          # extraction. Placeholder for the workflow shape.
+          : # libkrunfw extraction lives here
+
+      - name: Stage binaries into platform subpackage
+        run: |
+          dst=npm-dist/agent-vm-${{ matrix.platform }}/bin
+          mkdir -p "$dst"
+          cp target/${{ matrix.cargo_target }}/release/agent-vm "$dst/agent-vm"
+          cp vendor/microsandbox/target/${{ matrix.cargo_target }}/release/msb "$dst/msb"
+          chmod +x "$dst/agent-vm" "$dst/msb"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-vm-${{ matrix.platform }}
+          path: npm-dist/agent-vm-${{ matrix.platform }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve-version, build-platform]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: npm-dist/
+          pattern: agent-vm-*
+          merge-multiple: false
+
+      - name: Restore directory layout
+        # actions/download-artifact drops artifacts as
+        # npm-dist/agent-vm-linux-x64/{bin,lib} — that's already
+        # what the subpackage expects. Sanity check.
+        run: |
+          set -e
+          for d in npm-dist/agent-vm-*-*/bin; do
+            test -f "$d/agent-vm" || { echo "missing $d/agent-vm"; exit 1; }
+            test -f "$d/msb" || { echo "missing $d/msb"; exit 1; }
+          done
+
+      - name: Set versions in every package.json
+        env:
+          V: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -e
+          for p in npm-dist/*/package.json; do
+            # Top-level version
+            node -e "
+              const fs=require('fs');
+              const p='$p';
+              const j=JSON.parse(fs.readFileSync(p,'utf8'));
+              j.version='${V}';
+              if (j.optionalDependencies) {
+                for (const k of Object.keys(j.optionalDependencies)) {
+                  j.optionalDependencies[k]='${V}';
+                }
+              }
+              fs.writeFileSync(p, JSON.stringify(j,null,2)+'\\n');
+            "
+          done
+
+      - name: Publish platform subpackages first
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          # Subpackages MUST be published before the main package, or
+          # the main package's optionalDependencies resolve to missing.
+          for d in npm-dist/agent-vm-*-*; do
+            (cd "$d" && npm publish --provenance --access public)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm-dist/agent-vm
+          npm publish --provenance --access public

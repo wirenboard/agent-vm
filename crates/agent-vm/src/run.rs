@@ -121,8 +121,8 @@ pub struct Args {
     mount: Vec<String>,
 
     /// Override the OCI image reference. Default:
-    /// `localhost:5000/agent-vm:latest` (the registry stood up by
-    /// `agent-vm setup`).
+    /// `ghcr.io/wirenboard/agent-vm:latest`. Use a timestamped tag
+    /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
     image: Option<String>,
 
@@ -153,7 +153,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .image
         .clone()
         .or_else(|| env::var("AGENT_VM_IMAGE_TAG").ok())
-        .unwrap_or_else(|| "localhost:5000/agent-vm:latest".to_string());
+        .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
     let memory_mib: u32 = args
         .memory
         .checked_mul(1024)
@@ -284,9 +284,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         );
     }
 
+    let is_local_registry = crate::pull::is_plain_http_registry(&image);
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
-        .registry(|r| r.insecure())
+        .registry(|r| if is_local_registry { r.insecure() } else { r })
         .pull_policy(PullPolicy::IfMissing)
         .cpus(cpus)
         .memory(memory_mib)
@@ -553,6 +554,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     if profile {
         eprintln!("[profile] create: {:?}", t_create.elapsed());
     }
+
+    // Confirm the image's API contract matches what this binary
+    // expects. Out-of-range → clear actionable error instead of
+    // mysterious mount-not-found / agent-crashing-on-startup
+    // failures inside the VM.
+    crate::image_api_version::check(&sandbox)
+        .await
+        .context("verifying image-API contract version")?;
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions

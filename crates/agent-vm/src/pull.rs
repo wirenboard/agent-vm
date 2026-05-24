@@ -24,8 +24,10 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Override the image reference. Defaults to localhost:5000/agent-vm:latest
-    /// or the value of AGENT_VM_IMAGE_TAG.
+    /// Override the image reference. Defaults to
+    /// `ghcr.io/wirenboard/agent-vm:latest` or the value of
+    /// `AGENT_VM_IMAGE_TAG`. Use a timestamped tag
+    /// (`...:YYYY-MM-DDTHH`) to pin a specific build.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
     image: Option<String>,
 }
@@ -33,7 +35,7 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let image = args
         .image
-        .unwrap_or_else(|| "localhost:5000/agent-vm:latest".to_string());
+        .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
     pull_image(&image).await?;
     println!("==> {image} pulled into the microsandbox cache");
     Ok(())
@@ -42,9 +44,10 @@ pub async fn run(args: Args) -> Result<()> {
 /// Force a pull of `image` into the microsandbox cache and exit. Used
 /// by both `agent-vm pull` and the verify step in `agent-vm setup`.
 pub async fn pull_image(image: &str) -> Result<()> {
+    let is_local = is_plain_http_registry(image);
     let config = Sandbox::builder("agent-vm-pull")
         .image(image)
-        .registry(|r| r.insecure())
+        .registry(|r| if is_local { r.insecure() } else { r })
         .pull_policy(PullPolicy::Always)
         .cpus(1)
         .memory(256)
@@ -72,4 +75,53 @@ pub async fn pull_image(image: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Heuristic: the image ref points at a registry that needs
+/// `--insecure` (plain HTTP). True for `localhost`, `127.0.0.1`,
+/// `0.0.0.0`, `*.local`, and `*.localhost` hostnames; false for
+/// public registries (ghcr.io, docker.io, ...) which always use
+/// HTTPS.
+///
+/// The microsandbox SDK's `.insecure()` switches to plain HTTP, so
+/// applying it to ghcr.io would break the pull. Restrict it to the
+/// dev workflow's local registry.
+///
+/// IPv6 literal hosts are not supported here (rare for local
+/// dev registries; bracketed form would need a real parser). Use
+/// `localhost` or `127.0.0.1` instead.
+pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
+    // First path segment is the registry host (with optional :port).
+    // If there's no `/` in the ref OR the first segment has no `.` /
+    // `:` / `localhost`, the ref points at docker.io's default
+    // registry and we never want insecure for that.
+    let first = image_ref.split('/').next().unwrap_or("");
+    // Strip the port suffix to get just the host.
+    let host = first.split(':').next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
+        || host.ends_with(".local")
+        || host.ends_with(".localhost")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_registries_are_plain_http() {
+        assert!(is_plain_http_registry("localhost:5000/agent-vm:latest"));
+        assert!(is_plain_http_registry("127.0.0.1:5000/x"));
+        assert!(is_plain_http_registry("0.0.0.0:8080/x"));
+        assert!(is_plain_http_registry("dev.local/x"));
+        assert!(is_plain_http_registry("foo.localhost:5000/x"));
+    }
+
+    #[test]
+    fn public_registries_are_not_plain_http() {
+        assert!(!is_plain_http_registry("ghcr.io/wirenboard/agent-vm:latest"));
+        assert!(!is_plain_http_registry("docker.io/library/debian:13"));
+        assert!(!is_plain_http_registry("registry.example.com/x"));
+        // Docker Hub short form has no `/` in the registry part.
+        assert!(!is_plain_http_registry("nginx:latest"));
+    }
 }

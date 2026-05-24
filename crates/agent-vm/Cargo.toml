@@ -28,3 +28,4 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # deps so production builds don't pull in the entire network stack.
 [dev-dependencies]
 microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
+tempfile = "3"

@@ -2,16 +2,25 @@
 #
 # Debian 13 slim + the three AI coding agents (Claude Code, OpenCode, Codex)
 # and the minimum dev tooling they need to be useful. Heavier extras
-# (Docker-in-VM, Chromium, LSPs, MCP servers) are deliberately deferred.
+# (Docker-in-VM, LSPs, additional MCP servers) are deliberately deferred.
 #
-# Built and pushed to a host-local registry by images/build.sh; consumed by
-# microsandbox via `localhost:5000/agent-vm:latest` with `insecure()`.
+# Published to ghcr.io/wirenboard/agent-vm:latest by the hourly CI
+# workflow (.github/workflows/build-image.yml). Source-checkout users
+# can also build locally and push to a host-local registry via
+# images/build.sh.
 
 FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
     PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+
+# Image-API contract version. Bump on BREAKING image changes only
+# (new required mount points, changed env-var contracts, removed
+# binaries, renamed in-VM paths). Routine agent-version refreshes
+# do NOT change this. See `crates/agent-vm/src/defaults.rs` for the
+# matching range in the binary.
+RUN echo 1 > /etc/agent-vm-image-version
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
