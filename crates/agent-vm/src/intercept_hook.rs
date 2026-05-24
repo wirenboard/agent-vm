@@ -147,11 +147,19 @@ async fn forward_github_api(
     let url = format!("https://{}{}", secrets::GITHUB_API_HOST, path);
 
     let client = reqwest::Client::builder()
+        // Bounded upstream timeout so a hung api.github.com call
+        // doesn't freeze the in-VM agent indefinitely (review #7).
+        .timeout(std::time::Duration::from_secs(60))
+        // Reflect 3xx back to the guest verbatim rather than
+        // following — protects against unexpected redirect targets
+        // and lets the agent decide (review #7).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building reqwest client")?;
     let method_obj = reqwest::Method::from_bytes(method.as_bytes())
         .context("invalid HTTP method")?;
     let mut req = client.request(method_obj, &url);
+    let mut had_authorization = false;
     for (name, value) in &headers {
         // Strip hop-by-hop + protocol-level headers; reqwest will
         // re-emit appropriate ones. `Host` is required to point at
@@ -165,12 +173,27 @@ async fn forward_github_api(
             continue;
         }
         if lower == "authorization" {
-            // Substitute placeholder → real token before forwarding.
-            let v = value.replace(secrets::GH_TOKEN_PLACEHOLDER, &real_token);
+            had_authorization = true;
+            // Substitute the placeholder → real token. Two forms:
+            //   - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` —
+            //     literal substring, handled by `replace`.
+            //   - `Basic base64(x-access-token:<PLACEHOLDER>)` —
+            //     the placeholder is base64-encoded, so a literal
+            //     replace finds nothing. Decode, substitute, re-
+            //     encode. Review finding #12.
+            let v = substitute_authorization_header(value, &real_token);
             req = req.header("Authorization", v);
         } else {
             req = req.header(name, value);
         }
+    }
+    // If the guest sent no Authorization header at all (some scripts
+    // strip it before retry), inject a Bearer with the real token —
+    // we've already checked the path against the allow-list, and the
+    // alternative is silently anonymous traffic that gets a 401 and
+    // confuses the agent. Review finding #11/#12.
+    if !had_authorization {
+        req = req.header("Authorization", format!("Bearer {real_token}"));
     }
     if !body.is_empty() {
         req = req.body(body);
@@ -182,9 +205,22 @@ async fn forward_github_api(
     let mut out_headers: Vec<(String, String)> = Vec::new();
     for (k, v) in resp.headers() {
         let k_lower = k.as_str().to_ascii_lowercase();
+        // Strip hop-by-hop headers (we set Content-Length below) AND
+        // anything that lets the guest re-authenticate as the host
+        // user without going through the substitution proxy. Review
+        // finding #3: Set-Cookie + WWW-Authenticate would otherwise
+        // let an in-VM agent harvest GitHub session cookies and
+        // drive github.com directly.
         if matches!(
             k_lower.as_str(),
-            "transfer-encoding" | "content-length" | "connection" | "keep-alive"
+            "transfer-encoding"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "set-cookie"
+                | "set-cookie2"
+                | "www-authenticate"
+                | "proxy-authenticate"
         ) {
             continue;
         }
@@ -314,6 +350,33 @@ fn read_gh_token(state_dir: &Path) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Substitute `GH_TOKEN_PLACEHOLDER` in an Authorization header value
+/// with `real_token`, handling both:
+/// - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` — literal
+///   substring, simple `replace`.
+/// - `Basic base64(x-access-token:<PLACEHOLDER>)` — git's HTTP basic
+///   auth scheme. The placeholder is base64-encoded inside the value,
+///   so a literal replace would miss it; decode, substitute, re-encode.
+///
+/// Falls back to the literal-replace result for any value that isn't
+/// recognisable as Basic auth, so non-GitHub callers' headers are
+/// touched as little as possible.
+fn substitute_authorization_header(value: &str, real_token: &str) -> String {
+    if let Some(b64) = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic ")) {
+        use base64::Engine as _;
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+            if let Ok(s) = std::str::from_utf8(&decoded) {
+                if s.contains(secrets::GH_TOKEN_PLACEHOLDER) {
+                    let sub = s.replace(secrets::GH_TOKEN_PLACEHOLDER, real_token);
+                    let re = base64::engine::general_purpose::STANDARD.encode(sub.as_bytes());
+                    return format!("Basic {re}");
+                }
+            }
+        }
+    }
+    value.replace(secrets::GH_TOKEN_PLACEHOLDER, real_token)
+}
+
 fn write_response(bytes: &[u8]) -> Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(bytes).context("writing response to stdout")?;
@@ -399,21 +462,50 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(cmd)
+    // Bounded wait so a hung host CLI doesn't keep the in-VM agent's
+    // OAuth refresh waiting indefinitely (review #8). 90 s is enough
+    // for normal claude/codex round-trips and small enough to surface
+    // a problem before the guest agent's own timeout fires.
+    use std::time::{Duration, Instant};
+    const TIMEOUT: Duration = Duration::from_secs(90);
+
+    let mut child = Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .with_context(|| format!("spawning host {cmd}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "host {cmd} failed (status {}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let mut stderr = Vec::new();
+                if let Some(mut e) = child.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = e.read_to_end(&mut stderr);
+                }
+                if !status.success() {
+                    anyhow::bail!(
+                        "host {cmd} failed (status {status}): {}",
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                return Ok(());
+            }
+            None => {
+                if start.elapsed() >= TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "host {cmd} did not return within {} s; killed",
+                        TIMEOUT.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
     }
-    Ok(())
 }
 
 fn looks_like_oauth_refresh(req: &[u8]) -> bool {

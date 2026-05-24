@@ -13,14 +13,20 @@ state_root="${AGENT_VM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm
 
 # Each per-project state dir has the Claude session history under
 # <hash>/claude (which is symlinked into the guest as ~/.claude).
-agent_vm_dirs=""
-if [ -d "$state_root" ]; then
-  agent_vm_dirs=$(find "$state_root" -maxdepth 2 -type d -name claude 2>/dev/null | paste -sd,)
-fi
-
+# Use NUL-delimited find→read so paths containing legal characters
+# like `,` (which CLAUDE_CONFIG_DIR uses as a separator) aren't
+# mis-split (review finding #15).
 paths="$HOME/.claude,$HOME/.config/claude"
-if [ -n "$agent_vm_dirs" ]; then
-  paths="$paths,$agent_vm_dirs"
+if [ -d "$state_root" ]; then
+  while IFS= read -r -d '' dir; do
+    # Refuse to add a path that contains a comma — CLAUDE_CONFIG_DIR
+    # has no escape mechanism and silently mis-tokenizes; better to
+    # skip than to merge directories the user didn't ask for.
+    case "$dir" in
+      *,*) echo "agent-vm-ccusage: skipping $dir (contains ',', breaks CLAUDE_CONFIG_DIR)" >&2;;
+      *)   paths="$paths,$dir";;
+    esac
+  done < <(find "$state_root" -maxdepth 2 -type d -name claude -print0 2>/dev/null)
 fi
 
 export CLAUDE_CONFIG_DIR="$paths"

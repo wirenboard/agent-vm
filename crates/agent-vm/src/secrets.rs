@@ -215,7 +215,12 @@ pub fn refresh(
     // `openai_token_file` with Codex.
     let opencode_openai_access_token_file = if openai_token_file.is_some() {
         match refresh_opencode(state_dir) {
-            Ok(_) => Some(opencode_openai_token_path(state_dir)),
+            // Only register the secret when refresh_opencode actually
+            // wrote a placeholder auth.json. `Ok(None)` (host file
+            // missing) means we have nothing to wire up — review
+            // finding #13.
+            Ok(Some(())) => Some(opencode_openai_token_path(state_dir)),
+            Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, "opencode credential refresh failed; skipping");
                 None
@@ -467,10 +472,21 @@ fn decode_id_token_account(json: &Value) -> Option<String> {
         .pointer("/tokens/id_token")
         .and_then(|v| v.as_str())?;
     let payload_b64 = id_token.split('.').nth(1)?;
-    let padded = format!("{}{}", payload_b64, "=".repeat((4 - payload_b64.len() % 4) % 4));
     use base64::Engine as _;
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE
-        .decode(padded.as_bytes())
+    // JWT spec says base64url *without* padding. Use URL_SAFE_NO_PAD
+    // first (the conformant variant); fall back to STANDARD (some
+    // libraries emit JWTs with '+'/'/' instead of '-'/'_') — review
+    // finding #14.
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .or_else(|_| {
+            let padded = format!(
+                "{}{}",
+                payload_b64.replace('-', "+").replace('_', "/"),
+                "=".repeat((4 - payload_b64.len() % 4) % 4)
+            );
+            base64::engine::general_purpose::STANDARD.decode(padded.as_bytes())
+        })
         .ok()?;
     let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
     payload

@@ -215,20 +215,44 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // decide whether to bother capturing host gh auth (no repos →
     // nothing to talk to) and to constrain api.github.com requests
     // server-side via the intercept hook.
+    // --no-git suppresses *automatic* cwd-remote detection but does
+    // NOT discard explicit --repo arguments (review #11): a user
+    // who passes `--no-git --repo X` clearly wants the explicit
+    // allow-list. We do warn so they notice if they didn't mean to.
     let mut allowed_repos: Vec<String> = Vec::new();
     if !args.no_git {
         allowed_repos.extend(detect_github_repos_in_cwd(&session.project_dir));
-        for r in &args.repo {
-            let r = r.trim().to_string();
-            if !r.is_empty() && !allowed_repos.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
-                allowed_repos.push(r);
-            }
+    } else if !args.repo.is_empty() {
+        eprintln!(
+            "==> --no-git skips cwd remote auto-detection, but --repo overrides are kept ({} entr{})",
+            args.repo.len(),
+            if args.repo.len() == 1 { "y" } else { "ies" },
+        );
+    }
+    for r in &args.repo {
+        let r = r.trim().to_string();
+        if !r.is_empty() && !allowed_repos.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+            allowed_repos.push(r);
         }
     }
-    let use_github = !args.no_git && !allowed_repos.is_empty();
+    let use_github = !allowed_repos.is_empty();
 
     let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
         .context("snapshotting host credentials")?;
+
+    // RAII guard so the Phase-5 host-cred mutation check runs on
+    // *every* exit path from launch() — including `?` propagation
+    // from attach/exec_stream errors (review finding #10). Without
+    // this the safety net only fires on the happy path.
+    struct SnapshotGuard(Option<crate::secrets::HostCredsSnapshot>);
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            if let Some(snap) = self.0.take() {
+                crate::secrets::verify_snapshot(&snap);
+            }
+        }
+    }
+    let _snap_guard = SnapshotGuard(creds.snapshot.clone());
 
     // Phase 6/9: always write the guest gitconfig (carries the
     // unconditional `safe.directory = *` so git inside the guest
@@ -397,6 +421,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             // `inject_basic_auth(true)` covers the Basic-auth path. We
             // accept the perf hit (basic_auth disables the per-chunk
             // fast path) because GitHub connections aren't WebSocket.
+            //
+            // **Known gap (review #1).** The per-launch repo allow-list
+            // is enforced by the intercept hook on api.github.com only.
+            // The gh secret also allows github.com / codeload / raw /
+            // objects so `git push` / `git clone` can reach them with
+            // the substituted token — but no intercept rule filters
+            // those paths. A malicious in-VM agent that knows how to
+            // craft git smart-HTTP requests can push to any repo the
+            // host token has access to. Filtering git protocol over
+            // HTTPS requires a streaming intercept primitive that
+            // microsandbox doesn't have yet (intercept buffers the
+            // full request, capped at 64 KiB — git push pack data
+            // exceeds that). Until then, the threat model assumes the
+            // agent is well-intentioned but possibly mistaken.
             if let Some(file) = gh {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_GH_UNUSED")
@@ -580,7 +618,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             .with_context(|| format!("running {inner_cmd} in sandbox"))?;
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
-        let mut code: i32 = 1;
+        // Track whether we actually saw an Exited event. The previous
+        // `let mut code = 1` conflated "stream closed without Exited"
+        // (infra failure) with "agent exited with 1" (real failure) —
+        // CI couldn't tell them apart. Review finding #9. Now we
+        // return Err on premature stream close so the launcher
+        // bubbles up an actionable error.
+        let mut exit_code: Option<i32> = None;
         while let Some(event) = handle.recv().await {
             match event {
                 ExecEvent::Stdout(b) => {
@@ -592,7 +636,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     stderr.flush().await.ok();
                 }
                 ExecEvent::Exited { code: c } => {
-                    code = c;
+                    exit_code = Some(c);
                     break;
                 }
                 ExecEvent::Failed(payload) => {
@@ -601,7 +645,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                 ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
             }
         }
-        code
+        match exit_code {
+            Some(c) => c,
+            None => anyhow::bail!(
+                "exec session event stream ended without Exited (agentd disconnect or microsandbox bug; partial output above)"
+            ),
+        }
     };
 
     if profile {
@@ -620,13 +669,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("[profile] remove: {:?}", t_remove.elapsed());
     }
 
-    // Phase 5 safety net: diff the host credential files against the
-    // SHA-256 snapshot we took at launch. The Phase 4 refresh hook may
-    // legitimately rewrite them mid-session; anything else changing
-    // them is a smell worth surfacing.
-    if let Some(snap) = creds.snapshot.as_ref() {
-        crate::secrets::verify_snapshot(snap);
-    }
+    // Phase 5 safety net (host-cred mutation check) runs via the
+    // SnapshotGuard above, which drops at end of scope including
+    // any `?`-propagated error path.
 
     Ok(exit)
 }
@@ -675,13 +720,43 @@ fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
 /// non-github remote) just yield an empty list — caller passes
 /// `--repo` to widen.
 fn detect_github_repos_in_cwd(project_dir: &Path) -> Vec<String> {
+    // Hardening (review #6): the user may have just cloned a project
+    // they don't fully trust; running git in that repo before we've
+    // even built the sandbox would otherwise honour core.fsmonitor /
+    // alias.* — host RCE pre-sandbox. Disable the dangerous knobs
+    // and force safe.directory so we don't fail closed on a foreign-
+    // UID checkout. (Note: -c include.path= isn't valid git syntax;
+    // includeIf/include are only honored from files git already
+    // decides to read, which the `-c` flags can't suppress in 2.x,
+    // so we rely on disabling the per-repo *execution* hooks below.)
     let out = std::process::Command::new("git")
-        .args(["-C"])
+        .args([
+            // Disable repo-local config that runs binaries:
+            "-c", "core.fsmonitor=",
+            "-c", "core.fsmonitorHookVersion=",
+            // Editor/pager fall back to cat — nothing we run here
+            // needs them but a repo `core.pager = !bad-script` would
+            // otherwise fire on `remote -v` output paging.
+            "-c", "core.pager=cat",
+            "-c", "core.editor=:",
+            // Trust the dir even if owned by another UID (we only
+            // read `git remote -v`, no writes).
+            "-c", "safe.directory=*",
+            // Don't fetch anything across this invocation.
+            "-c", "protocol.allow=never",
+            "-C",
+        ])
         .arg(project_dir)
         .args(["remote", "-v"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Refuse host-level git config so a $GIT_CONFIG_GLOBAL
+        // override (env injected by the user shell) can't sneak past
+        // the `-c` overrides above. The empty values turn into a
+        // non-existent path lookup, which git treats as missing.
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
