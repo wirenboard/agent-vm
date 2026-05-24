@@ -63,6 +63,14 @@ async fn main() -> Result<()> {
     // build it).
     msb_install::point_at_workspace_msb();
     let cli = Cli::parse();
+    // Phase 9: auto-install the upstream microsandbox runtime libs
+    // (libkrunfw + a fallback prebuilt msb) into ~/.microsandbox if
+    // missing. Idempotent. Skip the check for the intercept-hook
+    // subcommand (it runs as a child of an already-booted sandbox,
+    // so the runtime is by definition present).
+    if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
+        msb_install::ensure_runtime_installed().await?;
+    }
     match cli.cmd {
         Cmd::Setup(args) => setup::run(args).await,
         Cmd::Pull(args) => pull::run(args).await,

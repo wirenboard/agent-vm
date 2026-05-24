@@ -24,6 +24,26 @@ pub fn workspace_built_msb() -> PathBuf {
         .join("../../vendor/microsandbox/target/release/msb")
 }
 
+/// Phase 9: ensure `~/.microsandbox/{bin,lib}` is populated. If not,
+/// download the upstream runtime bundle and install it (the SDK's
+/// `setup::install` handles the `libkrunfw` symlinks). Idempotent.
+///
+/// agent-vm prefers its own patched `msb` via [`point_at_workspace_msb`]
+/// (set after this call), but we still need the runtime libs from the
+/// bundle — those aren't built by `cargo build` and have to come from
+/// the upstream release.
+pub async fn ensure_runtime_installed() -> Result<()> {
+    if microsandbox::setup::is_installed() {
+        return Ok(());
+    }
+    eprintln!("==> microsandbox runtime libs missing; downloading bundle (~17 MB, one-time)");
+    microsandbox::setup::install()
+        .await
+        .context("downloading microsandbox runtime bundle")?;
+    eprintln!("==> microsandbox runtime ready");
+    Ok(())
+}
+
 /// If we have a built msb in the workspace, point microsandbox at it.
 /// Quiet no-op otherwise (falls through to the SDK's normal resolution
 /// chain — workspace_local, then `~/.microsandbox/bin/msb`, then

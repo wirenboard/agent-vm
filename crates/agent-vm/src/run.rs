@@ -120,6 +120,18 @@ pub struct Args {
     #[arg(long = "mount")]
     mount: Vec<String>,
 
+    /// Override the OCI image reference. Default:
+    /// `localhost:5000/agent-vm:latest` (the registry stood up by
+    /// `agent-vm setup`).
+    #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
+    image: Option<String>,
+
+    /// Don't HEAD the registry for a newer manifest digest at
+    /// launch (skips the "==> A newer image is available …" banner).
+    /// Useful in CI and on flaky networks.
+    #[arg(long = "no-update-check", default_value_t = false)]
+    no_update_check: bool,
+
     /// Args forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -137,8 +149,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     );
     let _ = &session.project_hash;
 
-    let image = env::var("AGENT_VM_IMAGE_TAG")
-        .unwrap_or_else(|_| "localhost:5000/agent-vm:latest".to_string());
+    let image = args
+        .image
+        .clone()
+        .or_else(|| env::var("AGENT_VM_IMAGE_TAG").ok())
+        .unwrap_or_else(|| "localhost:5000/agent-vm:latest".to_string());
     let memory_mib: u32 = args
         .memory
         .checked_mul(1024)
@@ -180,7 +195,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // image_check::check_for_update and print a banner if there's a newer
     // image available — the user runs `agent-vm pull` explicitly to
     // fetch it.
-    notify_if_update_available(image.as_str()).await;
+    if !args.no_update_check {
+        notify_if_update_available(image.as_str()).await;
+    }
 
     // Snapshot host credentials into per-project token files and place
     // placeholder credentials.json files where the in-VM agents will
@@ -508,8 +525,25 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     //    jobs) but we can't background the user's agent. An explicit
     //    `exec < /dev/null` gives codex a real /dev/null fd and it
     //    proceeds. `[ -t 0 ]` keeps interactive TTY launches unaffected.
-    let prelude = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
-[ -t 0 ] || exec < /dev/null"#;
+    // Phase 9 adds a project-runtime hook (`.agent-vm.runtime.sh`):
+    // if the file exists at the project root inside the guest, source
+    // it before exec'ing the agent. Project owners use this for
+    // setup that has to happen *inside* the sandbox (npm install,
+    // docker compose up, env-var exports). Runs once per launch with
+    // PWD set to the project dir; non-zero exit aborts the launch
+    // with the same exit code.
+    let project_guest_path_escaped = shell_escape(&project_guest_path);
+    let prelude = format!(
+        "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
+         [ -t 0 ] || exec < /dev/null\n\
+         _hook={path}/.agent-vm.runtime.sh\n\
+         if [ -f \"$_hook\" ]; then\n\
+         \techo \"==> sourcing $_hook\" >&2\n\
+         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
+         fi",
+        path = project_guest_path_escaped,
+    );
+    let prelude = prelude.as_str();
     let mut shell_line = String::from(prelude);
     shell_line.push_str("; exec ");
     shell_line.push_str(&shell_escape(inner_cmd));
