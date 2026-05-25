@@ -112,13 +112,35 @@ ensure_registry() {
 }
 
 build_and_push() {
-    echo "==> Building ${IMAGE_TAG}"
-    docker build -t "${IMAGE_TAG}" -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}"
-    echo "==> Pushing ${IMAGE_TAG}"
-    docker push "${IMAGE_TAG}"
+    echo "==> Building ${IMAGE_TAG} (zstd-compressed layers)"
+    # Use buildx with `type=registry` so the layers are zstd-compressed on
+    # the way to the registry — gzip→zstd is the dominant per-layer
+    # cost during `agent-vm setup`, and a benchmark on /usr/lib showed
+    # ~24× faster end-to-end ingest with no change to microsandbox
+    # (`tar_ingest.rs:427` already accepts the `+zstd` media type).
+    #
+    # `force-compression=true` re-emits even already-compressed base-image
+    # layers as zstd; without it, only the layers we ADD are zstd while
+    # everything from the base image stays gzip, partially defeating the
+    # win. `registry.insecure=true` lets us push to the loopback HTTP
+    # registry. We use `compression-level=3` (zstd's default) — the
+    # bench shows diminishing returns past that for binary-heavy layers.
+    docker buildx build \
+        -t "${IMAGE_TAG}" \
+        --output "type=registry,push=true,registry.insecure=true,compression=zstd,compression-level=3,force-compression=true" \
+        -f "${SCRIPT_DIR}/Dockerfile" \
+        "${SCRIPT_DIR}"
 }
 
 main() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "docker not found on PATH; agent-vm setup needs Docker installed" >&2
+        exit 1
+    fi
+    if ! docker buildx version >/dev/null 2>&1; then
+        echo "docker buildx not available — install Docker 20.10+ or 'docker buildx install'" >&2
+        exit 1
+    fi
     ensure_registry
     build_and_push
     echo "==> ${IMAGE_TAG} ready"
