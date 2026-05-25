@@ -286,7 +286,10 @@ jobs:
           # — avoiding a split-state where subpackages exist at v but
           # the main package never makes it.
           for d in npm-dist/agent-vm-*-*; do
-            name=$(node -p "require('$d/package.json').name")
+            # Node's `require` only resolves bare-relative paths
+            # with a leading `./` — without it the loader treats the
+            # argument as a node_modules / built-in spec and bails.
+            name=$(node -p "require('./$d/package.json').name")
             existing=$(npm view "$name@$V" version 2>/dev/null || true)
             if [[ "$existing" == "$V" ]]; then
               echo "::notice::$name@$V already published; skipping"
