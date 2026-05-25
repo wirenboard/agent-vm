@@ -99,6 +99,15 @@ jobs:
           # so subsequent runs (re-dispatch, redo-after-publish-fail
           # etc.) restore from the previous build's target/.
           save-if: ${{ true }}
+          # Cache the *full* target/ including path-dep crates.
+          # Default cache-workspace-crates=false strips
+          # vendor/microsandbox/crates/* artefacts before save, so
+          # a warm-cache run still recompiled ~9 microsandbox-*
+          # workspace crates (28s) + the agent-vm crate itself
+          # (~70s of LTO link). Caching the full target/ trades
+          # ~600 MB extra GH cache space for skipping that work.
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
 
       - name: cargo build --release -p agent-vm
         run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
@@ -156,6 +165,10 @@ jobs:
           # See build-agent-vm; release runs are off main so default
           # save-if would skip every release. Force-save.
           save-if: ${{ true }}
+          # Keep path-dep artefacts (microsandbox workspace internals)
+          # cached too — default strips them and forces re-link.
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
 
       - name: cargo build --release -p microsandbox-cli --bin msb
         run: |
