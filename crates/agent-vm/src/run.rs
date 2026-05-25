@@ -408,6 +408,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .inject_basic_auth(false)
                         .allow_host(ANTHROPIC_API_HOST)
                         .allow_host(ANTHROPIC_OAUTH_HOST)
+                        .allow_host(ANTHROPIC_MCP_PROXY_HOST)
                 });
             }
             if let Some(file) = openai {
