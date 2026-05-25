@@ -91,6 +91,14 @@ jobs:
           # Unique suffix so this job doesn't fight build-msb for
           # the same key (different effective Cargo.lock content).
           key: agent-vm-${{ matrix.platform }}
+          # rust-cache@v2 defaults to "save only on the default
+          # branch (main)". This workflow fires on `v*.*.*` tags and
+          # workflow_dispatch from `rewrite-microsandbox`; neither
+          # matches main, so the cache was never being saved and
+          # every release re-paid a cold build (~5 min). Force-save
+          # so subsequent runs (re-dispatch, redo-after-publish-fail
+          # etc.) restore from the previous build's target/.
+          save-if: ${{ true }}
 
       - name: cargo build --release -p agent-vm
         run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
@@ -145,6 +153,9 @@ jobs:
           # build's stale artefacts.
           env-vars: "CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
           key: msb-${{ matrix.platform }}
+          # See build-agent-vm; release runs are off main so default
+          # save-if would skip every release. Force-save.
+          save-if: ${{ true }}
 
       - name: cargo build --release -p microsandbox-cli --bin msb
         run: |
