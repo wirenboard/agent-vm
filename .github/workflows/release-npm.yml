@@ -268,8 +268,9 @@ jobs:
         # already-executable. (We *also* chmod in publish as a belt-
         # and-suspenders measure since the round-trip CAN strip
         # perms again — confirmed by v0.1.0's EACCES.)
-        run: chmod +x npm-dist/agent-vm-${{ matrix.platform }}/bin/agent-vm \
-                       npm-dist/agent-vm-${{ matrix.platform }}/bin/msb
+        run: |
+          chmod +x "npm-dist/agent-vm-${{ matrix.platform }}/bin/agent-vm"
+          chmod +x "npm-dist/agent-vm-${{ matrix.platform }}/bin/msb"
 
       - name: Upload assembled platform subpackage
         uses: actions/upload-artifact@v7
