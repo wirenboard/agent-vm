@@ -61,16 +61,23 @@ pub const OPENAI_ID_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ
 /// header  = base64url('{"alg":"none","typ":"JWT"}')
 /// payload = base64url('{"exp":9999999999,
 ///                       "chatgpt_account_id":"00000000-0000-0000-0000-000000000000"}')
-/// sig     = "msb-opencode-placeholder-a-v2"  (non-token-shaped to
-///           match the rest of the placeholder family; see the warning
-///           on `OPENAI_ID_PLACEHOLDER`)
+/// sig     = "msb-opencode-placeholder-av2"  (28 chars; non-token-
+///           shaped to match the rest of the placeholder family; see
+///           the warning on `OPENAI_ID_PLACEHOLDER`). Length is
+///           deliberately ≡ 0 mod 4 so the segment is still a valid
+///           unpadded base64url string — strict JWT parsers
+///           (`jose` v6 in strict mode, `jsonwebtoken`) reject the
+///           29-char `…-a-v2` form with "invalid base64" because
+///           `len % 4 == 1` is structurally impossible. OpenCode's
+///           current parser is lax and tolerates that, but the
+///           defensive length is one char away.
 ///
 /// **Kept short on purpose:** an earlier ~480-char payload (with
 /// iss/aud/scp/email/sub claims) triggered upstream issue #8 — long
 /// placeholders fail sandbox boot with `handshake read id_offset:
 /// timed out before relay sent bytes`. Add fields here only if
 /// OpenCode actually parses them and chokes on absence.
-pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.msb-opencode-placeholder-a-v2";
+pub const OPENCODE_OPENAI_ACCESS_PLACEHOLDER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjk5OTk5OTk5OTksImNoYXRncHRfYWNjb3VudF9pZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCJ9.msb-opencode-placeholder-av2";
 pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "msb-opencode-placeholder-r-v2";
 /// Placeholder for the host's `gh auth token`. The in-guest `gh` /
 /// git credential helper sees this string; the proxy substitutes the
@@ -685,12 +692,23 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     // AGENT_VM_NO_CHROME_MCP after a launch without it would leave
     // the stale entry in the on-disk claude.json and the MCP would
     // keep spawning. We always own this key.
-    let mcp = obj
+    //
+    // `mcpServers: null` (left by an earlier buggy write, or a
+    // hand-edit) is treated as "no MCP servers" — we reset to {}
+    // rather than bail. The old `as_object_mut().context(...)?` form
+    // would have errored out the entire launch over a recoverable
+    // shape mismatch.
+    let mcp_entry = obj
         .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}))
+        .or_insert_with(|| serde_json::json!({}));
+    if !mcp_entry.is_object() {
+        *mcp_entry = serde_json::json!({});
+    }
+    let mcp = mcp_entry
         .as_object_mut()
-        .context("~/.claude.json mcpServers is not an object")?;
-    if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
+        .expect("mcp_entry coerced to object above");
+    let opting_out = std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some();
+    if opting_out {
         mcp.remove("chrome-devtools");
     } else {
         mcp.insert(
@@ -700,12 +718,27 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
                 "args": [
                     "npx",
                     "-y",
-                    "chrome-devtools-mcp@latest",
+                    // Pinned. The image's pre-warm RUN step in
+                    // images/Dockerfile bakes THIS version into
+                    // /home/chrome/.npm/_npx so first launch is a
+                    // cache hit; bump both together. Without a pin,
+                    // npx re-resolves `@latest` against the registry
+                    // on every launch and invalidates the cache as
+                    // soon as upstream publishes anything new.
+                    "chrome-devtools-mcp@1.0.1",
                     "--headless=true",
                     "--isolated=true",
                 ],
             }),
         );
+    }
+    // If we ended up with an empty mcpServers map *and* the user is
+    // opted out, drop the key entirely — don't materialise an empty
+    // object on disk that would surprise the user inspecting the
+    // file and could trip future Claude Code schema validation that
+    // requires absent-or-non-empty.
+    if opting_out && mcp.is_empty() {
+        obj.remove("mcpServers");
     }
 
     atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;

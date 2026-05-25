@@ -1,0 +1,10 @@
+# The platform subpackages' bin/ + lib/ directories are populated
+# by CI at release time, not committed to source. Keep the
+# directories around (via .gitkeep) so the layout is obvious.
+agent-vm-*/bin/agent-vm
+agent-vm-*/bin/agent-vm.exe
+agent-vm-*/bin/msb
+agent-vm-*/bin/msb.exe
+agent-vm-*/lib/libkrunfw.so.*
+node_modules/
+*.tgz

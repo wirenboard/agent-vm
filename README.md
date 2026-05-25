@@ -21,15 +21,31 @@ top of microsandbox. Living on `rewrite-microsandbox` until v1.
 
 ## Requirements
 
-- Linux with `/dev/kvm` (rw)
-- Docker, for building the base image + running the local registry
-- Rust toolchain (rustup stable)
-- `libcap-ng-dev`, `libdbus-1-dev`, `pkg-config`
+- Linux with `/dev/kvm` (rw) — your user must be in the `kvm`
+  group: `sudo usermod -aG kvm $USER` and re-login.
+- Node.js 18+ (already there if you use Claude Code / Codex CLI /
+  OpenCode — they're all npm-distributed).
 
-`~/.microsandbox/{bin/msb, lib/libkrunfw.so.5.x}` auto-install on
-first launch.
+`~/.microsandbox/lib/libkrunfw.so.5.x` auto-installs on first
+launch.
 
 ## Quick start
+
+```bash
+npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
+
+agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
+
+cd ~/your-project
+agent-vm claude           # or codex / opencode / shell
+```
+
+The npm package bundles a prebuilt `agent-vm` binary, the patched
+`msb`, and libkrunfw. agent-vm finds them via
+`current_exe()`-relative paths, so a user's separate
+`~/.microsandbox/bin/msb` (if any) never shadows the patched build.
+
+## Build from source
 
 ```bash
 git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
@@ -37,22 +53,37 @@ cd agent-vm
 git submodule update --init vendor/microsandbox
 sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
 cargo build --release -p agent-vm
-BIN=$(pwd)/target/release/agent-vm
-
-"$BIN" setup                    # build + push image, build patched msb
-
-cd ~/your-project
-"$BIN" claude                   # or codex / opencode / shell
+cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
+    -p microsandbox-cli --bin msb
+./target/release/agent-vm setup       # uses the locally-built msb sibling
 ```
+
+`agent-vm setup` pulls
+`ghcr.io/wirenboard/agent-vm:latest` by default; pass
+`--image localhost:5000/agent-vm:latest` to use a local image
+you've built via `images/build.sh`.
 
 ## Subcommands
 
 ```
 claude | codex | opencode | shell   launch an agent in a per-project sandbox
 pull                                refresh the cached image
-setup                               build base image + patched msb
+setup                               pull base image + verify boot
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
+
+## Image release cadence
+
+The base OCI image (`ghcr.io/wirenboard/agent-vm:latest`) is
+rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
+and OpenCode releases automatically. Pin a specific build with
+`--image ghcr.io/wirenboard/agent-vm:YYYY-MM-DDTHH` (date tags are
+immutable; the last 14 days are retained).
+
+The agent-vm binary and the image are version-locked through an
+**image-API-version** integer
+(`/etc/agent-vm-image-version` inside the image). Mismatch → clean
+error at launch instead of mysterious in-VM failures.
 
 Each launcher accepts:
 
@@ -68,6 +99,33 @@ Each launcher accepts:
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
+
+Env-var knobs (all opt-in; set to *any* value, empty included):
+
+| var | what |
+|---|---|
+| `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
+| `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
+| `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
+| `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
+| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
+| `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+
+## Chrome DevTools MCP
+
+The image ships chromium and a `chrome-devtools` MCP entry pinned to
+`chrome-devtools-mcp@1.0.1`. To keep chromium's nested user-namespace
+sandbox active (we'd rather not pass `--no-sandbox`) the MCP runs as a
+dedicated `chrome` user via a sudo wrapper at
+`/usr/local/bin/agent-vm-chrome-mcp`. The launcher installs the
+per-boot microsandbox MITM CA into chrome's NSS DB at startup so
+chromium accepts the intercepted TLS chain without
+`--acceptInsecureCerts` (which would trust *any* untrusted cert).
+
+If the CA install fails (e.g. someone broke the in-image sudoers rule)
+the launcher prints a warning naming the symptom — without it, every
+HTTPS navigate would silently return `ERR_CERT_AUTHORITY_INVALID`.
+Set `AGENT_VM_NO_CHROME_MCP=1` to skip the whole setup.
 
 ## Credentials
 
