@@ -41,7 +41,19 @@ jobs:
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
-  build-platform:
+  # Two parallel build jobs, one per binary. Each has its own
+  # Swatinem/rust-cache@v2 keyed on the relevant Cargo.lock — no
+  # cross-pollination between the workspaces, so an msb-only bump
+  # doesn't blow away the agent-vm cache and vice-versa.
+  #
+  # Both run in the same OS prereq install + Rust toolchain step;
+  # only the build command and cache key differ. The msb job also
+  # overrides the release profile via env to relax LTO (the
+  # vendor/microsandbox profile is `lto=fat, codegen-units=1` which
+  # adds ~3 min of single-threaded link time per CI run — runtime
+  # perf is negligible for a TLS proxy, not worth the wait).
+
+  build-agent-vm:
     needs: resolve-version
     strategy:
       fail-fast: false
@@ -50,77 +62,146 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-latest
             cargo_target: x86_64-unknown-linux-gnu
-            # libkrunfw arch in upstream's release filenames.
-            libkrunfw_arch: x86_64
-          # - platform: linux-arm64
-          #   runner: ubuntu-24.04-arm
-          #   cargo_target: aarch64-unknown-linux-gnu
-          #   libkrunfw_arch: aarch64
-          # - platform: darwin-arm64
-          #   runner: macos-14
-          #   cargo_target: aarch64-apple-darwin
-          #   libkrunfw_arch: aarch64
-          #   (macOS needs microsandbox-VZ backend before binaries are useful;
-          #    npm package builds work but won't boot a VM yet.)
     runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        # No submodules — the agent-vm crate doesn't need
+        # vendor/microsandbox source to compile (it depends on
+        # microsandbox via a path dep, but we have it at the
+        # workspace level... wait, actually it does need it via
+        # path = "../../vendor/microsandbox/crates/microsandbox").
+        # Keep recursive checkout.
+        with:
+          submodules: 'recursive'
+
+      - name: Install Rust toolchain + linux deps
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.cargo_target }}
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+
+      - name: Cargo cache (rust-cache)
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Workspace root → cache target/. Action auto-keys on
+          # rustc version + OS + Cargo.lock hash + a default salt.
+          workspaces: ". -> target"
+          # Unique suffix so this job doesn't fight build-msb for
+          # the same key (different effective Cargo.lock content).
+          key: agent-vm-${{ matrix.platform }}
+
+      - name: cargo build --release -p agent-vm
+        run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
+
+      - name: Upload agent-vm binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-vm-bin-${{ matrix.platform }}
+          path: target/${{ matrix.cargo_target }}/release/agent-vm
+          retention-days: 7
+          if-no-files-found: error
+
+  build-msb:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            cargo_target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Override vendor/microsandbox's `lto=true, codegen-units=1`
+      # release profile for CI. Keeps `panic=abort` (changes
+      # behaviour) and `strip=true` (no symbols needed) intact.
+      # Cuts msb link time from ~4 min to ~30s with negligible
+      # runtime cost on a TLS-proxy workload.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: 'recursive'
 
-      - name: Install Rust toolchain
-        id: rust
+      - name: Install Rust toolchain + linux deps
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
-          # Capture the exact rustc version so the cache key invalidates
-          # whenever the toolchain rolls (e.g. `stable` bumps on the
-          # runner image). Without this, cached rlibs built with the
-          # previous rustc get linked against a newer one →
-          # undefined-symbol errors that took us hours to debug locally.
-          echo "rustc_version=$(rustc -V | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
-      - name: Install build prereqs (linux)
-        if: runner.os == 'Linux'
-        run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
+      - name: Cargo cache (rust-cache)
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            vendor/microsandbox/target
-          # rustc-version in the key → toolchain bumps invalidate the
-          # cache. Cargo.lock change → dependency tree changed, also
-          # invalidate.
-          key: cargo-${{ matrix.platform }}-${{ steps.rust.outputs.rustc_version }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ matrix.platform }}-${{ steps.rust.outputs.rustc_version }}-
+          # Cache vendor/microsandbox's target/. Action picks up the
+          # right Cargo.lock automatically from the workspaces map.
+          workspaces: "vendor/microsandbox -> target"
+          # Mirrors the env-set LTO/codegen-units into the cache key
+          # so a relax-LTO flip doesn't accidentally reuse a fat-LTO
+          # build's stale artefacts.
+          env-vars: "CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          key: msb-${{ matrix.platform }}
 
-      - name: Build agent-vm
-        run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
-
-      - name: Build patched msb
+      - name: cargo build --release -p microsandbox-cli --bin msb
         run: |
           cargo build --release --target ${{ matrix.cargo_target }} \
             --manifest-path vendor/microsandbox/Cargo.toml \
             -p microsandbox-cli --bin msb
 
-      - name: Resolve runtime-bundle versions from vendor/microsandbox
-        id: msb_ver
+      - name: Upload msb binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: msb-bin-${{ matrix.platform }}
+          path: vendor/microsandbox/target/${{ matrix.cargo_target }}/release/msb
+          retention-days: 7
+          if-no-files-found: error
+
+  # Assemble per-platform npm subpackage: pull in the two binaries
+  # from the parallel build jobs, fetch libkrunfw inline (the curl
+  # is ~10s so not worth a separate job), upload the populated
+  # subpackage tree as the per-platform artifact the publish job
+  # downloads.
+  package:
+    needs: [resolve-version, build-agent-vm, build-msb]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            libkrunfw_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        # We need vendor/microsandbox source to read LIBKRUNFW_VERSION
+        # and LIBKRUNFW_ABI constants. Recursive fetch needed for the
+        # libkrunfw sub-submodule? Actually no — we only need the
+        # microsandbox crate source for awk. `submodules: true` (one
+        # level) is enough; saves the libkrunfw clone time.
+        with:
+          submodules: true
+
+      - name: Download agent-vm binary
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-vm-bin-${{ matrix.platform }}
+          path: npm-dist/agent-vm-${{ matrix.platform }}/bin/
+
+      - name: Download msb binary
+        uses: actions/download-artifact@v8
+        with:
+          name: msb-bin-${{ matrix.platform }}
+          path: npm-dist/agent-vm-${{ matrix.platform }}/bin/
+
+      - name: Resolve libkrunfw versions from vendor/microsandbox
+        id: lkv
         shell: bash
         run: |
           set -euo pipefail
-          # Read the values straight from the vendored source of
-          # truth so the npm bundle stays aligned with what the
-          # patched msb expects to dynamically load. The crate uses
-          # `version.workspace = true`, so the canonical version
-          # lives in the workspace root Cargo.toml.
           msb_version=$(awk -F\" '/^version *=/{print $2; exit}' \
             vendor/microsandbox/Cargo.toml)
           libkrunfw_version=$(awk -F\" \
@@ -132,24 +213,19 @@ jobs:
           test -n "$msb_version" || { echo "::error::could not extract msb version"; exit 1; }
           test -n "$libkrunfw_version" || { echo "::error::could not extract libkrunfw version"; exit 1; }
           test -n "$libkrunfw_abi" || { echo "::error::could not extract libkrunfw abi"; exit 1; }
-          echo "msb_version=$msb_version"               >> "$GITHUB_OUTPUT"
-          echo "libkrunfw_version=$libkrunfw_version"   >> "$GITHUB_OUTPUT"
-          echo "libkrunfw_abi=$libkrunfw_abi"           >> "$GITHUB_OUTPUT"
-          echo "Resolved: msb=$msb_version libkrunfw=$libkrunfw_version abi=$libkrunfw_abi"
+          echo "msb_version=$msb_version"             >> "$GITHUB_OUTPUT"
+          echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
+          echo "libkrunfw_abi=$libkrunfw_abi"         >> "$GITHUB_OUTPUT"
 
       - name: Fetch libkrunfw from upstream microsandbox release
         shell: bash
         env:
-          MSB_V:    ${{ steps.msb_ver.outputs.msb_version }}
-          LK_V:     ${{ steps.msb_ver.outputs.libkrunfw_version }}
-          LK_ABI:   ${{ steps.msb_ver.outputs.libkrunfw_abi }}
+          MSB_V:    ${{ steps.lkv.outputs.msb_version }}
+          LK_V:     ${{ steps.lkv.outputs.libkrunfw_version }}
+          LK_ABI:   ${{ steps.lkv.outputs.libkrunfw_abi }}
           LK_ARCH:  ${{ matrix.libkrunfw_arch }}
         run: |
           set -euo pipefail
-          # Upstream publishes a per-arch tarball containing msb +
-          # libkrunfw. We need only libkrunfw — our own patched msb
-          # ships separately in this bundle.
-          # crates/utils/lib/lib.rs::bundle_download_url
           if [[ "${{ matrix.platform }}" == darwin-* ]]; then
             os_tag=darwin
           else
@@ -161,8 +237,6 @@ jobs:
           mkdir -p "$dst"
           tmp=$(mktemp -d)
           curl -fsSL -o "$tmp/bundle.tar.gz" "$url"
-          # Extract just libkrunfw* into the lib/ dir, flat (drop any
-          # leading directory prefix from the tarball).
           tar -xzf "$tmp/bundle.tar.gz" -C "$tmp"
           shopt -s globstar nullglob
           found=0
@@ -174,15 +248,6 @@ jobs:
             echo "::error::no libkrunfw* in $url"; ls -R "$tmp"; exit 1
           fi
           rm -rf "$tmp"
-
-          # Recreate the ABI symlinks the dynamic linker expects.
-          # Mirrors `libkrunfw_symlinks()` in vendor/microsandbox/
-          # crates/microsandbox/lib/setup/download.rs.
-          #
-          # Use a plain sequence (not a subshell) so each ln failure
-          # propagates cleanly under `set -e` on every bash version,
-          # and absolute `$dst/...` paths so we don't depend on the
-          # cwd being right.
           if [[ "$os_tag" == darwin ]]; then
             full="libkrunfw.${LK_ABI}.dylib"
             if [[ ! -e "$dst/$full" ]]; then
@@ -197,15 +262,16 @@ jobs:
           fi
           ls -la "$dst"
 
-      - name: Stage binaries into platform subpackage
-        run: |
-          dst=npm-dist/agent-vm-${{ matrix.platform }}/bin
-          mkdir -p "$dst"
-          cp target/${{ matrix.cargo_target }}/release/agent-vm "$dst/agent-vm"
-          cp vendor/microsandbox/target/${{ matrix.cargo_target }}/release/msb "$dst/msb"
-          chmod +x "$dst/agent-vm" "$dst/msb"
+      - name: Restore executable bits on the bundled binaries
+        # upload-artifact strips POSIX perms when zipping; restore
+        # before re-uploading so the next download-artifact lands
+        # already-executable. (We *also* chmod in publish as a belt-
+        # and-suspenders measure since the round-trip CAN strip
+        # perms again — confirmed by v0.1.0's EACCES.)
+        run: chmod +x npm-dist/agent-vm-${{ matrix.platform }}/bin/agent-vm \
+                       npm-dist/agent-vm-${{ matrix.platform }}/bin/msb
 
-      - name: Upload platform artifact
+      - name: Upload assembled platform subpackage
         uses: actions/upload-artifact@v7
         with:
           name: agent-vm-${{ matrix.platform }}
@@ -214,7 +280,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [resolve-version, build-platform]
+    needs: [resolve-version, package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
