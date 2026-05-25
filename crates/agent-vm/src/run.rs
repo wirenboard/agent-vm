@@ -121,7 +121,7 @@ pub struct Args {
     mount: Vec<String>,
 
     /// Override the OCI image reference. Default:
-    /// `ghcr.io/wirenboard/agent-vm:latest`. Use a timestamped tag
+    /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
     image: Option<String>,

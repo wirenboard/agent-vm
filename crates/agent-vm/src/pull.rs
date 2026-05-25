@@ -25,7 +25,7 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 #[derive(ClapArgs)]
 pub struct Args {
     /// Override the image reference. Defaults to
-    /// `ghcr.io/wirenboard/agent-vm:latest` or the value of
+    /// `ghcr.io/wirenboard/agent-vm-template:latest` or the value of
     /// `AGENT_VM_IMAGE_TAG`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a specific build.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn local_registries_are_plain_http() {
-        assert!(is_plain_http_registry("localhost:5000/agent-vm:latest"));
+        assert!(is_plain_http_registry("localhost:5000/agent-vm-template:latest"));
         assert!(is_plain_http_registry("127.0.0.1:5000/x"));
         assert!(is_plain_http_registry("0.0.0.0:8080/x"));
         assert!(is_plain_http_registry("dev.local/x"));
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn public_registries_are_not_plain_http() {
-        assert!(!is_plain_http_registry("ghcr.io/wirenboard/agent-vm:latest"));
+        assert!(!is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
         assert!(!is_plain_http_registry("docker.io/library/debian:13"));
         assert!(!is_plain_http_registry("registry.example.com/x"));
         // Docker Hub short form has no `/` in the registry part.
@@ -155,7 +155,7 @@ mod tests {
         // SAFETY: see rationale above.
         unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", "1") };
         assert!(is_plain_http_registry("registry.corp.example:5000/x"));
-        assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm:latest"));
+        assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
         // SAFETY: same.
         unsafe { std::env::remove_var("AGENT_VM_INSECURE_REGISTRY") };
         // After cleanup the heuristic resumes its normal behaviour.

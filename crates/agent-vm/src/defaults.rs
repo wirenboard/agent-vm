@@ -4,17 +4,23 @@
 //! bump the image-API range, or change other distribution wiring
 //! without grepping for string literals across subcommands.
 
-/// Default OCI image reference. Overridable per-subcommand via
-/// `--image` or the `AGENT_VM_IMAGE_TAG` env var. Pulled fresh on
-/// `agent-vm setup` / `agent-vm pull`; uses the cached copy
-/// otherwise.
+/// Default OCI image reference. This is the GUEST TEMPLATE image
+/// that agent-vm boots inside each per-project microVM — NOT the
+/// agent-vm tool itself (the binary running this code). The image
+/// holds Debian + the in-VM agents (Claude Code / Codex / OpenCode)
+/// and is rebuilt hourly so users get fresh agent versions
+/// without bumping their agent-vm install.
+///
+/// Overridable per-subcommand via `--image` or the
+/// `AGENT_VM_IMAGE_TAG` env var. Pulled fresh on `agent-vm setup`
+/// / `agent-vm pull`; uses the cached copy otherwise.
 ///
 /// Tags published by CI:
 /// - `:latest` — moving tag, rebuilt hourly to pick up agent
 ///   updates (Claude Code, OpenCode, Codex etc.).
 /// - `:YYYY-MM-DDTHH` — timestamped, immutable. Use for
 ///   reproducible setups.
-pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm:latest";
+pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template:latest";
 
 /// Image-API contract version range this binary supports.
 ///

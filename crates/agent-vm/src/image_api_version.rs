@@ -88,7 +88,7 @@ fn verify_in_range(version: u32) -> Result<()> {
             "image-API version {version} is too NEW \
              (this agent-vm supports {MIN_SUPPORTED_IMAGE_API}..={MAX_SUPPORTED_IMAGE_API}).\n\
              Update agent-vm (`npm install -g @wirenboard/agent-vm@latest`) \
-             or pin an older image tag via `--image ghcr.io/wirenboard/agent-vm:YYYY-MM-DDTHH`."
+             or pin an older image tag via `--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH`."
         );
     }
     Ok(())

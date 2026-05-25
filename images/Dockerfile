@@ -1,15 +1,22 @@
-# agent-vm v1 base image.
+# agent-vm GUEST TEMPLATE image — the OCI image that the agent-vm
+# tool boots *inside* its per-project microVM. NOT the agent-vm
+# tool itself (that's the Rust binary published as
+# @wirenboard/agent-vm on npm).
 #
-# Debian 13 slim + the three AI coding agents (Claude Code, OpenCode, Codex)
-# and the minimum dev tooling they need to be useful. Heavier extras
-# (Docker-in-VM, LSPs, additional MCP servers) are deliberately deferred.
+# Contents: Debian 13 slim + the three AI coding agents (Claude
+# Code, OpenCode, Codex) and the minimum dev tooling they need to be
+# useful. Heavier extras (Docker-in-VM, LSPs, additional MCP
+# servers) are deliberately deferred.
 #
-# Published to ghcr.io/wirenboard/agent-vm:latest by the hourly CI
-# workflow (.github/workflows/build-image.yml). Source-checkout users
-# can also build locally and push to a host-local registry via
-# images/build.sh.
+# Published to ghcr.io/wirenboard/agent-vm-template:latest by the
+# hourly CI workflow (.github/workflows/build-image.yml). Source-
+# checkout users can also build locally and push to a host-local
+# registry via images/build.sh.
 
 FROM debian:13-slim
+
+LABEL org.opencontainers.image.title="agent-vm guest template"
+LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \

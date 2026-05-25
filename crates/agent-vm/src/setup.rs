@@ -7,7 +7,7 @@
 //!
 //! Source-checkout users can build a local image with
 //! `images/build.sh` and point setup at it via
-//! `--image localhost:5000/agent-vm:latest`.
+//! `--image localhost:5000/agent-vm-template:latest`.
 
 use std::path::PathBuf;
 
@@ -22,9 +22,9 @@ pub struct Args {
     no_verify: bool,
 
     /// Override the image reference. Defaults to
-    /// `ghcr.io/wirenboard/agent-vm:latest`. Source-checkout users
+    /// `ghcr.io/wirenboard/agent-vm-template:latest`. Source-checkout users
     /// who built a local image can point at it
-    /// (`--image localhost:5000/agent-vm:latest`) — agent-vm
+    /// (`--image localhost:5000/agent-vm-template:latest`) — agent-vm
     /// detects local registries and uses plain HTTP.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
     image: Option<String>,
@@ -60,7 +60,7 @@ pub async fn run(args: Args) -> Result<()> {
              If you intended a local build, run \
              `git submodule update --init --recursive vendor/microsandbox`, \
              then `images/build.sh` and \
-             `agent-vm setup --image localhost:5000/agent-vm:latest`."
+             `agent-vm setup --image localhost:5000/agent-vm-template:latest`."
         );
     }
 

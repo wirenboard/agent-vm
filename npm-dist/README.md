@@ -28,7 +28,7 @@ package. See `.github/workflows/release-npm.yml`.
 
 The OCI image is on a separate cadence (hourly cron) — see
 `.github/workflows/build-image.yml`. Binary releases pin the
-default image to `ghcr.io/wirenboard/agent-vm:latest`; users
+default image to `ghcr.io/wirenboard/agent-vm-template:latest`; users
 override per-launch via `--image` or `AGENT_VM_IMAGE_TAG`.
 
 ## Local smoke test

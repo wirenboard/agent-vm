@@ -175,9 +175,9 @@ mod tests {
 
     #[test]
     fn parses_localhost_with_port() {
-        let p = ParsedRef::parse("localhost:5000/agent-vm:latest").unwrap();
+        let p = ParsedRef::parse("localhost:5000/agent-vm-template:latest").unwrap();
         assert_eq!(p.host, "localhost:5000");
-        assert_eq!(p.name, "agent-vm");
+        assert_eq!(p.name, "agent-vm-template");
         assert_eq!(p.tag, "latest");
         assert!(p.is_insecure);
     }
@@ -193,9 +193,9 @@ mod tests {
 
     #[test]
     fn parses_ghcr_explicit_tag() {
-        let p = ParsedRef::parse("ghcr.io/wirenboard/agent-vm:v1").unwrap();
+        let p = ParsedRef::parse("ghcr.io/wirenboard/agent-vm-template:v1").unwrap();
         assert_eq!(p.host, "ghcr.io");
-        assert_eq!(p.name, "wirenboard/agent-vm");
+        assert_eq!(p.name, "wirenboard/agent-vm-template");
         assert_eq!(p.tag, "v1");
         assert!(!p.is_insecure);
     }

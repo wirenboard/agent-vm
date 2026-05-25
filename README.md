@@ -59,8 +59,8 @@ cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
 ```
 
 `agent-vm setup` pulls
-`ghcr.io/wirenboard/agent-vm:latest` by default; pass
-`--image localhost:5000/agent-vm:latest` to use a local image
+`ghcr.io/wirenboard/agent-vm-template:latest` by default; pass
+`--image localhost:5000/agent-vm-template:latest` to use a local image
 you've built via `images/build.sh`.
 
 ## Subcommands
@@ -74,10 +74,10 @@ clipboard {get,put} [--sys]         exchange a string with the project sandbox
 
 ## Image release cadence
 
-The base OCI image (`ghcr.io/wirenboard/agent-vm:latest`) is
+The base OCI image (`ghcr.io/wirenboard/agent-vm-template:latest`) is
 rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
 and OpenCode releases automatically. Pin a specific build with
-`--image ghcr.io/wirenboard/agent-vm:YYYY-MM-DDTHH` (date tags are
+`--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH` (date tags are
 immutable; the last 14 days are retained).
 
 The agent-vm binary and the image are version-locked through an

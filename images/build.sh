@@ -11,7 +11,7 @@ set -euo pipefail
 
 REGISTRY_NAME="${AGENT_VM_REGISTRY_NAME:-agent-vm-registry}"
 REGISTRY_PORT="${AGENT_VM_REGISTRY_PORT:-5000}"
-IMAGE_TAG="${AGENT_VM_IMAGE_TAG:-localhost:${REGISTRY_PORT}/agent-vm:latest}"
+IMAGE_TAG="${AGENT_VM_IMAGE_TAG:-localhost:${REGISTRY_PORT}/agent-vm-template:latest}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
