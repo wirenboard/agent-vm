@@ -100,26 +100,35 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Ensure microsandbox's runtime libs (libkrunfw etc.) exist under
-/// `~/.microsandbox/{bin,lib}`. Downloads the upstream bundle if
-/// missing. Idempotent.
+/// Point msb at the agent-vm-controlled state dir instead of
+/// `~/.microsandbox/`.
 ///
-/// agent-vm prefers its own patched `msb` via [`point_at_msb`] (set
-/// after this call), but we still need libkrunfw — `cargo build`
-/// doesn't produce it; it comes from the upstream release bundle.
+/// Why we don't use the default upstream layout (`~/.microsandbox/`):
 ///
-/// TODO(npm): bundle libkrunfw inside the per-platform npm subpackage
-/// alongside the binaries so first-launch is fully offline-capable.
-pub async fn ensure_runtime_installed() -> Result<()> {
-    if microsandbox::setup::is_installed() {
-        return Ok(());
-    }
-    eprintln!("==> microsandbox runtime libs missing; downloading bundle (~17 MB, one-time)");
-    microsandbox::setup::install()
-        .await
-        .context("downloading microsandbox runtime bundle")?;
-    eprintln!("==> microsandbox runtime ready");
-    Ok(())
+/// agent-vm ships its own patched `msb` and a libkrunfw rebuilt with
+/// `CONFIG_KVM=y` (the upstream one has `# CONFIG_KVM is not set`,
+/// killing nested KVM). If a user has a separate microsandbox install
+/// — or just ran an older agent-vm version — the existing
+/// `~/.microsandbox/lib/libkrunfw.so.X.Y.Z` would shadow ours and
+/// `/dev/kvm` would silently not appear in the guest. Avoid the
+/// conflict entirely by giving agent-vm its own `MSB_HOME` under
+/// `state_root()`. Read-only bits (msb, libkrunfw) come from the
+/// bundle next to `agent-vm` via msb's own resolver
+/// (`MSB_PATH` → sibling `lib/`); writable bits (db, cache,
+/// sandboxes, logs, secrets, tls/CA) live here.
+///
+/// Idempotent. Returns the path that was pinned.
+pub fn point_at_msb_home() -> Result<PathBuf> {
+    let dir = crate::host_paths::state_root()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
+        .join("msb-home");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating MSB_HOME at {}", dir.display()))?;
+    // SAFETY: like [`point_at_msb`], called before the tokio runtime
+    // spins up. setenv() is not thread-safe; this ordering invariant
+    // is the only thing that makes the call sound.
+    unsafe { std::env::set_var("MSB_HOME", &dir) };
+    Ok(dir)
 }
 
 /// Resolve and pin the patched `msb` binary for this process.
