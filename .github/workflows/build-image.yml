@@ -85,13 +85,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to
-          # `main` so a workflow_dispatch on a feature branch can be
-          # used to verify the build without clobbering production.
-          # The immutable `:sha-…` tag is always pushed, which is
-          # what we inspect for verification.
+          # the integration branches (`main`, `rewrite-microsandbox`)
+          # so workflow_dispatch on a feature branch can verify the
+          # build without clobbering production. The immutable
+          # `:sha-…` tag is always pushed and is what we inspect
+          # for branch-level verification.
+          # rewrite-microsandbox is included because it's the de-facto
+          # trunk for the microsandbox-rewrite work; release-npm
+          # already documents that workflow_dispatch happens from
+          # there too (release-npm.yml:96).
           tags: |
-            ${{ github.ref_name == 'main' && format('{0}:latest', env.IMAGE) || '' }}
-            ${{ github.ref_name == 'main' && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:latest', env.IMAGE) || '' }}
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           # Tag with the short SHA too so we can trace any image
           # back to the exact Dockerfile commit.
