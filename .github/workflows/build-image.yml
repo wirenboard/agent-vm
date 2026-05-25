@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-vm
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-vm-template
 
 jobs:
   build:
