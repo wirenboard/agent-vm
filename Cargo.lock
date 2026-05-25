@@ -26,6 +26,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "console",
  "indicatif",
  "libc",
  "microsandbox",

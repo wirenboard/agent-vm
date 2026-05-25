@@ -93,11 +93,15 @@ async fn verify_image(image: &str) -> Result<()> {
         .context("preparing verify config")?;
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
-    let sandbox = task
+    // See pull.rs: await render before propagating errors so finish()
+    // clears the bars, and use the logging helper so render-task panics
+    // are visible instead of silently swallowed.
+    let result = task
         .await
-        .context("create-with-pull-progress join")?
-        .context("booting verify sandbox")?;
-    render_task.await.ok();
+        .context("create-with-pull-progress join")
+        .and_then(|inner| inner.context("booting verify sandbox"));
+    crate::pull_progress::await_render(render_task).await;
+    let sandbox = result?;
 
     // Image-API-version range check: same path agent-vm run takes
     // on every launch. Mismatch here = an actionable error at setup

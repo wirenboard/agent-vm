@@ -57,11 +57,16 @@ pub async fn pull_image(image: &str) -> Result<()> {
         .context("preparing pull config")?;
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render = tokio::spawn(crate::pull_progress::render(progress));
-    let sandbox = task
-        .await
-        .context("pull task join")?
-        .context("pulling image")?;
-    render.await.ok();
+    // Await render BEFORE propagating any error from `task`. Two reasons:
+    // (1) `task` finishing drops the progress sender, so render's recv
+    // loop is already winding down; this just lets `display.finish()`
+    // run `mp.clear()` to restore the terminal before we exit. (2) using
+    // a logging helper makes panics inside the render task (e.g. a
+    // ProgressStyle template typo) visible instead of swallowed by
+    // `JoinHandle::await.ok()`.
+    let result = task.await.context("pull task join").and_then(|inner| inner.context("pulling image"));
+    crate::pull_progress::await_render(render).await;
+    let sandbox = result?;
     sandbox.stop_and_wait().await.ok();
     Sandbox::remove("agent-vm-pull").await.ok();
 
