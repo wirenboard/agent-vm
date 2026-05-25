@@ -1,0 +1,24 @@
+# Automatic version bumps for the action pins in .github/workflows/.
+# Without this, action majors silently drift behind — we hit exactly
+# that with the Node 20 → 24 cutover (every action on Node 20 had a
+# Node-24-on major already shipped but we were pinned to the older
+# major).
+#
+# Submodule and Rust dep updates intentionally NOT enabled here —
+# bumping vendor/microsandbox needs a careful audit (patched msb +
+# libkrunfw kernel-config invariants), and Rust dep bumps are
+# better handled by `cargo update` runs we drive manually.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"

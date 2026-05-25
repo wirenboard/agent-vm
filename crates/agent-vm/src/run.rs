@@ -408,7 +408,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .inject_basic_auth(false)
                         .allow_host(ANTHROPIC_API_HOST)
                         .allow_host(ANTHROPIC_OAUTH_HOST)
-                        .allow_host(ANTHROPIC_MCP_PROXY_HOST)
                 });
             }
             if let Some(file) = openai {
@@ -783,7 +782,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
 }
 
 /// Best-effort hint at where msb writes a sandbox's per-launch
-/// logs. The directory contains several files worth checking on a
+/// logs. The directory contains three files worth checking on a
 /// failed launch:
 ///
 /// - `runtime.log` — msb tracing + Rust panic from the sandbox
@@ -795,13 +794,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
 ///   up far enough to write into the two above (vendor
 ///   `boot_error.rs` is the canonical source of "couldn't boot
 ///   because X").
-/// - `msb.stderr.log` — raw libkrun / kernel-printk bytes that
-///   bypass the in-process log capture (vendor `runtime::spawn`
-///   tees msb's stderr here so a SIGABRT panic line survives even
-///   when the in-process logger died mid-drain).
-/// - `msb-exit.log` — one append-only line per boot recording the
-///   msb subprocess's exit status (vendor `runtime::handle::wait`).
-///   Useful for "did this boot SIGKILL?" without reproducing.
 ///
 /// Returning a *directory* rather than a single file lets the user
 /// `ls` it and pick whichever is non-empty, instead of following a

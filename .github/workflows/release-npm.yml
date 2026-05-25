@@ -88,7 +88,7 @@ jobs:
             libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -206,7 +206,7 @@ jobs:
           chmod +x "$dst/agent-vm" "$dst/msb"
 
       - name: Upload platform artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-vm-${{ matrix.platform }}
           path: npm-dist/agent-vm-${{ matrix.platform }}/
@@ -225,7 +225,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       # Download each platform artifact into its own subpackage
-      # directory explicitly. `actions/download-artifact@v5` with
+      # directory explicitly. `actions/download-artifact@v8` with
       # `pattern:` + a single matched artifact does NOT wrap it in a
       # subdir (the v5 behaviour change vs v4) — files land flat at
       # the `path:` root. Downloading by exact `name:` into a
@@ -237,13 +237,13 @@ jobs:
       # checkout; the artifact carries bin/ + lib/ on top of it.
       # download-artifact will create missing parents.
       - name: Download linux-x64 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: agent-vm-linux-x64
           path: npm-dist/agent-vm-linux-x64/
 
       - name: Verify artifact layout + restore executable bits
-        # `actions/upload-artifact@v4` packs files into a zip that
+        # `actions/upload-artifact@v7` packs files into a zip that
         # doesn't preserve POSIX permissions. After download, the
         # binaries land as 0644 — npm publishes them as-is and users
         # get EACCES on first invocation. Restoring +x here is the
