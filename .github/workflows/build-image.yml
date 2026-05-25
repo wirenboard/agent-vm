@@ -1,0 +1,147 @@
+name: build-image
+
+# Build the agent-vm OCI image and push to GHCR on:
+# - hourly schedule (picks up new claude-code/codex/opencode releases),
+# - any push that touches images/ (Dockerfile or related),
+# - manual dispatch (force a rebuild).
+#
+# Tags pushed:
+# - `latest`             — moving tag, used by agent-vm by default.
+# - `YYYY-MM-DDTHH`      — immutable, for users who need to pin.
+# - `<short-sha>`        — also immutable, for traceability to source.
+#
+# The binary release pipeline (release-npm.yml) runs on a separate
+# cadence; image-API-version contract (images/Dockerfile + defaults.rs)
+# keeps them compatible.
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # every hour, on the hour, UTC
+  push:
+    branches:
+      - main
+    paths:
+      - 'images/**'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # for ghcr.io push
+
+concurrency:
+  # One image build at a time. Newer runs cancel queued older ones —
+  # but never interrupt a build in progress (cancel-in-progress: false).
+  group: build-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-vm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute timestamp tag (UTC)
+        id: ts
+        run: |
+          echo "tag=$(date -u +%Y-%m-%dT%H)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: images
+          file: images/Dockerfile
+          push: true
+          # `cache-from`/`cache-to` keep layer rebuilds fast when only
+          # the agent-version layers at the top of the Dockerfile
+          # change (the common hourly case).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.ts.outputs.tag }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          # Tag with the short SHA too so we can trace any image
+          # back to the exact Dockerfile commit.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.ts.outputs.tag }}
+
+      - name: Show pushed digest
+        run: |
+          echo "Pushed ${{ env.IMAGE }}:${{ steps.ts.outputs.tag }}"
+          echo "  digest: ${{ steps.build.outputs.digest }}"
+
+  retain:
+    # Delete date-tagged image versions older than 14 days so the
+    # registry doesn't grow unbounded. `latest` and `sha-...` tags
+    # are immune via the ignore-versions regex.
+    #
+    # Why a custom script and not actions/delete-package-versions's
+    # `min-versions-to-keep`: that knob only fires once you HAVE at
+    # least N versions, so a paused/disabled cron can leave stale
+    # versions outliving the 14-day window unbounded. The age-based
+    # approach prunes correctly regardless of build cadence.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune image versions older than 14 days
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const pkg = 'agent-vm';
+            const horizonMs = 14 * 24 * 60 * 60 * 1000;
+            const now = Date.now();
+            // Patterns we never delete, regardless of age.
+            const keepTagRe = /^(latest|sha-[0-9a-f]+)$/i;
+
+            // List all versions (paginated).
+            const versions = await github.paginate(
+              github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+              {
+                package_type: 'container',
+                package_name: pkg,
+                org: owner,
+                per_page: 100,
+              }
+            );
+            core.info(`found ${versions.length} versions of ${owner}/${pkg}`);
+
+            let deleted = 0;
+            for (const v of versions) {
+              const tags = (v.metadata?.container?.tags) ?? [];
+              // Skip anything carrying a protected tag.
+              if (tags.some((t) => keepTagRe.test(t))) continue;
+              // Untagged manifest lists / blob orphans can be GC'd too.
+              const age = now - new Date(v.created_at).getTime();
+              if (age <= horizonMs) continue;
+              core.info(`deleting ${pkg}@${v.id} tags=${JSON.stringify(tags)} age_days=${(age/86400000).toFixed(1)}`);
+              try {
+                await github.rest.packages.deletePackageVersionForOrg({
+                  package_type: 'container',
+                  package_name: pkg,
+                  org: owner,
+                  package_version_id: v.id,
+                });
+                deleted++;
+              } catch (e) {
+                core.warning(`delete ${v.id} failed: ${e.message}`);
+              }
+            }
+            core.info(`deleted ${deleted} version(s) older than 14 days`);
