@@ -242,12 +242,20 @@ jobs:
           name: agent-vm-linux-x64
           path: npm-dist/agent-vm-linux-x64/
 
-      - name: Verify artifact layout
+      - name: Verify artifact layout + restore executable bits
+        # `actions/upload-artifact@v4` packs files into a zip that
+        # doesn't preserve POSIX permissions. After download, the
+        # binaries land as 0644 — npm publishes them as-is and users
+        # get EACCES on first invocation. Restoring +x here is the
+        # smallest fix; declaring them in `bin` of the subpackage's
+        # package.json would also work but creates a competing
+        # `agent-vm` shim that fights the main package's launcher.
         run: |
           set -e
           for d in npm-dist/agent-vm-*-*/bin; do
             test -f "$d/agent-vm" || { echo "missing $d/agent-vm"; exit 1; }
             test -f "$d/msb" || { echo "missing $d/msb"; exit 1; }
+            chmod +x "$d/agent-vm" "$d/msb"
           done
 
       - name: Set versions in every package.json
