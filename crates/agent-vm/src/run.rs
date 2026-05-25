@@ -559,11 +559,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
-    let sandbox = task
+    // See pull.rs: await render before propagating errors so finish()
+    // clears the bars, and use the logging helper so render-task panics
+    // are visible instead of silently swallowed.
+    let result = task
         .await
-        .context("create-with-pull-progress join")?
-        .context("creating sandbox")?;
-    render_task.await.ok();
+        .context("create-with-pull-progress join")
+        .and_then(|inner| inner.context("creating sandbox"));
+    crate::pull_progress::await_render(render_task).await;
+    let sandbox = result?;
     if profile {
         eprintln!("[profile] create: {:?}", t_create.elapsed());
     }
