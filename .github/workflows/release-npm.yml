@@ -73,6 +73,35 @@ jobs:
         # Keep recursive checkout.
         with:
           submodules: 'recursive'
+          # Full history needed by git-restore-mtime (next step)
+          # so it can walk per-file commit timestamps.
+          fetch-depth: 0
+
+      - name: Restore source mtimes from git history
+        shell: bash
+        run: |
+          # actions/checkout sets every source file's mtime to
+          # "now", which defeats cargo's fingerprint fast-path:
+          # cargo sees sources as newer than the cached
+          # target/.fingerprint entries and recompiles every
+          # path-dep workspace crate + the final binary
+          # (~90s/job extra on warm runs). git-restore-mtime
+          # walks `git log` and sets each file's mtime to its
+          # last-touching commit's date, so the fingerprints
+          # restored by rust-cache below still match.
+          #
+          # Script source pinned to MestreLion/git-tools `main` —
+          # it's a 200-line Python file, used widely by Rust+CI
+          # users for exactly this problem. Run once per repo
+          # (outer + each path-dep submodule that ends up in a
+          # `Compiling` line; here only vendor/microsandbox).
+          set -euo pipefail
+          sudo curl -fsSL \
+            https://raw.githubusercontent.com/MestreLion/git-tools/main/git-restore-mtime \
+            -o /usr/local/bin/git-restore-mtime
+          sudo chmod +x /usr/local/bin/git-restore-mtime
+          git restore-mtime --quiet
+          git -C vendor/microsandbox restore-mtime --quiet
 
       - name: Install Rust toolchain + linux deps
         run: |
@@ -142,6 +171,18 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Restore source mtimes from git history
+        shell: bash
+        run: |
+          # See build-agent-vm for rationale.
+          set -euo pipefail
+          sudo curl -fsSL \
+            https://raw.githubusercontent.com/MestreLion/git-tools/main/git-restore-mtime \
+            -o /usr/local/bin/git-restore-mtime
+          sudo chmod +x /usr/local/bin/git-restore-mtime
+          git -C vendor/microsandbox restore-mtime --quiet
 
       - name: Install Rust toolchain + linux deps
         run: |
