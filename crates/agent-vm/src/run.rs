@@ -585,7 +585,25 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .filter(|d| !args.agent_args.iter().any(|u| u == *d))
         .map(|s| s.to_string())
         .collect();
-    inner_args.extend(args.agent_args);
+    if matches!(agent, Agent::Shell) && !args.agent_args.is_empty() {
+        // `agent-vm shell foo bar` runs `foo bar` as a command. Without
+        // `-c`, bash treats the first non-option positional as a script
+        // filename and PATH-searches for it, so `agent-vm shell ls` lands
+        // on `/usr/bin/ls` and prints "cannot execute binary file" the
+        // moment bash hits the ELF magic. Joining the user's args into a
+        // single `-c` command line (each arg shell-escaped so quoting is
+        // preserved across the boundary) is the standard fix.
+        let cmd = args
+            .agent_args
+            .iter()
+            .map(|a| shell_escape(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        inner_args.push("-c".into());
+        inner_args.push(cmd);
+    } else {
+        inner_args.extend(args.agent_args);
+    }
 
     // Wrap the agent invocation in a tiny bash prelude that:
     //
