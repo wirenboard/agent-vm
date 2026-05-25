@@ -47,10 +47,19 @@ try {
   const ext = process.platform === "win32" ? ".exe" : "";
   binPath = path.join(path.dirname(pkgJson), "bin", `agent-vm${ext}`);
 } catch {
+  // Most common causes, ordered by likelihood:
+  //  1. Transient network failure during `npm install`: the main
+  //     package installs, the optional dep silently fails. npm logs
+  //     a warning but it's easy to miss.
+  //  2. `npm install --no-optional` (or yarn `--ignore-optional`).
+  //  3. Lock-file pins to a version of the main package without a
+  //     matching subpackage version on npm (mid-publish).
   console.error(
-    `agent-vm: optionalDependency ${pkg} did not install. ` +
-      `Re-install with \`npm install -g @wirenboard/agent-vm --force\` ` +
-      `or check that --no-optional was not passed.`
+    `agent-vm: the prebuilt binary subpackage ${pkg} is not installed.\n` +
+      `  - If your last \`npm install\` showed a warning about ${pkg} failing, that's the cause —\n` +
+      `    retry with \`npm install -g @wirenboard/agent-vm --force\` (network was likely flaky).\n` +
+      `  - If you passed \`--no-optional\` / \`--ignore-optional\`, re-install without it.\n` +
+      `  - If you locked an inconsistent set of versions, delete your lockfile entry and re-resolve.`
   );
   process.exit(1);
 }

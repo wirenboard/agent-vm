@@ -77,20 +77,28 @@ pub async fn pull_image(image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Heuristic: the image ref points at a registry that needs
-/// `--insecure` (plain HTTP). True for `localhost`, `127.0.0.1`,
-/// `0.0.0.0`, `*.local`, and `*.localhost` hostnames; false for
-/// public registries (ghcr.io, docker.io, ...) which always use
-/// HTTPS.
+/// Decide whether the registry needs `--insecure` (plain HTTP).
+///
+/// Two ways to get a `true`:
+/// 1. `AGENT_VM_INSECURE_REGISTRY=1` env var — opt-in escape hatch
+///    for airgapped/intranet plain-HTTP registries
+///    (`registry.corp.example:5000`, `192.168.1.10:5000`, etc.) that
+///    the heuristic can't recognise from the ref alone.
+/// 2. Hostname is unambiguously local: `localhost`, `127.0.0.1`,
+///    `0.0.0.0`, `*.local`, `*.localhost`.
 ///
 /// The microsandbox SDK's `.insecure()` switches to plain HTTP, so
-/// applying it to ghcr.io would break the pull. Restrict it to the
-/// dev workflow's local registry.
+/// applying it to ghcr.io or any other public HTTPS registry would
+/// break the pull. The heuristic stays narrow for safety; the env
+/// var is the operator-blessed override.
 ///
-/// IPv6 literal hosts are not supported here (rare for local
-/// dev registries; bracketed form would need a real parser). Use
+/// IPv6 literal hosts are not supported here (rare for local dev
+/// registries; bracketed form would need a real parser). Use
 /// `localhost` or `127.0.0.1` instead.
 pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
+    if env_truthy("AGENT_VM_INSECURE_REGISTRY") {
+        return true;
+    }
     // First path segment is the registry host (with optional :port).
     // If there's no `/` in the ref OR the first segment has no `.` /
     // `:` / `localhost`, the ref points at docker.io's default
@@ -101,6 +109,13 @@ pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
         || host.ends_with(".local")
         || host.ends_with(".localhost")
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 #[cfg(test)]
@@ -123,5 +138,27 @@ mod tests {
         assert!(!is_plain_http_registry("registry.example.com/x"));
         // Docker Hub short form has no `/` in the registry part.
         assert!(!is_plain_http_registry("nginx:latest"));
+    }
+
+    // Single test exercising the env-var escape hatch — the heuristic
+    // says "secure" for `registry.corp.example` but the env override
+    // wins. Uses a serial-style guard (set + clear) so a parallel test
+    // doesn't observe the var. (cargo test runs tests in parallel by
+    // default — keep the var name unique to this test so it can't
+    // collide with another module setting the same var.)
+    #[test]
+    fn env_override_forces_plain_http() {
+        // SAFETY: cargo test parallelises but env mutations affect the
+        // whole process; restrict to one assertion + cleanup. The
+        // assertions in the OTHER tests in this module don't touch
+        // AGENT_VM_INSECURE_REGISTRY, so no interference.
+        // SAFETY: see rationale above.
+        unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", "1") };
+        assert!(is_plain_http_registry("registry.corp.example:5000/x"));
+        assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm:latest"));
+        // SAFETY: same.
+        unsafe { std::env::remove_var("AGENT_VM_INSECURE_REGISTRY") };
+        // After cleanup the heuristic resumes its normal behaviour.
+        assert!(!is_plain_http_registry("registry.corp.example:5000/x"));
     }
 }

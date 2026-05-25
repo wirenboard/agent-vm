@@ -57,13 +57,35 @@ fn exe_sibling_msb() -> Option<PathBuf> {
 /// fails to even execute).
 pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     if let Some(env_path) = std::env::var_os("MSB_PATH") {
-        let p = PathBuf::from(env_path);
+        let p = PathBuf::from(&env_path);
         if p.exists() {
             return Ok(Some(p));
         }
+        // Stale env from a previous dev session (common pitfall:
+        // .bashrc / shell init kept the var around after the file was
+        // moved or the dev directory deleted). Name MSB_PATH
+        // explicitly so the user knows what to unset, and offer the
+        // sibling fallback path if we can find one — otherwise the
+        // env var is a permanent foot-gun.
+        if let Some(sibling) = exe_sibling_msb()
+            && sibling.exists()
+        {
+            eprintln!(
+                "warn: MSB_PATH={} does not exist; ignoring and using sibling {}",
+                p.display(),
+                sibling.display()
+            );
+            return Ok(Some(sibling));
+        }
         bail!(
-            "MSB_PATH={} is set but the file does not exist",
-            p.display()
+            "MSB_PATH={} is set but the file does not exist, and no fallback msb \
+             was found next to {}.\n\
+             Either `unset MSB_PATH` to use the default discovery path, or point \
+             it at a valid patched msb.",
+            p.display(),
+            std::env::current_exe()
+                .map(|e| e.display().to_string())
+                .unwrap_or_else(|_| "<agent-vm exe>".to_string())
         );
     }
     if let Some(p) = exe_sibling_msb()
@@ -124,7 +146,12 @@ pub fn point_at_msb() -> Result<()> {
 
     verify_patched_marker(&resolved)?;
 
-    // SAFETY: called from main before any other thread is spawned.
+    // SAFETY: `main()` is a plain `fn main` and calls `point_at_msb`
+    // BEFORE constructing the tokio runtime. setenv() is not thread-
+    // safe; this ordering invariant is the only thing that makes the
+    // call sound. If you move the call into the runtime context the
+    // multi-threaded workers can race with libc's getenv()
+    // (reqwest, sea-orm, etc. read env on first use) → UB.
     unsafe { std::env::set_var("MSB_PATH", &resolved) };
     Ok(())
 }
@@ -149,9 +176,21 @@ fn verify_patched_marker(msb: &std::path::Path) -> Result<()> {
         );
     }
     if !stdout.contains(PATCHED_VERSION_MARKER) {
+        // Tailor the hint based on whether MSB_PATH is what pointed us
+        // at this binary. If the user explicitly set MSB_PATH, "set
+        // MSB_PATH explicitly" is the LAST thing they need to hear —
+        // they need to unset it.
+        let hint = if std::env::var_os("MSB_PATH").is_some() {
+            "Your MSB_PATH points at this binary. `unset MSB_PATH` to use the \
+             bundled patched msb, or point MSB_PATH at a patched build."
+        } else {
+            "Reinstall agent-vm (e.g. `npm install -g @wirenboard/agent-vm --force`) \
+             to restore the bundled patched msb."
+        };
         bail!(
             "{} is the upstream microsandbox binary (no '{PATCHED_VERSION_MARKER}' marker in --version: {:?}).\n\
-             agent-vm needs its own patched build; reinstall agent-vm (e.g. `npm install -g @wirenboard/agent-vm --force`) or set MSB_PATH explicitly.",
+             agent-vm needs its own patched build.\n\
+             {hint}",
             msb.display(),
             stdout.trim(),
         );
@@ -275,18 +314,46 @@ mod tests {
         verify_patched_marker(&p).expect("patched marker should be accepted");
     }
 
+    /// Tests both branches of the rejection-hint logic in one test so
+    /// they don't race on the process-global MSB_PATH env var. cargo
+    /// test parallelises by default and we don't want to pull in
+    /// `serial_test` just for this.
     #[test]
-    fn verify_marker_rejects_vanilla_version() {
+    fn verify_marker_rejects_vanilla_with_branch_specific_hint() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_fake_msb(dir.path(), "msb 0.4.6");
-        let err = verify_patched_marker(&p).unwrap_err();
-        let msg = format!("{err:?}");
+
+        // Branch 1: MSB_PATH unset → hint mentions reinstall.
+        // SAFETY: see module top — these tests are the only place we
+        // mutate the env var; we serialise them by living in one
+        // function.
+        let prior = std::env::var_os("MSB_PATH");
+        unsafe { std::env::remove_var("MSB_PATH") };
+        let err1 = verify_patched_marker(&p).unwrap_err();
+        let msg1 = format!("{err1:?}");
         assert!(
-            msg.contains("upstream microsandbox"),
-            "expected upstream-rejection message; got:\n{msg}"
+            msg1.contains("upstream microsandbox"),
+            "expected upstream-rejection message; got:\n{msg1}"
         );
-        // Actionable hint must be in the error chain.
-        assert!(msg.contains("reinstall agent-vm"), "missing actionable hint: {msg}");
+        assert!(
+            msg1.to_lowercase().contains("reinstall agent-vm"),
+            "missing 'reinstall agent-vm' hint when MSB_PATH unset: {msg1}"
+        );
+
+        // Branch 2: MSB_PATH set → hint blames MSB_PATH.
+        unsafe { std::env::set_var("MSB_PATH", "/anywhere") };
+        let err2 = verify_patched_marker(&p).unwrap_err();
+        let msg2 = format!("{err2:?}");
+        assert!(
+            msg2.contains("unset MSB_PATH"),
+            "missing 'unset MSB_PATH' hint when MSB_PATH set: {msg2}"
+        );
+
+        // Restore the var so we don't leak state to other tests.
+        match prior {
+            Some(v) => unsafe { std::env::set_var("MSB_PATH", v) },
+            None => unsafe { std::env::remove_var("MSB_PATH") },
+        }
     }
 
     #[test]

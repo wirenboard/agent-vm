@@ -69,9 +69,16 @@ jobs:
           submodules: 'recursive'
 
       - name: Install Rust toolchain
+        id: rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
+          # Capture the exact rustc version so the cache key invalidates
+          # whenever the toolchain rolls (e.g. `stable` bumps on the
+          # runner image). Without this, cached rlibs built with the
+          # previous rustc get linked against a newer one →
+          # undefined-symbol errors that took us hours to debug locally.
+          echo "rustc_version=$(rustc -V | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Install build prereqs (linux)
         if: runner.os == 'Linux'
@@ -88,9 +95,12 @@ jobs:
             ~/.cargo/git
             target
             vendor/microsandbox/target
-          key: cargo-${{ matrix.platform }}-${{ hashFiles('**/Cargo.lock') }}
+          # rustc-version in the key → toolchain bumps invalidate the
+          # cache. Cargo.lock change → dependency tree changed, also
+          # invalidate.
+          key: cargo-${{ matrix.platform }}-${{ steps.rust.outputs.rustc_version }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ matrix.platform }}-
+            cargo-${{ matrix.platform }}-${{ steps.rust.outputs.rustc_version }}-
 
       - name: Build agent-vm
         run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
@@ -168,13 +178,22 @@ jobs:
           # Recreate the ABI symlinks the dynamic linker expects.
           # Mirrors `libkrunfw_symlinks()` in vendor/microsandbox/
           # crates/microsandbox/lib/setup/download.rs.
+          #
+          # Use a plain sequence (not a subshell) so each ln failure
+          # propagates cleanly under `set -e` on every bash version,
+          # and absolute `$dst/...` paths so we don't depend on the
+          # cwd being right.
           if [[ "$os_tag" == darwin ]]; then
             full="libkrunfw.${LK_ABI}.dylib"
-            test -f "$dst/$full" || ln -s "libkrunfw.${LK_V}.dylib" "$dst/$full"
+            if [[ ! -e "$dst/$full" ]]; then
+              ln -s "libkrunfw.${LK_V}.dylib" "$dst/$full"
+            fi
           else
             full="libkrunfw.so.${LK_V}"
             soname="libkrunfw.so.${LK_ABI}"
-            ( cd "$dst" && ln -sf "$full" "$soname" && ln -sf "$soname" "libkrunfw.so" )
+            test -f "$dst/$full" || { echo "::error::$dst/$full missing after extraction"; exit 1; }
+            ln -sf "$full"   "$dst/$soname"
+            ln -sf "$soname" "$dst/libkrunfw.so"
           fi
           ls -la "$dst"
 
@@ -247,17 +266,37 @@ jobs:
       - name: Publish platform subpackages first
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
           # Subpackages MUST be published before the main package, or
           # the main package's optionalDependencies resolve to missing.
+          # Each publish is idempotent: if a re-run of a failed release
+          # finds a subpackage already at this version (npm 403:
+          # "cannot publish over existing version"), we accept that and
+          # carry on so the workflow can still publish the main package
+          # — avoiding a split-state where subpackages exist at v but
+          # the main package never makes it.
           for d in npm-dist/agent-vm-*-*; do
+            name=$(node -p "require('$d/package.json').name")
+            existing=$(npm view "$name@$V" version 2>/dev/null || true)
+            if [[ "$existing" == "$V" ]]; then
+              echo "::notice::$name@$V already published; skipping"
+              continue
+            fi
             (cd "$d" && npm publish --provenance --access public)
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ needs.resolve-version.outputs.version }}
         run: |
+          set -e
+          existing=$(npm view "@wirenboard/agent-vm@$V" version 2>/dev/null || true)
+          if [[ "$existing" == "$V" ]]; then
+            echo "::notice::@wirenboard/agent-vm@$V already published; skipping"
+            exit 0
+          fi
           cd npm-dist/agent-vm
           npm publish --provenance --access public

@@ -15,7 +15,7 @@ mod secrets;
 mod session;
 mod setup;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -56,8 +56,7 @@ enum Cmd {
     InterceptHook(intercept_hook::Args),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     // Locate and pin our patched msb binary via MSB_PATH so a user's
@@ -66,23 +65,35 @@ async fn main() -> Result<()> {
     // already resolved); the clipboard subcommand also runs in
     // contexts where the bundled msb may not be available
     // (e.g. inside the guest VM), so skip the check there too.
+    //
+    // CRITICAL: `point_at_msb()` mutates the process environment via
+    // `unsafe { std::env::set_var("MSB_PATH", ...) }`. setenv() is
+    // not thread-safe under POSIX. We MUST run it before the tokio
+    // multi-thread runtime spawns workers (which happens inside
+    // `Runtime::new()`). Hence the manual sync `fn main` + manual
+    // runtime construction instead of `#[tokio::main]`.
     if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
         msb_install::point_at_msb()?;
-        // Phase 9: auto-install the upstream microsandbox runtime
-        // libs (libkrunfw) into ~/.microsandbox if missing.
-        // Idempotent.
-        msb_install::ensure_runtime_installed().await?;
     }
-    match cli.cmd {
-        Cmd::Setup(args) => setup::run(args).await,
-        Cmd::Pull(args) => pull::run(args).await,
-        Cmd::Claude(args) => exit_with(run::launch(run::Agent::Claude, args).await?),
-        Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
-        Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
-        Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
-        Cmd::Clipboard(args) => clipboard::run(args),
-        Cmd::InterceptHook(args) => intercept_hook::run(args).await,
-    }
+    let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
+    runtime.block_on(async move {
+        if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
+            // Phase 9: auto-install the upstream microsandbox runtime
+            // libs (libkrunfw) into ~/.microsandbox if missing.
+            // Idempotent. Async because the bundle is fetched over HTTP.
+            msb_install::ensure_runtime_installed().await?;
+        }
+        match cli.cmd {
+            Cmd::Setup(args) => setup::run(args).await,
+            Cmd::Pull(args) => pull::run(args).await,
+            Cmd::Claude(args) => exit_with(run::launch(run::Agent::Claude, args).await?),
+            Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
+            Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
+            Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
+            Cmd::Clipboard(args) => clipboard::run(args),
+            Cmd::InterceptHook(args) => intercept_hook::run(args).await,
+        }
+    })
 }
 
 /// Wire `tracing` so `RUST_LOG=agent_vm=debug,microsandbox=info` works.
