@@ -89,20 +89,34 @@ RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
         '#    node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN.' \
         '#  - PATH: needed so npx is findable (sudo'\''s secure_path' \
         '#    would otherwise replace it).' \
-        '#  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (both cases):' \
-        '#    forward agentd-set proxy config so chrome routes traffic' \
-        '#    the same way as the rest of the guest.' \
+        '#  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (upper/lowercase):' \
+        '#    NOT set by agentd (microsandbox uses transparent network' \
+        '#    interception, no HTTP proxy env). Forwarded so that a' \
+        '#    user-supplied MCP `env:` block or .agent-vm.runtime.sh' \
+        '#    setting these is honoured by chromium.' \
         '#  - CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS / CI / DEBUG:' \
         '#    user/MCP-config opt-outs and debugging knobs that' \
         '#    chrome-devtools-mcp documents.' \
         '#  - TZ / LANG / LC_ALL / TMPDIR: locale + sane temp paths.' \
         '#' \
+        '# NOT in the preserve list (deliberate):' \
+        '#  - USER / LOGNAME: sudo'\''s default `env_reset` policy re-' \
+        '#    derives these from the target passwd entry. Adding them' \
+        '#    here would forward root'\''s USER into the chrome session.' \
+        '#  - HOME: set by `-H` from chrome'\''s passwd entry (not by' \
+        '#    env passthrough).' \
+        '#' \
         '# `cd /home/chrome` keeps chromium'\''s default CWD writable' \
         '# (the agent runs as root in /workspace, where chrome (UID' \
         '# 9999) cannot write; tools that emit relative paths' \
         '# (./trace.json, ./screenshot.png) would otherwise EACCES).' \
+        '# Diagnostic on failure so Claude doesn'\''t just see the MCP' \
+        '# transport close before handshake with no breadcrumb.' \
         'set -e' \
-        'cd /home/chrome' \
+        'cd /home/chrome 2>/dev/null || {' \
+        '    echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
+        '    exit 1' \
+        '}' \
         'exec sudo -u chrome -H -n \' \
         '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
         '    --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
@@ -130,12 +144,24 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 # Pre-warm chrome-devtools-mcp's npm cache as the chrome user so the
 # first browser tool call in any sandbox doesn't pay the multi-second
-# `npx -y` fetch cost (and so cold launches don't fail entirely when
-# registry.npmjs.org is briefly unreachable). `--help` exits cleanly
-# after install/version-check; it's the cheapest exercise of the full
-# install path. Must come AFTER the nodejs RUN above — npx didn't
-# exist before it.
-RUN sudo -u chrome -H npx -y chrome-devtools-mcp@latest --help >/dev/null
+# `npx -y` fetch cost. `--help` exits cleanly after install/version-
+# check; it's the cheapest exercise of the full install path.
+#
+# Pinned to a known-good version. The runtime MCP config in
+# `crates/agent-vm/src/secrets.rs::write_default_claude_root_state`
+# pins the SAME version — bump both together. Without the pin the
+# cache stops being useful the first time upstream cuts a release:
+# `npx -y` re-resolves `@latest` against the registry and re-
+# downloads under the writable upper layer.
+#
+# Best-effort: `|| true` because npm-registry transient failure or a
+# bad `--help` exit code shouldn't fail the whole `agent-vm setup`.
+# A missing cache costs a multi-second fetch on first browser tool
+# call; failing the image build is much worse.
+#
+# Must come AFTER the nodejs RUN above — npx didn't exist before it.
+RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
+ || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
