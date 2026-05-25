@@ -128,7 +128,11 @@ jobs:
         with:
           script: |
             const owner = context.repo.owner;
-            const pkg = 'agent-vm';
+            // GHCR package name — `agent-vm-template`, not the repo's
+            // short name. The repo was renamed in ca6a2a3 but this
+            // string was left stale, so every `retain` run since then
+            // has failed with HttpError 404 and pruned nothing.
+            const pkg = 'agent-vm-template';
             const horizonMs = 14 * 24 * 60 * 60 * 1000;
             const now = Date.now();
             // Patterns we never delete, regardless of age.
