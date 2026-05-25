@@ -224,17 +224,25 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Download all platform artifacts
+      # Download each platform artifact into its own subpackage
+      # directory explicitly. `actions/download-artifact@v5` with
+      # `pattern:` + a single matched artifact does NOT wrap it in a
+      # subdir (the v5 behaviour change vs v4) — files land flat at
+      # the `path:` root. Downloading by exact `name:` into a
+      # per-artifact `path:` sidesteps that, and keeps the layout
+      # explicit when we add more platforms (just add another
+      # download step).
+      #
+      # Each subpackage's package.json is already on disk from the
+      # checkout; the artifact carries bin/ + lib/ on top of it.
+      # download-artifact will create missing parents.
+      - name: Download linux-x64 artifact
         uses: actions/download-artifact@v5
         with:
-          path: npm-dist/
-          pattern: agent-vm-*
-          merge-multiple: false
+          name: agent-vm-linux-x64
+          path: npm-dist/agent-vm-linux-x64/
 
-      - name: Restore directory layout
-        # actions/download-artifact drops artifacts as
-        # npm-dist/agent-vm-linux-x64/{bin,lib} — that's already
-        # what the subpackage expects. Sanity check.
+      - name: Verify artifact layout
         run: |
           set -e
           for d in npm-dist/agent-vm-*-*/bin; do
