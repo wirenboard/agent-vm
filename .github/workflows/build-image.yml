@@ -65,15 +65,33 @@ jobs:
         with:
           context: images
           file: images/Dockerfile
-          push: true
+          # `outputs: type=registry,push=true` replaces a bare
+          # `push: true` so we can carry compression directives on the
+          # same step. The benchmark in crates/agent-vm/examples/
+          # erofs_bench.rs showed gzip → zstd cuts the per-layer
+          # OCI→EROFS conversion cost by ~24× (143s → 5s on 856 MB
+          # of /usr/lib). `force-compression=true` re-emits even
+          # already-compressed base-image layers as zstd; without it
+          # we'd only re-compress layers we add and the base layers
+          # would stay gzip, halving the win. `compression-level=3`
+          # is zstd's default — the bench shows diminishing returns
+          # past that for binary-heavy content.
+          # microsandbox's `tar_ingest.rs:427` already accepts the
+          # `application/vnd.oci.image.layer.v1.tar+zstd` media type.
+          outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true
           # `cache-from`/`cache-to` keep layer rebuilds fast when only
           # the agent-version layers at the top of the Dockerfile
           # change (the common hourly case).
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to
+          # `main` so a workflow_dispatch on a feature branch can be
+          # used to verify the build without clobbering production.
+          # The immutable `:sha-…` tag is always pushed, which is
+          # what we inspect for verification.
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ steps.ts.outputs.tag }}
+            ${{ github.ref_name == 'main' && format('{0}:latest', env.IMAGE) || '' }}
+            ${{ github.ref_name == 'main' && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           # Tag with the short SHA too so we can trace any image
           # back to the exact Dockerfile commit.
