@@ -171,13 +171,95 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # Assemble per-platform npm subpackage: pull in the two binaries
-  # from the parallel build jobs, fetch libkrunfw inline (the curl
-  # is ~10s so not worth a separate job), upload the populated
-  # subpackage tree as the per-platform artifact the publish job
-  # downloads.
+  # Build libkrunfw from source with the KVM-hypervisor config patch
+  # from libkrunfw-overrides/. Stock libkrunfw ships only the
+  # paravirt-guest helpers (CONFIG_KVM_GUEST=y) — agent-vm needs the
+  # in-kernel hypervisor (CONFIG_KVM=y + Intel/AMD backends) so the
+  # guest can host nested KVM (Docker-in-Docker, qemu, etc.). See
+  # libkrunfw-overrides/README.md for details.
+  build-libkrunfw:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        # Need the patch file + LIBKRUNFW_VERSION constant. Submodules
+        # via the vendor path; recursive not required for libkrunfw
+        # itself (cloned separately below).
+        with:
+          submodules: true
+
+      - name: Resolve libkrunfw version from vendor/microsandbox
+        id: lkv
+        shell: bash
+        run: |
+          set -euo pipefail
+          libkrunfw_version=$(awk -F\" \
+            '/^pub const LIBKRUNFW_VERSION *: *&str *= *"/{print $2; exit}' \
+            vendor/microsandbox/crates/utils/lib/lib.rs)
+          test -n "$libkrunfw_version" || { echo "::error::could not extract libkrunfw version"; exit 1; }
+          echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libkrunfw build output
+        id: lk-cache
+        uses: actions/cache@v4
+        with:
+          # Key on version + arch + sha256 of the patch + workflow
+          # file so a patch edit or pin bump invalidates the cache.
+          key: libkrunfw-${{ steps.lkv.outputs.libkrunfw_version }}-${{ matrix.arch }}-${{ hashFiles('libkrunfw-overrides/config-libkrunfw_x86_64.patch', '.github/workflows/release-npm.yml') }}
+          path: libkrunfw-out/
+
+      - name: Install kernel build deps
+        if: steps.lk-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc flex bison libelf-dev libssl-dev \
+            kmod cpio bzip2 xz-utils python3 python3-pyelftools \
+            curl ca-certificates patch
+
+      - name: Clone + patch + build libkrunfw
+        if: steps.lk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          LK_V: ${{ steps.lkv.outputs.libkrunfw_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          git clone --branch "v${LK_V}" --depth 1 \
+            https://github.com/containers/libkrunfw.git libkrunfw-src
+          cd libkrunfw-src
+          patch -p1 < ../libkrunfw-overrides/config-libkrunfw_${ARCH}.patch
+          # olddefconfig (run by make rule on first invocation) resolves
+          # support symbols (KVM_X86, KVM_SMM, KVM_HYPERV, KVM_VFIO, …).
+          make -j"$(nproc)"
+          # Sanity: hypervisor symbols must be in the rebuilt vmlinux,
+          # otherwise the .so would silently ship the wrong kernel.
+          nm linux-*/vmlinux | grep -qE " kvm_dev_ioctl$" \
+            || { echo "::error::kvm_dev_ioctl missing — patch did not take"; exit 1; }
+          mkdir -p ../libkrunfw-out
+          cp libkrunfw.so."${LK_V}" ../libkrunfw-out/
+
+      - name: Upload libkrunfw artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: libkrunfw-${{ matrix.platform }}
+          path: libkrunfw-out/libkrunfw.so.*
+          retention-days: 7
+          if-no-files-found: error
+
+  # Assemble per-platform npm subpackage: pull in the three artefacts
+  # (agent-vm + msb + libkrunfw with KVM=y) from the parallel build
+  # jobs, create soname symlinks, upload the populated subpackage tree
+  # as the per-platform artifact the publish job downloads.
   package:
-    needs: [resolve-version, build-agent-vm, build-msb]
+    needs: [resolve-version, build-agent-vm, build-msb, build-libkrunfw]
     strategy:
       fail-fast: false
       matrix:
@@ -228,46 +310,27 @@ jobs:
           echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
           echo "libkrunfw_abi=$libkrunfw_abi"         >> "$GITHUB_OUTPUT"
 
-      - name: Fetch libkrunfw from upstream microsandbox release
+      - name: Download patched libkrunfw artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: libkrunfw-${{ matrix.platform }}
+          path: npm-dist/agent-vm-${{ matrix.platform }}/lib/
+
+      - name: Create libkrunfw soname symlinks
         shell: bash
         env:
-          MSB_V:    ${{ steps.lkv.outputs.msb_version }}
-          LK_V:     ${{ steps.lkv.outputs.libkrunfw_version }}
-          LK_ABI:   ${{ steps.lkv.outputs.libkrunfw_abi }}
-          LK_ARCH:  ${{ matrix.libkrunfw_arch }}
+          LK_V:   ${{ steps.lkv.outputs.libkrunfw_version }}
+          LK_ABI: ${{ steps.lkv.outputs.libkrunfw_abi }}
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
-            os_tag=darwin
-          else
-            os_tag=linux
-          fi
-          url="https://github.com/superradcompany/microsandbox/releases/download/v${MSB_V}/microsandbox-${os_tag}-${LK_ARCH}.tar.gz"
-          echo "Downloading $url"
           dst=npm-dist/agent-vm-${{ matrix.platform }}/lib
-          mkdir -p "$dst"
-          tmp=$(mktemp -d)
-          curl -fsSL -o "$tmp/bundle.tar.gz" "$url"
-          tar -xzf "$tmp/bundle.tar.gz" -C "$tmp"
-          shopt -s globstar nullglob
-          found=0
-          for f in "$tmp"/**/libkrunfw*; do
-            cp -a "$f" "$dst/"
-            found=$((found+1))
-          done
-          if [[ $found -eq 0 ]]; then
-            echo "::error::no libkrunfw* in $url"; ls -R "$tmp"; exit 1
-          fi
-          rm -rf "$tmp"
-          if [[ "$os_tag" == darwin ]]; then
+          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
             full="libkrunfw.${LK_ABI}.dylib"
-            if [[ ! -e "$dst/$full" ]]; then
-              ln -s "libkrunfw.${LK_V}.dylib" "$dst/$full"
-            fi
+            test -f "$dst/$full" || { echo "::error::$dst/$full missing"; exit 1; }
           else
             full="libkrunfw.so.${LK_V}"
             soname="libkrunfw.so.${LK_ABI}"
-            test -f "$dst/$full" || { echo "::error::$dst/$full missing after extraction"; exit 1; }
+            test -f "$dst/$full" || { echo "::error::$dst/$full missing"; exit 1; }
             ln -sf "$full"   "$dst/$soname"
             ln -sf "$soname" "$dst/libkrunfw.so"
           fi

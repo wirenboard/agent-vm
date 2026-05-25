@@ -66,24 +66,24 @@ fn main() -> Result<()> {
     // contexts where the bundled msb may not be available
     // (e.g. inside the guest VM), so skip the check there too.
     //
-    // CRITICAL: `point_at_msb()` mutates the process environment via
-    // `unsafe { std::env::set_var("MSB_PATH", ...) }`. setenv() is
-    // not thread-safe under POSIX. We MUST run it before the tokio
-    // multi-thread runtime spawns workers (which happens inside
-    // `Runtime::new()`). Hence the manual sync `fn main` + manual
-    // runtime construction instead of `#[tokio::main]`.
+    // CRITICAL: `point_at_msb()` / `point_at_msb_home()` mutate the
+    // process environment via `unsafe { std::env::set_var(...) }`.
+    // setenv() is not thread-safe under POSIX. We MUST run them
+    // before the tokio multi-thread runtime spawns workers (which
+    // happens inside `Runtime::new()`). Hence the manual sync `fn
+    // main` + manual runtime construction instead of `#[tokio::main]`.
     let needs_msb_setup = !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_));
     if needs_msb_setup {
         msb_install::point_at_msb()?;
+        // Reroute msb's writable state off `~/.microsandbox/` and into
+        // agent-vm's own state dir. msb still finds `libkrunfw.so.*`
+        // via MSB_PATH → sibling `../lib/` (the bundle layout), so no
+        // copy/sync into MSB_HOME is needed — only the writable state
+        // (db, sandboxes, cache, tls/CA, logs) lives here.
+        msb_install::point_at_msb_home()?;
     }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
-        if needs_msb_setup {
-            // Phase 9: auto-install the upstream microsandbox runtime
-            // libs (libkrunfw) into ~/.microsandbox if missing.
-            // Idempotent. Async because the bundle is fetched over HTTP.
-            msb_install::ensure_runtime_installed().await?;
-        }
         match cli.cmd {
             Cmd::Setup(args) => setup::run(args).await,
             Cmd::Pull(args) => pull::run(args).await,
