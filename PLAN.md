@@ -446,7 +446,7 @@ in a real GitHub project lands a commit on the remote; an agent attempt
 to push to a *different* repo gets a clean 403 from the proxy hook
 rather than reaching GitHub.
 
-### Phase 7 — DX additions: `--mount`, clipboard, ccusage, Chrome DevTools MCP [done — commit `5c5bf22`]
+### Phase 7 — DX additions: `--mount`, clipboard, ccusage, Chrome DevTools MCP [done — commits `5c5bf22`, `f40e6df`, `ce745ec`, `43203fe`]
 
 A grab-bag of original-agent-vm capabilities the user wants in v1.
 Each is independent and lands as its own PR per the working agreement.
@@ -478,31 +478,76 @@ a separate shell script in `bin/` and reference from README.
 
 **Chrome DevTools MCP.** Original at `claude-vm.sh:385` installs
 Chromium into the image with `google-chrome` symlinks, then writes the
-MCP server entry into `~/.claude.json` / Codex settings:
+MCP server entry into `~/.claude.json`. The naive port (`command:
+"npx"`, args `["-y", "chrome-devtools-mcp@latest", "--headless=true",
+"--isolated=true"]`) reported `✓ Connected` to `claude mcp list` but
+every tool call returned either `Protocol error
+(Target.setDiscoverTargets): Target closed` or
+`net::ERR_CERT_AUTHORITY_INVALID`. Two distinct root causes (both
+fixed across `f40e6df`, `ce745ec`, `43203fe`):
 
-```json
-"chrome-devtools": {
-  "command": "npx",
-  "args": ["-y", "chrome-devtools-mcp@latest", "--headless=true", "--isolated=true"]
-}
-```
+1. **Chromium refuses to initialize its user-namespace sandbox as
+   root.** The browser dies before the CDP pipe is read. Common
+   workaround is `--no-sandbox`; we'd rather keep chromium's nested
+   sandbox active (defence in depth against untrusted content the
+   agent navigates to).
+2. **Chromium on Linux ignores `/etc/ssl/certs/ca-certificates.crt`
+   and only honours its built-in root store + the per-user NSS DB**,
+   so the microsandbox MITM CA isn't trusted by chromium even though
+   curl/openssl trust it. Common workaround is `--acceptInsecureCerts`
+   (puppeteer-level "trust everything"); we'd rather scope trust to
+   just our CA.
 
-In the rewrite:
-- Add `chromium` + the `google-chrome` symlink dance to `images/
-  Dockerfile`.
-- Extend `secrets::write_default_claude_settings` (and equivalents for
-  Codex `config.toml` / OpenCode `config.json`) to inject the
-  MCP server entry into the merged settings. Merge semantics already in
-  place: user-set MCP servers survive, the chrome-devtools entry is
-  force-set.
-- `AGENT_VM_NO_CHROME_MCP=1` opt-out for users who don't want
-  Chromium running in the guest.
+What shipped in the rewrite, end to end:
+
+- **Image** (`images/Dockerfile`): chromium + `google-chrome` symlinks;
+  added `sudo` and `libnss3-tools`; dedicated `chrome` user (UID 9999,
+  /home/chrome) baked via direct `/etc/passwd`/`/etc/shadow`/`/etc/group`
+  edits (debian-slim has no `useradd`); empty NSS DB at
+  `/home/chrome/.pki/nssdb` initialized at image-build time; sudoers
+  drop-in `root ALL=(chrome) NOPASSWD: ALL`; wrapper script at
+  `/usr/local/bin/agent-vm-chrome-mcp` that re-execs the MCP under
+  `sudo -u chrome -H -n` with an explicit env allow-list
+  (`NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE` /
+  `REQUESTS_CA_BUNDLE` / `PATH` / `HTTP(S)_PROXY` / `NO_PROXY` /
+  `CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS` / `CI` / `DEBUG` / `TZ` /
+  `LANG` / `LC_ALL` / `TMPDIR`) and `cd /home/chrome` before exec
+  (chrome can't write `/workspace`); pre-warm RUN that bakes
+  `chrome-devtools-mcp@1.0.1` into `/home/chrome/.npm/_npx/` so first
+  launch is a cache hit (best-effort `|| echo skipped` so a transient
+  registry blip doesn't fail the whole `agent-vm setup`).
+- **Launcher** (`crates/agent-vm/src/run.rs`): bash prelude runs
+  `certutil -A -t C,, -n microsandbox -i /usr/local/share/ca-certificates/microsandbox-ca.crt`
+  per boot (the CA is per-boot — agentd writes it into the guest, so
+  it can't be baked into the image). Trust string is `C,,`
+  (server-cert only — `T` would add client-cert signing too). On
+  failure the launcher prints a 4-line warning naming the symptom
+  (`HTTPS in chrome-devtools MCP will fail with
+  ERR_CERT_AUTHORITY_INVALID`) and prefixed sudo/certutil stderr,
+  rather than the original silent `|| true`.
+- **MCP config** (`crates/agent-vm/src/secrets.rs::write_default_claude_root_state`):
+  `command: "/usr/local/bin/agent-vm-chrome-mcp"`, `args: ["npx",
+  "-y", "chrome-devtools-mcp@1.0.1", "--headless=true",
+  "--isolated=true"]`. Pinned to the SAME version as the image's
+  pre-warm — bump both together. Codex / OpenCode are unchanged
+  (they don't get the entry — Phase 7 scope was Claude-only).
+- **`AGENT_VM_NO_CHROME_MCP` opt-out** (any value, including empty,
+  consistent with `AGENT_VM_PROFILE` / `AGENT_VM_DEBUG_CONFIG`):
+  removes the `chrome-devtools` key from a merged claude.json (sticky
+  fix), drops `mcpServers` entirely if it ends up empty, AND skips the
+  per-boot certutil/sudo prelude so opted-out users don't pay for or
+  trip the chrome-user setup. Both gates check the same env var so
+  the opt-out is honoured everywhere.
 
 **Done when:** `--mount` round-trips a file into a guest path of the
 user's choice; `agent-vm clipboard put` then in-guest `cat
 /agent-vm-state/clipboard.txt` shows the same string; `agent-vm-
 ccusage` reports usage across all project sessions; in-VM Claude
-opens a real URL via the MCP and screenshots it.
+opens a real URL via the MCP and screenshots it (verified e2e: a
+JSON-RPC `navigate_page` https://example.com followed by
+`take_snapshot` returns the real "Example Domain" content, with
+chromium running as `chrome` UID 9999, sandbox active, and the NSS
+DB listing only the `microsandbox` CA with attributes `C,,`).
 
 ### Phase 8 — Fast-launch (deferred — wrong instrument for the job)
 

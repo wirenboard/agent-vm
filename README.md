@@ -69,6 +69,33 @@ Each launcher accepts:
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
 
+Env-var knobs (all opt-in; set to *any* value, empty included):
+
+| var | what |
+|---|---|
+| `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
+| `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
+| `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
+| `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
+| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
+| `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+
+## Chrome DevTools MCP
+
+The image ships chromium and a `chrome-devtools` MCP entry pinned to
+`chrome-devtools-mcp@1.0.1`. To keep chromium's nested user-namespace
+sandbox active (we'd rather not pass `--no-sandbox`) the MCP runs as a
+dedicated `chrome` user via a sudo wrapper at
+`/usr/local/bin/agent-vm-chrome-mcp`. The launcher installs the
+per-boot microsandbox MITM CA into chrome's NSS DB at startup so
+chromium accepts the intercepted TLS chain without
+`--acceptInsecureCerts` (which would trust *any* untrusted cert).
+
+If the CA install fails (e.g. someone broke the in-image sudoers rule)
+the launcher prints a warning naming the symptom — without it, every
+HTTPS navigate would silently return `ERR_CERT_AUTHORITY_INVALID`.
+Set `AGENT_VM_NO_CHROME_MCP=1` to skip the whole setup.
+
 ## Credentials
 
 Reads from the host:

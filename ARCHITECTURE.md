@@ -127,19 +127,33 @@ run plus the dev tools that are universally useful:
 
 - Base: `ca-certificates`, `curl`, `wget`, `git`, `jq`, `bash`,
   `python3`/`pip`, `ripgrep`, `fd-find`.
+- Chromium + `fonts-liberation` + `sudo` + `libnss3-tools` for the
+  Chrome DevTools MCP (Phase 7). Symlinks `/usr/bin/google-chrome` and
+  `/opt/google/chrome/chrome` to `/usr/bin/chromium` so puppeteer's
+  default discovery paths resolve. Dedicated `chrome` user (UID 9999)
+  with home `/home/chrome`, empty NSS DB at `~/.pki/nssdb`, sudoers
+  rule `root ALL=(chrome) NOPASSWD: ALL`, and a wrapper at
+  `/usr/local/bin/agent-vm-chrome-mcp` that re-execs the MCP under
+  that user. Pre-warmed npm cache for `chrome-devtools-mcp@1.0.1`
+  under `/home/chrome/.npm/_npx/` so first launch is a cache hit.
+- `gh` from cli.github.com/packages (Phase 6 — gh/git credential
+  injection).
 - Node.js 22 from NodeSource (needed by Claude Code, OpenCode, MCP servers).
 - Agents installed via their canonical installer scripts so we track upstream
   release channels: `claude.ai/install.sh`, `opencode.ai/install`, and the
   Codex `install.sh` from GitHub releases.
 
-Explicitly skipped in v1 (per PLAN.md scope cuts): Docker-in-VM, Chromium,
-LSP plugins, Chrome DevTools MCP, `mitmproxy` (microsandbox does the
-interception in Phase 3, no in-VM proxy needed), `gh`, GitHub Copilot CLI.
-Each line we keep is a line that has to keep working through `apt-get update`
-churn, so the bar to add anything is "needed by an in-scope agent flow."
+Explicitly skipped in v1 (per PLAN.md scope cuts): Docker-in-VM, LSP
+plugins, `mitmproxy` (microsandbox does the interception in Phase 3,
+no in-VM proxy needed), GitHub Copilot CLI. Each line we keep is a
+line that has to keep working through `apt-get update` churn, so the
+bar to add anything is "needed by an in-scope agent flow."
 
-Resulting image: ~1.5 GB uncompressed locally, ~350 MB on disk in the
-registry (compressed layers). Node.js itself is the biggest contributor.
+Resulting image: a few GB uncompressed (chromium is the largest
+contributor at ~400 MB, followed by Node.js and the agent CLIs;
+re-measure with `docker images` when you care about exact bytes).
+Registry layer count is bounded by the `RUN` granularity in the
+Dockerfile.
 
 ### Image build is shelled to Bash, not done in Rust
 
