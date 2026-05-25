@@ -6,9 +6,15 @@
 //! standard paths (`/root/.claude`, `/root/.codex`,
 //! `/root/.local/share/opencode`) so session history survives across runs.
 //!
-//! The sandbox name is derived from the hash too, so launching `agent-vm
-//! claude` twice in the same project replaces the prior sandbox instead of
-//! booting a second one.
+//! The sandbox *name* additionally carries the launcher PID
+//! (`agent-vm-<hash>-<pid>`) so two concurrent `agent-vm` invocations
+//! from the same project boot independent VMs. Without this, the second
+//! launch's `Sandbox::create` would SIGTERM/SIGKILL the first one's VMM
+//! (we used to set `.replace()` to handle the same-name collision; now
+//! there is no collision to handle). Per-project bind-mounted state
+//! (claude/, codex/, opencode/, bash_history) is still shared between
+//! the two — running two agents that mutate the same session files at
+//! once is the user's call.
 
 use std::{
     env,
@@ -39,7 +45,14 @@ impl ProjectSession {
     fn for_dir(project_dir: PathBuf) -> Result<Self> {
         let project_hash = hash_path(&project_dir);
         let state_dir = state_root()?.join(&project_hash);
-        let sandbox_name = format!("agent-vm-{project_hash}");
+        // Per-launch PID suffix so two concurrent invocations in the same
+        // project boot independent sandboxes (the first one stays alive
+        // instead of being SIGTERMed by the second's create()). The PID
+        // is unique across currently-running processes on the host, which
+        // is the only collision window we need to handle — a leftover
+        // sandbox from a crashed launcher is cleaned up by the
+        // Sandbox::remove call at end of launch().
+        let sandbox_name = format!("agent-vm-{project_hash}-{}", std::process::id());
         Ok(Self {
             project_dir,
             project_hash,
@@ -113,5 +126,29 @@ mod tests {
         assert_eq!(h.len(), 12);
         assert_eq!(h, hash_path(Path::new("/some/project")));
         assert_ne!(h, hash_path(Path::new("/other/project")));
+    }
+
+    #[test]
+    fn sandbox_name_carries_pid_for_concurrent_safety() {
+        // Two ProjectSession values for the same dir must share state
+        // (so per-project history etc. survives) but produce distinct
+        // sandbox names within the same process (PID disambiguator —
+        // and across processes the PIDs differ by definition).
+        let dir = std::env::temp_dir();
+        let a = ProjectSession::for_dir(dir.clone()).expect("for_dir a");
+        let b = ProjectSession::for_dir(dir.clone()).expect("for_dir b");
+        assert_eq!(a.state_dir, b.state_dir);
+        assert_eq!(a.project_hash, b.project_hash);
+        // Same process → same PID → same name within-process. The
+        // concurrent-launch guarantee comes from PIDs differing across
+        // processes; assert the name format encodes the PID so a future
+        // refactor that drops it from the format trips the test.
+        let pid = std::process::id().to_string();
+        assert!(
+            a.sandbox_name.ends_with(&format!("-{pid}")),
+            "sandbox_name {:?} must end with -<pid>",
+            a.sandbox_name
+        );
+        assert_eq!(a.sandbox_name, b.sandbox_name);
     }
 }

@@ -27,6 +27,7 @@ dependencies = [
  "base64",
  "clap",
  "indicatif",
+ "libc",
  "microsandbox",
  "microsandbox-network",
  "reqwest",

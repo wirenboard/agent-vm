@@ -186,11 +186,24 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretValue::File config.
+///
+/// Serialized across concurrent launchers in the same project via an
+/// advisory flock on `<state_dir>/.refresh.lock`. Several files under
+/// `state_dir` (`claude.json`, `claude/settings.json`,
+/// `opencode-config/opencode.json`) are read-modify-write — without
+/// the lock, two `agent-vm` invocations in the same project would
+/// race: both read the same baseline, both write back their
+/// mutations, the later writer silently clobbers the earlier. Token
+/// files themselves use `atomic_write` (tempfile + rename) so are
+/// fine without the lock, but the lock is cheap and the easier API
+/// is "everything refresh touches is serialized."
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
     use_github: bool,
 ) -> Result<CredsState> {
+    let _lock = ProjectRefreshLock::acquire(state_dir)
+        .context("acquiring per-project refresh lock")?;
     // The token files hold the host's *real* access tokens, so their
     // directory must never be bind-mounted into the guest. Create it
     // 0700 in the host-only sibling location (see `host_secret_dir`).
@@ -855,6 +868,75 @@ fn write_default_opencode_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Advisory exclusive flock on `<state_dir>/.refresh.lock`. Held for
+/// the duration of [`refresh`] so two concurrent `agent-vm` launchers
+/// in the same project don't interleave reads/writes of the shared
+/// per-project state files (`claude.json`, `claude/settings.json`,
+/// `opencode-config/opencode.json` — each is a read-modify-write that
+/// would otherwise lose one launcher's mutation).
+///
+/// Implemented on top of `flock(2)` (Unix-only). The lock auto-releases
+/// when the fd closes — Drop performs an explicit `LOCK_UN` first for
+/// clarity, but isn't strictly required for correctness.
+///
+/// Why a separate lockfile (`.refresh.lock`) and not flock'ing the
+/// state files directly: those files don't exist on first launch (we
+/// create them inside the locked section), and flock requires an open
+/// fd. A dedicated always-present lockfile avoids that chicken-and-egg.
+struct ProjectRefreshLock {
+    file: std::fs::File,
+}
+
+impl ProjectRefreshLock {
+    fn acquire(state_dir: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        // Caller created state_dir already (run.rs's session.ensure_dirs);
+        // belt-and-braces in case `refresh` is invoked from somewhere
+        // that doesn't.
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("creating {}", state_dir.display()))?;
+        let lock_path = state_dir.join(".refresh.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        // LOCK_EX blocks until exclusive ownership is acquired. Loop
+        // on EINTR (signal during the wait). No timeout — a peer that
+        // truly hangs inside the locked section is a bug we want
+        // surfaced as a stuck launcher, not silently bypassed.
+        loop {
+            // SAFETY: file owns the fd for the duration of the call;
+            // LOCK_EX is a valid `flock(2)` operation; errno is read
+            // immediately on failure.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(anyhow::Error::from(err)
+                .context(format!("flock(LOCK_EX) on {}", lock_path.display())));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ProjectRefreshLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: file still owns the fd; LOCK_UN can't fail in a way
+        // that warrants action here (close on Drop releases the lock
+        // either way).
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +965,43 @@ mod tests {
             // and the refresh hook agree on the path.
             assert_eq!(token.parent().unwrap().parent(), state_dir.parent());
         }
+    }
+
+    /// The per-project refresh lock must serialize: a second
+    /// `LOCK_EX` against the same lock file (via a *different* fd,
+    /// because flock is per-fd on Linux) must fail with `EWOULDBLOCK`
+    /// while the first guard is alive. This is the property that
+    /// prevents concurrent launchers from interleaving RMW on
+    /// `claude.json` / `settings.json` (see review finding #2).
+    #[test]
+    fn project_refresh_lock_blocks_second_acquire() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = ProjectRefreshLock::acquire(dir.path()).expect("first acquire");
+        // Open a second fd on the lock file from a different File
+        // (same process, but flock(2) on Linux is per-open-file-
+        // description, so this is the right way to model a second
+        // launcher). LOCK_NB returns EWOULDBLOCK if the lock can't be
+        // taken immediately — that's what we want to observe.
+        let other = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join(".refresh.lock"))
+            .expect("open second handle");
+        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let err = std::io::Error::last_os_error();
+        assert_eq!(rc, -1, "second flock should fail while guard is alive");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EWOULDBLOCK),
+            "expected EWOULDBLOCK, got {err:?}"
+        );
+        // Releasing the first guard makes the second acquire succeed.
+        drop(guard);
+        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "second flock should succeed after guard drop");
+        let _ = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
     }
 
     /// Trailing-slash state_dir was flagged in code review as a

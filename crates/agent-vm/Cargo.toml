@@ -22,6 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+libc = "0.2"
 
 # Integration tests that drive the actual secret-substitution layer
 # end-to-end with the hook's anonymisation logic. Kept out of release
