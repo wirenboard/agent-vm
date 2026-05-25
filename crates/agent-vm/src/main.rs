@@ -72,12 +72,13 @@ fn main() -> Result<()> {
     // multi-thread runtime spawns workers (which happens inside
     // `Runtime::new()`). Hence the manual sync `fn main` + manual
     // runtime construction instead of `#[tokio::main]`.
-    if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
+    let needs_msb_setup = !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_));
+    if needs_msb_setup {
         msb_install::point_at_msb()?;
     }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
-        if !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_)) {
+        if needs_msb_setup {
             // Phase 9: auto-install the upstream microsandbox runtime
             // libs (libkrunfw) into ~/.microsandbox if missing.
             // Idempotent. Async because the bundle is fetched over HTTP.
