@@ -224,22 +224,38 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Download all platform artifacts
+      # Download each platform artifact into its own subpackage
+      # directory explicitly. `actions/download-artifact@v5` with
+      # `pattern:` + a single matched artifact does NOT wrap it in a
+      # subdir (the v5 behaviour change vs v4) — files land flat at
+      # the `path:` root. Downloading by exact `name:` into a
+      # per-artifact `path:` sidesteps that, and keeps the layout
+      # explicit when we add more platforms (just add another
+      # download step).
+      #
+      # Each subpackage's package.json is already on disk from the
+      # checkout; the artifact carries bin/ + lib/ on top of it.
+      # download-artifact will create missing parents.
+      - name: Download linux-x64 artifact
         uses: actions/download-artifact@v5
         with:
-          path: npm-dist/
-          pattern: agent-vm-*
-          merge-multiple: false
+          name: agent-vm-linux-x64
+          path: npm-dist/agent-vm-linux-x64/
 
-      - name: Restore directory layout
-        # actions/download-artifact drops artifacts as
-        # npm-dist/agent-vm-linux-x64/{bin,lib} — that's already
-        # what the subpackage expects. Sanity check.
+      - name: Verify artifact layout + restore executable bits
+        # `actions/upload-artifact@v4` packs files into a zip that
+        # doesn't preserve POSIX permissions. After download, the
+        # binaries land as 0644 — npm publishes them as-is and users
+        # get EACCES on first invocation. Restoring +x here is the
+        # smallest fix; declaring them in `bin` of the subpackage's
+        # package.json would also work but creates a competing
+        # `agent-vm` shim that fights the main package's launcher.
         run: |
           set -e
           for d in npm-dist/agent-vm-*-*/bin; do
             test -f "$d/agent-vm" || { echo "missing $d/agent-vm"; exit 1; }
             test -f "$d/msb" || { echo "missing $d/msb"; exit 1; }
+            chmod +x "$d/agent-vm" "$d/msb"
           done
 
       - name: Set versions in every package.json
@@ -278,7 +294,10 @@ jobs:
           # — avoiding a split-state where subpackages exist at v but
           # the main package never makes it.
           for d in npm-dist/agent-vm-*-*; do
-            name=$(node -p "require('$d/package.json').name")
+            # Node's `require` only resolves bare-relative paths
+            # with a leading `./` — without it the loader treats the
+            # argument as a node_modules / built-in spec and bails.
+            name=$(node -p "require('./$d/package.json').name")
             existing=$(npm view "$name@$V" version 2>/dev/null || true)
             if [[ "$existing" == "$V" ]]; then
               echo "::notice::$name@$V already published; skipping"
