@@ -223,18 +223,46 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Claude's per-folder trust list (~/.claude.json `projects.<path>.
     // hasTrustDialogAccepted = true`), suppressing the "do you trust
     // this folder?" wizard on first launch in each project.
+    // Phase 7 (moved up): parse `--mount HOST[:GUEST]` so the
+    // GitHub repo scan below can also walk each mount's remote +
+    // submodules — matches main-branch claude-vm.sh behavior. The
+    // libkrun IRQ pool is *tight* — empirically the project bind +
+    // state bind + network + agentd + OCI overlay already saturate
+    // it on this build, so any extra mount tends to trip a
+    // confusing `RegisterNetDevice(IrqsExhausted)` at boot. We let
+    // the user try and surface a friendly suggestion if libkrun
+    // rejects the config; we don't pre-cap because libkrun
+    // configurations vary. See discovered upstream issue #3.
+    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    for em in &extra_mounts {
+        if !em.host.exists() {
+            anyhow::bail!("--mount host path {:?} does not exist", em.host);
+        }
+    }
+    if !extra_mounts.is_empty() {
+        eprintln!(
+            "==> Note: {} --mount arg(s) — libkrun's virtio IRQ pool is tight; if you see \
+             RegisterNetDevice(IrqsExhausted) at boot, drop a mount or pass --no-git to free a slot.",
+            extra_mounts.len()
+        );
+    }
+
     // Phase 6: build the per-launch GitHub repo allow-list from the
-    // cwd's `git remote -v` plus any `--repo` overrides. Used both to
-    // decide whether to bother capturing host gh auth (no repos →
-    // nothing to talk to) and to constrain api.github.com requests
-    // server-side via the intercept hook.
+    // cwd's `git remote -v` + its `.gitmodules` submodules + the
+    // same for any `--mount`ed dir, plus any `--repo` overrides.
+    // Used both to decide whether to bother capturing host gh auth
+    // (no repos → nothing to talk to) and to constrain
+    // api.github.com requests server-side via the intercept hook.
     // --no-git suppresses *automatic* cwd-remote detection but does
     // NOT discard explicit --repo arguments (review #11): a user
     // who passes `--no-git --repo X` clearly wants the explicit
     // allow-list. We do warn so they notice if they didn't mean to.
     let mut allowed_repos: Vec<String> = Vec::new();
     if !args.no_git {
-        allowed_repos.extend(detect_github_repos_in_cwd(&session.project_dir));
+        allowed_repos.extend(detect_github_repos(
+            &session.project_dir,
+            extra_mounts.iter().map(|m| m.host.as_path()),
+        ));
     } else if !args.repo.is_empty() {
         eprintln!(
             "==> --no-git skips cwd remote auto-detection, but --repo overrides are kept ({} entr{})",
@@ -249,6 +277,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         }
     }
     let use_github = !allowed_repos.is_empty();
+    if use_github {
+        eprintln!(
+            "==> GitHub repo scope ({}): {}",
+            allowed_repos.len(),
+            allowed_repos.join(", "),
+        );
+    } else {
+        eprintln!("==> GitHub repo scope: <none> (no api.github.com access)");
+    }
 
     let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
         .context("snapshotting host credentials")?;
@@ -274,28 +311,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // gated on having actually captured a host gh token.
     crate::secrets::write_guest_gh_config(&session.state_dir, creds.gh_token_file.is_some())
         .context("writing guest gh/git config")?;
-
-    // Phase 7: parse `--mount HOST[:GUEST]` extras. The libkrun IRQ
-    // pool is *tight* — empirically the project bind + state bind +
-    // network + agentd + OCI overlay already saturate it on this
-    // build, so any extra mount tends to trip a confusing
-    // `RegisterNetDevice(IrqsExhausted)` at boot. We let the user try
-    // and surface a friendly suggestion if libkrun rejects the
-    // config; we don't pre-cap because libkrun configurations vary.
-    // See discovered upstream issue #3.
-    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
-    for em in &extra_mounts {
-        if !em.host.exists() {
-            anyhow::bail!("--mount host path {:?} does not exist", em.host);
-        }
-    }
-    if !extra_mounts.is_empty() {
-        eprintln!(
-            "==> Note: {} --mount arg(s) — libkrun's virtio IRQ pool is tight; if you see \
-             RegisterNetDevice(IrqsExhausted) at boot, drop a mount or pass --no-git to free a slot.",
-            extra_mounts.len()
-        );
-    }
 
     let is_local_registry = crate::pull::is_plain_http_registry(&image);
     let mut builder = Sandbox::builder(&session.sandbox_name)
@@ -973,39 +988,72 @@ fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
     Ok(out)
 }
 
-/// Parse `git remote -v` in `project_dir` and pull out
-/// `owner/repo` slugs for every github.com remote (https or ssh, with
-/// or without trailing `.git`). Failure modes (no `.git`, not a repo,
-/// non-github remote) just yield an empty list — caller passes
-/// `--repo` to widen.
-fn detect_github_repos_in_cwd(project_dir: &Path) -> Vec<String> {
-    // Hardening (review #6): the user may have just cloned a project
-    // they don't fully trust; running git in that repo before we've
-    // even built the sandbox would otherwise honour core.fsmonitor /
-    // alias.* — host RCE pre-sandbox. Disable the dangerous knobs
-    // and force safe.directory so we don't fail closed on a foreign-
-    // UID checkout. (Note: -c include.path= isn't valid git syntax;
-    // includeIf/include are only honored from files git already
-    // decides to read, which the `-c` flags can't suppress in 2.x,
-    // so we rely on disabling the per-repo *execution* hooks below.)
+/// Build the GitHub repo allow-list by scanning `project_dir` and
+/// each `extra_mount_dir` for:
+///   * every `git remote -v` URL that points at github.com,
+///   * every github.com URL listed in that dir's `.gitmodules`.
+/// Matches main-branch claude-vm.sh:1463-1514 — without this,
+/// `git push` from inside a submodule (or a mounted sibling repo)
+/// would hit api.github.com anonymous and 401.
+///
+/// Failure modes (not a repo, no `.gitmodules`, non-github remote)
+/// just contribute nothing — caller passes `--repo` to widen.
+fn detect_github_repos<'a>(
+    project_dir: &Path,
+    extra_mount_dirs: impl IntoIterator<Item = &'a Path>,
+) -> Vec<String> {
+    let mut slugs: Vec<String> = Vec::new();
+    scan_dir_for_github_slugs(project_dir, &mut slugs);
+
+    // Dedup against the project dir so a mount that *is* the
+    // project dir (or a symlink to it) doesn't re-run the same scan.
+    let project_canon = project_dir.canonicalize().ok();
+    for dir in extra_mount_dirs {
+        if let (Some(pc), Ok(mc)) = (project_canon.as_ref(), dir.canonicalize()) {
+            if &mc == pc {
+                continue;
+            }
+        }
+        scan_dir_for_github_slugs(dir, &mut slugs);
+    }
+    slugs
+}
+
+/// Scan one directory: top-level remotes + one level of submodule
+/// URLs in `.gitmodules`. Submodule scanning is shallow (matches
+/// claude-vm.sh; recursing into each submodule's `.gitmodules`
+/// would balloon scope and add little value in practice).
+fn scan_dir_for_github_slugs(dir: &Path, out: &mut Vec<String>) {
+    for slug in parse_dir_remote_github_slugs(dir) {
+        push_slug_unique(out, slug);
+    }
+    for slug in parse_gitmodules_github_slugs(dir) {
+        push_slug_unique(out, slug);
+    }
+}
+
+fn push_slug_unique(out: &mut Vec<String>, slug: String) {
+    if !out.iter().any(|x| x.eq_ignore_ascii_case(&slug)) {
+        out.push(slug);
+    }
+}
+
+/// `git -C <dir> remote -v` → github slugs. Hardened against a
+/// hostile cwd that might define core.fsmonitor / aliases (review
+/// #6): the user may have just cloned a project they don't fully
+/// trust; running git in that repo before we've even built the
+/// sandbox would otherwise honour repo-local hooks — host RCE
+/// pre-sandbox. Disable the dangerous knobs and force
+/// safe.directory so we don't fail closed on a foreign-UID
+/// checkout. (Note: `-c include.path=` isn't valid git syntax;
+/// includeIf/include are only honored from files git already
+/// decides to read, which `-c` flags can't suppress in 2.x, so we
+/// rely on disabling the per-repo *execution* hooks below.)
+fn parse_dir_remote_github_slugs(dir: &Path) -> Vec<String> {
     let out = std::process::Command::new("git")
-        .args([
-            // Disable repo-local config that runs binaries:
-            "-c", "core.fsmonitor=",
-            "-c", "core.fsmonitorHookVersion=",
-            // Editor/pager fall back to cat — nothing we run here
-            // needs them but a repo `core.pager = !bad-script` would
-            // otherwise fire on `remote -v` output paging.
-            "-c", "core.pager=cat",
-            "-c", "core.editor=:",
-            // Trust the dir even if owned by another UID (we only
-            // read `git remote -v`, no writes).
-            "-c", "safe.directory=*",
-            // Don't fetch anything across this invocation.
-            "-c", "protocol.allow=never",
-            "-C",
-        ])
-        .arg(project_dir)
+        .args(safe_git_config_flags())
+        .args(["-C"])
+        .arg(dir)
         .args(["remote", "-v"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1036,6 +1084,74 @@ fn detect_github_repos_in_cwd(project_dir: &Path) -> Vec<String> {
         }
     }
     slugs
+}
+
+/// Parse `.gitmodules` (INI-style) via `git config -f` — using git
+/// itself avoids reinventing an INI parser AND inherits the same
+/// safe.directory / fsmonitor neutralization. `-f <path>` reads
+/// ONLY that file (no chdir into the repo), so repo-local hooks
+/// can't fire.
+fn parse_gitmodules_github_slugs(dir: &Path) -> Vec<String> {
+    let gitmodules = dir.join(".gitmodules");
+    // `symlink_metadata` (vs `is_file`/`metadata`) deliberately does
+    // NOT follow symlinks. A hostile checkout containing
+    // `.gitmodules -> ~/.config/git/config` (or any out-of-tree path)
+    // would otherwise route the parse at an unrelated host file —
+    // and any stale `submodule.*.url` entries leaking out of it
+    // would silently widen this launch's GitHub scope. The
+    // legitimate `.gitmodules` is always a regular file.
+    match std::fs::symlink_metadata(&gitmodules) {
+        Ok(m) if m.is_file() => {}
+        _ => return Vec::new(),
+    }
+    let out = std::process::Command::new("git")
+        .args(safe_git_config_flags())
+        .args(["config", "-f"])
+        .arg(&gitmodules)
+        .args(["--get-regexp", r"^submodule\..*\.url$"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut slugs: Vec<String> = Vec::new();
+    for line in text.lines() {
+        // line format: "submodule.<name>.url <url>"
+        let url = match line.split_ascii_whitespace().nth(1) {
+            Some(u) => u,
+            None => continue,
+        };
+        if let Some(slug) = parse_github_slug(url) {
+            slugs.push(slug);
+        }
+    }
+    slugs
+}
+
+/// `-c` flags reused by every git invocation we make on
+/// possibly-untrusted host paths. Keeps the hardening identical
+/// across remote/submodule scans.
+fn safe_git_config_flags() -> [&'static str; 12] {
+    [
+        // Disable repo-local config that runs binaries:
+        "-c", "core.fsmonitor=",
+        "-c", "core.fsmonitorHookVersion=",
+        // Editor/pager fall back to cat — nothing we run here
+        // needs them but a repo `core.pager = !bad-script` would
+        // otherwise fire on output paging.
+        "-c", "core.pager=cat",
+        "-c", "core.editor=:",
+        // Trust the dir even if owned by another UID (we only read).
+        "-c", "safe.directory=*",
+        // Don't fetch anything across this invocation.
+        "-c", "protocol.allow=never",
+    ]
 }
 
 /// Pull `owner/repo` from a GitHub remote URL. Returns `None` for
@@ -1070,6 +1186,15 @@ fn parse_github_slug(url: &str) -> Option<String> {
     // would round-trip as `repo` and miss the actual repo name.
     let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
     if repo.is_empty() {
+        return None;
+    }
+    // Reject path-traversal-shaped segments. A URL like
+    // `https://github.com/../attacker/repo` would otherwise yield
+    // the bogus slug `"../attacker"`, which the intercept hook's
+    // path-traversal guard already drops — but it still pollutes
+    // the `==> GitHub repo scope` summary and the `--allowed-repo`
+    // argv with junk that masks malicious .gitmodules entries.
+    if matches!(owner, "." | "..") || matches!(repo, "." | "..") {
         return None;
     }
     Some(format!("{owner}/{repo}"))
@@ -1181,6 +1306,17 @@ mod tests {
         assert_eq!(parse_github_slug("https://github.com/owner/.git"), None);
     }
 
+    #[test]
+    fn parse_github_slug_rejects_dot_and_dotdot_segments() {
+        // A submodule URL like `https://github.com/../attacker/repo`
+        // is shaped like a path-traversal — must not yield a slug.
+        assert_eq!(parse_github_slug("https://github.com/../attacker"), None);
+        assert_eq!(parse_github_slug("https://github.com/owner/.."), None);
+        assert_eq!(parse_github_slug("https://github.com/./repo"), None);
+        assert_eq!(parse_github_slug("https://github.com/owner/."), None);
+        assert_eq!(parse_github_slug("git@github.com:../attacker.git"), None);
+    }
+
     // ── parse_extra_mounts ───────────────────────────────────────
 
     #[test]
@@ -1269,6 +1405,52 @@ mod tests {
         // /tmpfoo is NOT under /tmp/ — must remain safe.
         assert!(guest_path_is_safe(std::path::Path::new("/tmpfoo")));
         assert!(guest_path_is_safe(std::path::Path::new("/run-extra")));
+    }
+
+    // ── detect_github_repos against the live worktree ─────────────
+    //
+    // Exercises the real `git` invocation on the worktree this test
+    // is built in. Skips itself cleanly if the workspace doesn't
+    // have a github origin (e.g. distro packagers building from a
+    // tarball), so it stays useful in the dev tree without being
+    // load-bearing for releases.
+
+    fn workspace_root() -> std::path::PathBuf {
+        // crates/agent-vm/ → workspace root is two levels up.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR has two parents")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn detect_github_repos_includes_submodules() {
+        let root = workspace_root();
+        if !root.join(".gitmodules").is_file() {
+            eprintln!("skipping: no .gitmodules at {root:?}");
+            return;
+        }
+        let slugs = detect_github_repos(&root, std::iter::empty());
+        // The rewrite worktree vendors microsandbox as a submodule.
+        // If origin happens to be non-github (rare), we still expect
+        // the submodule slug.
+        assert!(
+            slugs.iter().any(|s| s.eq_ignore_ascii_case("wirenboard/microsandbox")),
+            "expected wirenboard/microsandbox in scope, got {slugs:?}"
+        );
+    }
+
+    #[test]
+    fn parse_gitmodules_returns_empty_when_file_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-vm-gitmodules-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let slugs = parse_gitmodules_github_slugs(&tmp);
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(slugs.is_empty(), "no .gitmodules → no slugs, got {slugs:?}");
     }
 }
 
