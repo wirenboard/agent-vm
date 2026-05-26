@@ -24,9 +24,19 @@ Docker-in-Docker / nested KVM use cases, so we flip:
 | `CONFIG_KVM=y` | enable the in-kernel KVM hypervisor |
 | `CONFIG_KVM_INTEL=y` | Intel VMX backend |
 | `CONFIG_KVM_AMD=y` | AMD SVM backend |
+| `CONFIG_POSIX_MQUEUE=y` | runc/crun default OCI spec always mounts `/dev/mqueue`; without this every container start fails with `mount mqueue: no such device` |
 
 `olddefconfig` pulls in the rest (`KVM_X86`, `KVM_SMM`, `KVM_HYPERV`,
-`KVM_VFIO`, …) automatically.
+`KVM_VFIO`, `POSIX_MQUEUE_SYSCTL`, …) automatically.
 
 `devtmpfs` and `DEVTMPFS_MOUNT` are already enabled upstream so
 `/dev/kvm` materializes at boot without further config changes.
+
+## Cost of each override
+
+Measured by rebuilding the `.so` from a pristine v5.2.1 checkout with and
+without each hunk (Debian 13 toolchain, gcc 14.2.0):
+
+| change | `bzImage` Δ | stripped `vmlinux` Δ | `libkrunfw.so` Δ | boot Δ |
+|---|---|---|---|---|
+| `+POSIX_MQUEUE` | +12 KB (+0.17%) | +4 KB (+0.02%) | +64 KB (+0.31%, page padding) | none (15-run mean within noise on nested boot) |

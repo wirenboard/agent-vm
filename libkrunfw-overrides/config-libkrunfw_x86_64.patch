@@ -1,5 +1,14 @@
 --- a/config-libkrunfw_x86_64
 +++ b/config-libkrunfw_x86_64
+@@ -51,7 +51,7 @@
+ CONFIG_DEFAULT_HOSTNAME="(none)"
+ CONFIG_SYSVIPC=y
+ CONFIG_SYSVIPC_SYSCTL=y
+-# CONFIG_POSIX_MQUEUE is not set
++CONFIG_POSIX_MQUEUE=y
+ # CONFIG_WATCH_QUEUE is not set
+ CONFIG_CROSS_MEMORY_ATTACH=y
+ # CONFIG_USELIB is not set
 @@ -485,7 +485,7 @@
  
  CONFIG_HAVE_KVM=y
