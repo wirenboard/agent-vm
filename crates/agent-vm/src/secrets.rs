@@ -742,6 +742,28 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
                     "--headless=true",
                     "--isolated=true",
                 ],
+                // Opt out of chrome-devtools-mcp's usage statistics
+                // (sent to Google's Clearcut endpoint). Two reasons,
+                // both matter for an agent-vm sandbox:
+                //  - It spawns a detached watchdog node child purely
+                //    to flush analytics on parent exit
+                //    (`telemetry/WatchdogClient.js`), doubling the
+                //    idle node-process count of this MCP for every
+                //    Claude session — even when no browser tool is
+                //    ever called.
+                //  - Per-tool-call events go to a Google endpoint;
+                //    we don't want a "I edited a file in my sandbox"
+                //    session to silently phone home with the URLs
+                //    and tool names the agent touched.
+                // The wrapper at /usr/local/bin/agent-vm-chrome-mcp
+                // whitelists this name in its sudo `--preserve-env`
+                // list so it propagates into the `chrome` user's
+                // env. `CI=1` would also work (same opt-out path)
+                // but is a less-targeted hammer that other tooling
+                // sniffs for unrelated behaviour changes.
+                "env": {
+                    "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1"
+                },
             }),
         );
     }
@@ -1204,6 +1226,50 @@ mod tests {
         // Our defaults still filled in where the user didn't set them.
         assert_eq!(v["$schema"], "https://opencode.ai/config.json");
         assert_eq!(v["autoupdate"], false);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    // ── write_default_claude_root_state: chrome MCP shape ─────────
+
+    /// The `chrome-devtools` MCP entry must always carry the
+    /// `CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1` env var. Otherwise
+    /// every Claude session starts a detached node "telemetry
+    /// watchdog" child (see chrome-devtools-mcp's WatchdogClient.js)
+    /// purely to ship usage events to Google's Clearcut endpoint —
+    /// extra idle process per session AND a covert phone-home from a
+    /// supposedly-sandboxed environment. Both regress easily on a
+    /// refactor of the json! literal, hence this guard.
+    #[test]
+    fn chrome_mcp_entry_disables_telemetry_watchdog() {
+        // Skip if the caller is explicitly opting OUT of the chrome
+        // MCP — that path removes the entry entirely and there's
+        // nothing to assert.
+        if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
+            return;
+        }
+        let tmpdir = std::env::temp_dir().join(format!(
+            "agent-vm-claude-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("claude.json");
+
+        write_default_claude_root_state(&path, "/workspace/proj").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+
+        let chrome = &v["mcpServers"]["chrome-devtools"];
+        assert!(chrome.is_object(), "chrome-devtools entry missing");
+        assert_eq!(
+            chrome["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"], "1",
+            "telemetry watchdog must be disabled — got {}",
+            chrome
+        );
 
         std::fs::remove_dir_all(&tmpdir).ok();
     }
