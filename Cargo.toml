@@ -6,7 +6,7 @@ members = ["crates/agent-vm"]
 exclude = ["vendor/microsandbox"]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
