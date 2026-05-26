@@ -1244,20 +1244,21 @@ mod tests {
     fn chrome_mcp_entry_disables_telemetry_watchdog() {
         // Skip if the caller is explicitly opting OUT of the chrome
         // MCP — that path removes the entry entirely and there's
-        // nothing to assert.
+        // nothing to assert. eprintln so a dev who has the var set
+        // in their shell can see the test was a no-op rather than
+        // mistakenly believing the regression guard ran green.
         if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
+            eprintln!(
+                "SKIP chrome_mcp_entry_disables_telemetry_watchdog: AGENT_VM_NO_CHROME_MCP set in env"
+            );
             return;
         }
-        let tmpdir = std::env::temp_dir().join(format!(
-            "agent-vm-claude-root-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&tmpdir).unwrap();
-        let path = tmpdir.join("claude.json");
+        // tempfile (vs hand-rolled std::env::temp_dir() + PID + nanos)
+        // gives RAII cleanup on assertion-panic and a guaranteed-unique
+        // mkdtemp — both useful when this test fires under flaky
+        // conditions (concurrent test bins, clock-skewed CI).
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let path = tmpdir.path().join("claude.json");
 
         write_default_claude_root_state(&path, "/workspace/proj").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -1270,7 +1271,5 @@ mod tests {
             "telemetry watchdog must be disabled — got {}",
             chrome
         );
-
-        std::fs::remove_dir_all(&tmpdir).ok();
     }
 }
