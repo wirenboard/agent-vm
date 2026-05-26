@@ -18,7 +18,7 @@
  CONFIG_AS_AVX512=y
  CONFIG_AS_SHA1_NI=y
  CONFIG_AS_SHA256_NI=y
-@@ -2389,3 +2389,36 @@
+@@ -2389,3 +2389,53 @@
  #
  # end of Rust hacking
  # end of Kernel hacking
@@ -55,3 +55,20 @@
 +CONFIG_LLC=y
 +CONFIG_STP=y
 +CONFIG_VLAN_8021Q=y
++
++# nf_tables backend — debian's default `iptables` alternative is
++# `iptables-nft`, so without these the user has to manually
++# `update-alternatives --set iptables iptables-legacy` before
++# dockerd's iptables rules will apply. NFT_COMPAT lets the
++# xtables-nft userspace translate `-j MASQUERADE` into native nft.
++CONFIG_NF_TABLES=y
++CONFIG_NF_TABLES_INET=y
++CONFIG_NF_TABLES_IPV4=y
++CONFIG_NF_TABLES_IPV6=y
++CONFIG_NFT_NAT=y
++CONFIG_NFT_MASQ=y
++CONFIG_NFT_REDIR=y
++CONFIG_NFT_CT=y
++CONFIG_NFT_LOG=y
++CONFIG_NFT_LIMIT=y
++CONFIG_NFT_COMPAT=y

@@ -24,6 +24,7 @@ Docker-in-Docker / nested KVM use cases, so we flip:
 | `CONFIG_KVM=y` + `CONFIG_KVM_INTEL=y` + `CONFIG_KVM_AMD=y` | in-kernel KVM hypervisor for nested KVM use cases |
 | `CONFIG_POSIX_MQUEUE=y` | runc/crun default OCI spec always mounts `/dev/mqueue`; without it every container start fails with `mount mqueue: no such device` |
 | netfilter + bridge family (`NETFILTER`, `NF_CONNTRACK`, `NF_NAT`, `IP_NF_*`, `IP6_NF_*`, `BRIDGE`, `BRIDGE_NETFILTER`, `VLAN_8021Q`, …) | docker/podman `--network=bridge` (the default) needs iptables and the bridge driver to set up `docker0` + SNAT. Without these the daemon starts but every container start fails on `Table does not exist` |
+| `nf_tables` family (`NF_TABLES`, `NFT_NAT`, `NFT_MASQ`, `NFT_CT`, `NFT_COMPAT`, …) | debian's default `iptables` alternative is `iptables-nft`, which talks to the kernel via nf_tables instead of ip_tables; without these the user has to flip `update-alternatives --set iptables iptables-legacy` first |
 
 `olddefconfig` pulls in the rest of each cascade (`KVM_X86`, `KVM_SMM`,
 `KVM_HYPERV`, `KVM_VFIO`, `POSIX_MQUEUE_SYSCTL`, `NETFILTER_NETLINK`,
@@ -43,6 +44,8 @@ hunk added incrementally (Debian 13 toolchain, gcc 14.2.0). Boot time is
 | baseline (just `+KVM`) | 7,431 KB | 21,300 KB | 1.015 s |
 | `+POSIX_MQUEUE` | +12 KB | +64 KB (page padding) | +2 ms |
 | `+netfilter + bridge` | +348 KB | +0 (still fits in mqueue's page) | +5 ms |
+| `+nf_tables / NFT_*` | +8 KB | +64 KB (next page) | +3 ms |
+| **all overrides** | **+368 KB (+5%)** | **+128 KB (+0.6%)** | **+10 ms (~1%)** |
 
 The shipped `.so` is what affects npm-package size and `agent-vm setup` cold-pull
 time; the `bzImage` figure is informational. Boot-time deltas were all within
