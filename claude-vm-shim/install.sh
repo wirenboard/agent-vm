@@ -19,8 +19,11 @@ bindir="${HOME}/.local/bin"
 shim="${here}/target/release/libclaude_vm_shim.so"
 dispatcher="${here}/target/release/claude-vm-dispatcher"
 bridge="${here}/target/release/claude-vm-bridge"
-if [ ! -x "$shim" ] || [ ! -x "$dispatcher" ] || [ ! -x "$bridge" ]; then
+# .so doesn't need the exec bit; bins do. Use -f for the lib and -x for bins.
+if [ ! -f "$shim" ] || [ ! -x "$dispatcher" ] || [ ! -x "$bridge" ]; then
     echo "build artifacts missing — run \`cargo build --release\` from ${here} first" >&2
+    echo "found:" >&2
+    ls -la "$shim" "$dispatcher" "$bridge" 2>&1 | sed 's/^/  /' >&2
     exit 1
 fi
 
@@ -41,6 +44,9 @@ mkdir -p "$target_root/bin" "$target_root/lib" "$bindir"
 install -m 0755 "$shim" "$target_root/lib/libclaude_vm_shim.so"
 install -m 0755 "$dispatcher" "$target_root/bin/claude-vm-dispatcher"
 install -m 0755 "$bridge" "$target_root/bin/claude-vm-bridge"
+# Copy the wrapper into the install prefix so we don't depend on source-tree
+# permissions (overlay FS sometimes strips the exec bit).
+install -m 0755 "${here}/wrapper/claude-wrapper.sh" "$target_root/bin/claude-wrapper.sh"
 
 # Render the wrapper with bound paths so users can run it without setting envs.
 cat > "$target_root/bin/claude-shimmed" <<EOF
@@ -48,7 +54,7 @@ cat > "$target_root/bin/claude-shimmed" <<EOF
 export CLAUDE_VM_SHIM_REAL_CLAUDE="${real_claude}"
 export CLAUDE_VM_SHIM_SO="${target_root}/lib/libclaude_vm_shim.so"
 export CLAUDE_VM_SHIM_DISPATCHER="${target_root}/bin/claude-vm-dispatcher"
-exec "${here}/wrapper/claude-wrapper.sh" "\$@"
+exec "${target_root}/bin/claude-wrapper.sh" "\$@"
 EOF
 chmod 0755 "$target_root/bin/claude-shimmed"
 

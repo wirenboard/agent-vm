@@ -106,12 +106,21 @@ impl CArgv {
 /// Returns Some((dispatcher_path, new_argv)) if this exec call should be
 /// redirected through the dispatcher. The new_argv is: [dispatcher, original_path, original_argv[1..]].
 fn maybe_redirect(path_c: &CStr, argv: &[CString]) -> Option<(CString, Vec<CString>)> {
-    // Match: argv[1] == "--bg-spare".
     if argv.len() < 2 {
         return None;
     }
     let arg1 = argv[1].to_string_lossy();
-    if arg1 != "--bg-spare" {
+
+    // Match either:
+    //   * `claude --bg-spare <sock>` (the `claude --bg` machinery), OR
+    //   * `claude --print --sdk-url <url> --session-id <id> …` (cloud sessions
+    //     opened via `claude remote-control`).
+    //
+    // The two paths use very different protocols (UDS handshake vs. JSON-stream
+    // over stdio) but both need to land inside a fresh agent-vm.
+    let is_bg_spare = arg1 == "--bg-spare";
+    let is_cloud_session = arg1 == "--print" && argv.iter().any(|a| a.to_bytes() == b"--sdk-url");
+    if !is_bg_spare && !is_cloud_session {
         return None;
     }
 
@@ -119,10 +128,15 @@ fn maybe_redirect(path_c: &CStr, argv: &[CString]) -> Option<(CString, Vec<CStri
     let dispatcher = match std::env::var("CLAUDE_VM_SHIM_DISPATCHER") {
         Ok(p) if !p.is_empty() => p,
         _ => {
-            debug_log("CLAUDE_VM_SHIM_DISPATCHER not set; passing through --bg-spare");
+            debug_log("CLAUDE_VM_SHIM_DISPATCHER not set; passing through");
             return None;
         }
     };
+    debug_log(&format!(
+        "intercept: {} (path={:?})",
+        if is_bg_spare { "--bg-spare" } else { "--print --sdk-url" },
+        path_c.to_string_lossy()
+    ));
     let dispatcher_c = match CString::new(dispatcher.clone()) {
         Ok(c) => c,
         Err(_) => return None,

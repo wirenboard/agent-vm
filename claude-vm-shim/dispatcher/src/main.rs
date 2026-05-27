@@ -105,40 +105,64 @@ fn main() {
         passthrough_local_claude(original_claude, forwarded);
     }
 
-    // Expect argv[2] == "--bg-spare", argv[3] == claim sock path.
-    if forwarded.first().map(|s| s.as_os_str()) != Some(OsStr::new("--bg-spare")) {
-        debug_log("argv[2] is not --bg-spare; passing through");
-        passthrough_local_claude(original_claude, forwarded);
-    }
-    let claim_sock_host = match forwarded.get(1) {
-        Some(s) => PathBuf::from(s),
-        None => {
-            debug_log("missing claim sock path; passing through");
-            passthrough_local_claude(original_claude, forwarded);
+    // Two modes:
+    //   * `--bg-spare <sock>` → claim-sock UDS handshake (claude --bg path)
+    //   * `--print --sdk-url <url> …` → JSON-stream over stdio (remote-control)
+    let mode_arg = forwarded.first().map(|s| s.as_os_str());
+    if mode_arg == Some(OsStr::new("--bg-spare")) {
+        let claim_sock_host = match forwarded.get(1) {
+            Some(s) => PathBuf::from(s),
+            None => {
+                debug_log("missing claim sock path; passing through");
+                passthrough_local_claude(original_claude, forwarded);
+            }
+        };
+        let extra_args: Vec<OsString> = forwarded.iter().skip(2).cloned().collect();
+        if !extra_args.is_empty() {
+            debug_log(&format!(
+                "warn: {} extra args after claim sock (unused in VM mode): {:?}",
+                extra_args.len(),
+                extra_args
+            ));
         }
-    };
-    let extra_args: Vec<OsString> = forwarded.iter().skip(2).cloned().collect();
+        match run_vm_session(&claim_sock_host) {
+            Ok(()) => {
+                debug_log("VM session finished cleanly");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                debug_log(&format!(
+                    "VM session failed: {e}; falling back to passthrough"
+                ));
+                eprintln!("claude-vm-dispatcher: {e}");
+                passthrough_local_claude(original_claude, forwarded);
+            }
+        }
+    }
 
-    if !extra_args.is_empty() {
-        debug_log(&format!(
-            "warn: {} extra args after claim sock (unused in VM mode): {:?}",
-            extra_args.len(),
-            extra_args
-        ));
+    if mode_arg == Some(OsStr::new("--print"))
+        && forwarded.iter().any(|s| s == "--sdk-url")
+    {
+        // Cloud session opened via `claude remote-control`. No UDS — just
+        // pipe stdio through agent-vm into an in-VM claude that speaks the
+        // same `--print --sdk-url ...` protocol.
+        match run_vm_cloud_session(original_claude.clone(), &forwarded) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                debug_log(&format!(
+                    "cloud session failed: {e}; falling back to passthrough"
+                ));
+                eprintln!("claude-vm-dispatcher: {e}");
+                passthrough_local_claude(original_claude, forwarded);
+            }
+        }
     }
 
-    // Run the VM session.
-    match run_vm_session(&claim_sock_host) {
-        Ok(()) => {
-            debug_log("VM session finished cleanly");
-            std::process::exit(0);
-        }
-        Err(e) => {
-            debug_log(&format!("VM session failed: {e}; falling back to passthrough"));
-            eprintln!("claude-vm-dispatcher: {e}");
-            passthrough_local_claude(original_claude, forwarded);
-        }
-    }
+    debug_log(&format!(
+        "no known intercept mode (argv[2]={:?}); passing through",
+        mode_arg.map(|s| s.to_string_lossy().into_owned())
+    ));
+    passthrough_local_claude(original_claude, forwarded);
 }
 
 fn run_vm_session(claim_sock_host: &std::path::Path) -> std::io::Result<()> {
@@ -341,6 +365,90 @@ fn run_vm_session(claim_sock_host: &std::path::Path) -> std::io::Result<()> {
     debug_log(&format!("agent-vm exited: {status:?}"));
 
     Ok(())
+}
+
+/// Cloud-session mode (`claude remote-control` dispatch).
+///
+/// The host's `remote-control` parent already spawned us with the cloud
+/// session arguments — `--print --sdk-url <cse url> --session-id <id>
+/// --input-format stream-json --output-format stream-json [...]`. Our job
+/// is to run the *same* `claude` command inside a fresh agent-vm, piping
+/// our inherited stdio through to it.
+///
+/// Returns the in-VM claude's exit code so the rc parent sees a faithful
+/// result.
+fn run_vm_cloud_session(
+    original_claude: PathBuf,
+    forwarded: &[OsString],
+) -> std::io::Result<i32> {
+    debug_log(&format!(
+        "cloud session begin: {} forwarded args",
+        forwarded.len()
+    ));
+
+    // Per-dispatcher VM workdir so each session gets its own state dir.
+    let workdir_root = std::env::var("CLAUDE_VM_SHIM_WORKDIR_ROOT")
+        .unwrap_or_else(|_| "/tmp/claude-vm-shim-work".to_string());
+    let vm_workdir = format!("{workdir_root}/{}", std::process::id());
+    let _ = std::fs::create_dir_all(&vm_workdir);
+
+    let agent_vm = match std::env::var("CLAUDE_VM_SHIM_AGENT_VM_BIN") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            let candidates = [
+                "/opt/claude-vm-shim/bin/agent-vm",
+                "/usr/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/agent-vm",
+                "/usr/local/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/agent-vm",
+                "/usr/bin/agent-vm",
+                "/usr/local/bin/agent-vm",
+            ];
+            candidates
+                .iter()
+                .find(|p| std::path::Path::new(p).is_file())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "agent-vm".to_string())
+        }
+    };
+    let msb_path = std::env::var("CLAUDE_VM_SHIM_MSB_PATH").unwrap_or_else(|_| {
+        "/usr/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/msb".to_string()
+    });
+
+    // Forward the verbatim claude argv to `agent-vm claude -- <args>`. Drop
+    // argv[0]; agent-vm prepends `claude` itself.
+    let mut cmd = Command::new(&agent_vm);
+    cmd.env("AGENT_VM_ALLOW_LOCAL_EGRESS", "1")
+        .env("MSB_PATH", &msb_path)
+        .arg("claude")
+        .arg("--no-git")
+        .current_dir(&vm_workdir)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .arg("--");
+    for a in forwarded {
+        cmd.arg(a);
+    }
+    debug_log(&format!(
+        "spawning agent-vm claude --no-git -- {:?} (cwd={vm_workdir})",
+        forwarded
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    ));
+
+    let _ = original_claude; // (currently unused; reserved for path translation)
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| std::io::Error::other(format!("spawn agent-vm: {e}")))?;
+    debug_log(&format!("agent-vm child pid={}", child.id()));
+
+    let status = child
+        .wait()
+        .map_err(|e| std::io::Error::other(format!("wait for agent-vm: {e}")))?;
+    let code = status.code().unwrap_or(1);
+    debug_log(&format!("cloud session exit: {status:?} → code={code}"));
+    Ok(code)
 }
 
 fn accept_uds_with_timeout(
