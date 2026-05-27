@@ -285,6 +285,212 @@ pub fn refresh(
     })
 }
 
+/// Author identity to bake into the guest's `~/.gitconfig` so commits
+/// made *inside* the VM are attributed to the real user, not the
+/// `agent-vm` placeholder. Resolved from the host by
+/// [`discover_host_git_identity`].
+#[derive(Debug, Clone)]
+pub struct HostGitIdentity {
+    pub name: String,
+    pub email: String,
+    /// gh login (e.g. `evgeny-boger`). Used to populate
+    /// `gh-config/hosts.yml` `user:` field — kept distinct from `name`
+    /// because gh's local `user:` is a *login*, not a display name.
+    /// `None` when the identity came from host gitconfig fallback.
+    pub gh_login: Option<String>,
+}
+
+/// Best-effort discovery of the user's git author identity *from the
+/// host*. Tries `gh api user` first (most reliable — bypasses any
+/// host-side `git config user.*` that itself was left behind by a
+/// previous nested agent-vm). Falls back to the host's `git config
+/// --global user.name/email` if gh isn't available.
+///
+/// Returns `None` if neither source yields a usable identity; in that
+/// case the guest gitconfig is written without a `[user]` section,
+/// which makes git refuse to commit rather than silently attribute to
+/// `agent-vm`.
+pub fn discover_host_git_identity() -> Option<HostGitIdentity> {
+    if let Some(id) = gh_api_user_identity() {
+        return Some(id);
+    }
+    host_git_config_identity()
+}
+
+/// Cap on how long we'll wait for `gh api user`. The call is an HTTPS
+/// round-trip to api.github.com; on a flaky network gh's own retries
+/// can stall launch for tens of seconds with no progress output, so
+/// we bound it tightly and fall through to the local gitconfig.
+const GH_API_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run `gh api user` on the host and parse the response. Bounded by
+/// [`GH_API_USER_TIMEOUT`] — if gh hangs (offline, captive portal,
+/// hung credential helper) we abandon and let the caller fall back
+/// to host gitconfig.
+fn gh_api_user_identity() -> Option<HostGitIdentity> {
+    let cmd = std::process::Command::new("gh");
+    let out = spawn_with_timeout(cmd, &["api", "user"], GH_API_USER_TIMEOUT)?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_gh_user_json(&out.stdout)
+}
+
+/// Spawn a subprocess with stdin closed and stdout/stderr piped, then
+/// wait up to `timeout` for completion. On timeout, send SIGKILL by
+/// pid and return None; the reader thread will observe child exit
+/// and clean up its end.
+///
+/// Returns `None` if spawn fails, the process can't be waited on, or
+/// the timeout elapses.
+fn spawn_with_timeout(
+    mut cmd: std::process::Command,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::sync::mpsc;
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().ok()?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        // `wait_with_output` consumes the child; if the outer thread
+        // hit timeout and killed pid, this returns promptly.
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(out)) => Some(out),
+        _ => {
+            // Best-effort kill. PID reuse window is microseconds; the
+            // child we just spawned is overwhelmingly the right one.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            None
+        }
+    }
+}
+
+/// Pure parser for the `gh api user` JSON response. Split out so it
+/// can be unit-tested against representative GitHub payloads (public
+/// email, hidden email, missing name, …) without spawning `gh`.
+fn parse_gh_user_json(bytes: &[u8]) -> Option<HostGitIdentity> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let login_raw = json.get("login")?.as_str()?.trim();
+    if !is_valid_gh_login(login_raw) {
+        return None;
+    }
+    let login = login_raw.to_string();
+    // GitHub user ids are u64 on the wire; `as_u64` handles the full
+    // range. (Previously used `as_i64` with a comment claiming a 2^53
+    // limit, conflating JSON-as-double with i64.) Used to synthesize
+    // the noreply email when `email` is private.
+    let id = json.get("id").and_then(|v| v.as_u64());
+    let name_raw = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(login_raw);
+    if !is_config_safe(name_raw) {
+        return None;
+    }
+    // GitHub returns `email: null` when the user has email privacy on.
+    // The `<id>+<login>@users.noreply.github.com` form is the
+    // canonical no-leak address GitHub itself recommends for commits.
+    let email_raw_owned: String = match json.get("email").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => format!("{}+{}@users.noreply.github.com", id?, login_raw),
+    };
+    if !is_config_safe(&email_raw_owned) {
+        return None;
+    }
+    Some(HostGitIdentity {
+        name: name_raw.to_string(),
+        email: email_raw_owned,
+        gh_login: Some(login),
+    })
+}
+
+/// Fallback: read `user.name`/`user.email` from the host's
+/// `~/.gitconfig`. Filters out the very placeholder this module
+/// previously wrote (the nested-agent-vm case): without the filter,
+/// a VM-inside-a-VM would inherit `agent-vm`/`agent-vm@msb.local`
+/// transitively, defeating the fix.
+fn host_git_config_identity() -> Option<HostGitIdentity> {
+    let name = git_global_value("user.name")?;
+    let email = git_global_value("user.email")?;
+    if name == "agent-vm" && email == "agent-vm@msb.local" {
+        return None;
+    }
+    // Same gitconfig-injection guard as the gh path — host gitconfig
+    // is normally clean, but a poisoned `~/.gitconfig` (or a value
+    // surreptitiously set by another tool) shouldn't be able to
+    // smuggle in new sections via `\n[core]…`.
+    if !is_config_safe(&name) || !is_config_safe(&email) {
+        return None;
+    }
+    Some(HostGitIdentity {
+        name,
+        email,
+        gh_login: None,
+    })
+}
+
+fn git_global_value(key: &str) -> Option<String> {
+    let cmd = std::process::Command::new("git");
+    // Local read on the host gitconfig — a 1s timeout is generous
+    // even on slow disks, and bounds the worst case if git itself
+    // hangs (e.g. a `core.editor` hook misbehaving in a credential
+    // helper triggered by config read).
+    let out = spawn_with_timeout(
+        cmd,
+        &["config", "--global", "--get", key],
+        std::time::Duration::from_secs(1),
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    // Git config values are byte strings — a user.name in Latin-1 or
+    // any non-UTF-8 encoding (legitimate on legacy dev boxes) would
+    // make a strict `from_utf8` return None and drop the identity.
+    // Lossy decode preserves the value; downstream `is_config_safe`
+    // still rejects control chars.
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// True iff `s` is safe to interpolate into a gitconfig value or YAML
+/// scalar without escaping. We reject any ASCII control character —
+/// in particular `\n`/`\r`, which would terminate the current value
+/// and allow injection of a new gitconfig section / hosts.yml field.
+/// Tab is also rejected since gitconfig uses leading-tab as the
+/// key/value indent and we'd rather refuse than confuse the parser.
+///
+/// This is intentionally conservative — printable unicode (including
+/// `[`, `]`, `=`, quotes, non-ASCII) is allowed, because those are
+/// harmless inside a `key = VALUE` line whose terminator is a
+/// newline.
+fn is_config_safe(s: &str) -> bool {
+    !s.is_empty() && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// GitHub logins are constrained to `[A-Za-z0-9-]`, max 39 chars, no
+/// leading/trailing hyphen. We enforce that before interpolating the
+/// login into `hosts.yml` (or the noreply email), so a future API
+/// surprise can't smuggle in a colon, newline, or other YAML-breaking
+/// character.
+fn is_valid_gh_login(s: &str) -> bool {
+    if s.is_empty() || s.len() > 39 || s.starts_with('-') || s.ends_with('-') {
+        return false;
+    }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Capture `gh auth token` from the host into a 0600 file under
 /// `<state>.secrets/gh`. Returns `None` if `gh` isn't installed or the
 /// user isn't logged in. The proxy substitutes `GH_TOKEN_PLACEHOLDER`
@@ -791,17 +997,26 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
 /// via the existing bind mount + symlinks (see run.rs patch builder).
 ///
 /// - `<state>/gitconfig` → symlinked to `/root/.gitconfig` in the
-///   guest. Always contains `safe.directory = *`. When the host has
-///   gh auth, also contains a `credential.helper` that echoes
-///   `username=x-access-token` / `password=<placeholder>` so
-///   `git push` to GitHub goes out as
+///   guest. Always contains `safe.directory = *`. When `identity` is
+///   `Some`, also contains a `[user]` section so in-VM commits carry
+///   the host's real author. When the host has gh auth, also contains
+///   a `credential.helper` that echoes `username=x-access-token` /
+///   `password=<placeholder>` so `git push` to GitHub goes out as
 ///   `Authorization: Basic base64(x-access-token:placeholder)`, which
 ///   the proxy substitutes on the wire.
 /// - `<state>/gh-config/hosts.yml` → symlinked to `/root/.config/gh`
 ///   in the guest. Only written when `has_gh_token`; the placeholder
 ///   is what gh CLI sends and the proxy substitutes outbound to
 ///   api.github.com.
-pub fn write_guest_gh_config(state_dir: &Path, has_gh_token: bool) -> Result<()> {
+///
+/// Omitting `[user]` when `identity` is `None` is deliberate: git
+/// will refuse to commit with "Please tell me who you are", which is
+/// strictly better than silently committing as `agent-vm`.
+pub fn write_guest_gh_config(
+    state_dir: &Path,
+    has_gh_token: bool,
+    identity: Option<&HostGitIdentity>,
+) -> Result<()> {
     // safe.directory = * is unconditional: the guest IS the security
     // boundary (microVM), so trusting every path is fine and git
     // operating on the host-bind-mounted project requires it. Use
@@ -809,11 +1024,15 @@ pub fn write_guest_gh_config(state_dir: &Path, has_gh_token: bool) -> Result<()>
     // listing every path.
     let mut gitconfig = String::from(
         "[safe]\n\
-         \tdirectory = *\n\
-         [user]\n\
-         \tname = agent-vm\n\
-         \temail = agent-vm@msb.local\n",
+         \tdirectory = *\n",
     );
+    if let Some(id) = identity {
+        gitconfig.push_str(&format!(
+            "[user]\n\tname = {name}\n\temail = {email}\n",
+            name = id.name,
+            email = id.email,
+        ));
+    }
     if has_gh_token {
         // git's credential helper for github.com pushes/clones. The
         // helper is a shell snippet; git invokes it with `get` and
@@ -831,13 +1050,21 @@ pub fn write_guest_gh_config(state_dir: &Path, has_gh_token: bool) -> Result<()>
     atomic_write(&state_dir.join("gitconfig"), gitconfig.as_bytes(), 0o600)?;
 
     if has_gh_token {
+        // The `user:` field in gh's hosts.yml is a local *login*
+        // annotation (shows up in `gh auth status`); use the real
+        // login if we have one, otherwise fall back to a literal
+        // that won't be confused for a real user.
+        let gh_user = identity
+            .and_then(|id| id.gh_login.as_deref())
+            .unwrap_or("agent-vm");
         let gh_dir = state_dir.join("gh-config");
         std::fs::create_dir_all(&gh_dir)?;
         let hosts_yml = format!(
             "github.com:\n\
-             \\x20\\x20user: agent-vm\n\
+             \\x20\\x20user: {gh_user}\n\
              \\x20\\x20oauth_token: {tok}\n\
              \\x20\\x20git_protocol: https\n",
+            gh_user = gh_user,
             tok = GH_TOKEN_PLACEHOLDER,
         )
         .replace("\\x20", " ");
@@ -1271,5 +1498,209 @@ mod tests {
             "telemetry watchdog must be disabled — got {}",
             chrome
         );
+    }
+
+    // ── write_guest_gh_config identity wiring ─────────────────────
+
+    #[test]
+    fn write_guest_gh_config_omits_user_section_when_identity_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_guest_gh_config(dir.path(), false, None).unwrap();
+        let cfg = std::fs::read_to_string(dir.path().join("gitconfig")).unwrap();
+        assert!(cfg.contains("[safe]"));
+        assert!(
+            !cfg.contains("[user]"),
+            "no identity means no [user] section, so git refuses to commit \
+             rather than mis-attribute (got: {cfg:?})"
+        );
+        // Make sure the legacy placeholder is *not* written anywhere.
+        assert!(!cfg.contains("agent-vm@msb.local"));
+    }
+
+    #[test]
+    fn write_guest_gh_config_writes_user_section_from_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = HostGitIdentity {
+            name: "Evgeny Boger".into(),
+            email: "boger@example.com".into(),
+            gh_login: Some("evgeny-boger".into()),
+        };
+        write_guest_gh_config(dir.path(), true, Some(&id)).unwrap();
+        let cfg = std::fs::read_to_string(dir.path().join("gitconfig")).unwrap();
+        assert!(cfg.contains("name = Evgeny Boger"), "got: {cfg:?}");
+        assert!(cfg.contains("email = boger@example.com"), "got: {cfg:?}");
+        // Credential helper still wired up when has_gh_token=true.
+        assert!(cfg.contains("credential \"https://github.com\""));
+
+        let hosts = std::fs::read_to_string(dir.path().join("gh-config/hosts.yml")).unwrap();
+        assert!(
+            hosts.contains("user: evgeny-boger"),
+            "hosts.yml user: should be the gh login, not the display name (got: {hosts:?})"
+        );
+    }
+
+    // ── parse_gh_user_json ────────────────────────────────────────
+
+    #[test]
+    fn parse_gh_user_json_public_email_path() {
+        // The common case: user has a public email — use it verbatim.
+        let payload = br#"{"login":"evgeny-boger","id":1755320,"name":"Evgeny Boger","email":"boger@wirenboard.com"}"#;
+        let id = parse_gh_user_json(payload).expect("parse");
+        assert_eq!(id.name, "Evgeny Boger");
+        assert_eq!(id.email, "boger@wirenboard.com");
+        assert_eq!(id.gh_login.as_deref(), Some("evgeny-boger"));
+    }
+
+    #[test]
+    fn parse_gh_user_json_hidden_email_falls_back_to_noreply() {
+        // Email privacy on → `email: null`. We synthesize the noreply
+        // form GitHub itself recommends so commits still attribute
+        // correctly without leaking the user's real address.
+        let payload = br#"{"login":"octocat","id":583231,"name":"The Octocat","email":null}"#;
+        let id = parse_gh_user_json(payload).expect("parse");
+        assert_eq!(id.name, "The Octocat");
+        assert_eq!(id.email, "583231+octocat@users.noreply.github.com");
+        assert_eq!(id.gh_login.as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn parse_gh_user_json_missing_name_falls_back_to_login() {
+        // `name` is optional on GitHub profiles; commits should still
+        // get a sensible attribution rather than `null`.
+        let payload = br#"{"login":"ghost","id":10137,"name":null,"email":null}"#;
+        let id = parse_gh_user_json(payload).expect("parse");
+        assert_eq!(id.name, "ghost");
+        assert_eq!(id.email, "10137+ghost@users.noreply.github.com");
+    }
+
+    #[test]
+    fn parse_gh_user_json_rejects_empty_login() {
+        // Defensive: an empty login would produce a structurally
+        // valid but useless identity. Treat as no-identity.
+        let payload = br#"{"login":"","id":1,"name":"X","email":"x@example.com"}"#;
+        assert!(parse_gh_user_json(payload).is_none());
+    }
+
+    #[test]
+    fn parse_gh_user_json_rejects_garbage() {
+        assert!(parse_gh_user_json(b"not json").is_none());
+        assert!(parse_gh_user_json(b"{}").is_none());
+        assert!(parse_gh_user_json(b"").is_none());
+    }
+
+    #[test]
+    fn parse_gh_user_json_hidden_email_without_id_yields_none() {
+        // If both email and id are missing/null, we have no usable
+        // address — return None so the caller can fall back further.
+        let payload = br#"{"login":"weird","name":"Weird","email":null}"#;
+        assert!(parse_gh_user_json(payload).is_none());
+    }
+
+    #[test]
+    fn write_guest_gh_config_hosts_yml_uses_placeholder_user_without_login() {
+        // Host gitconfig fallback path: identity has no gh_login.
+        // hosts.yml is only written when has_gh_token=true, so this
+        // pairing is rare in practice but still legitimate.
+        let dir = tempfile::tempdir().unwrap();
+        let id = HostGitIdentity {
+            name: "Some User".into(),
+            email: "u@example.com".into(),
+            gh_login: None,
+        };
+        write_guest_gh_config(dir.path(), true, Some(&id)).unwrap();
+        let hosts = std::fs::read_to_string(dir.path().join("gh-config/hosts.yml")).unwrap();
+        assert!(hosts.contains("user: agent-vm"), "got: {hosts:?}");
+    }
+
+    // ── injection guards ──────────────────────────────────────────
+
+    #[test]
+    fn parse_gh_user_json_rejects_newline_in_name() {
+        // The exact attack we're guarding against: a display name
+        // containing `\n[core]\n\tpager = …` would inject a [core]
+        // section into the guest gitconfig. is_config_safe rejects
+        // any ASCII control byte, so parse_gh_user_json returns None
+        // and the caller falls through to the host gitconfig.
+        let payload = br#"{"login":"x","id":1,"name":"Foo\n[core]\n\tpager = bad","email":"a@b"}"#;
+        assert!(parse_gh_user_json(payload).is_none());
+    }
+
+    #[test]
+    fn parse_gh_user_json_rejects_newline_in_email() {
+        let payload = br#"{"login":"x","id":1,"name":"OK","email":"a@b\n[user]\nname=evil"}"#;
+        assert!(parse_gh_user_json(payload).is_none());
+    }
+
+    #[test]
+    fn parse_gh_user_json_rejects_invalid_login() {
+        // Colon, slash, leading dash, length > 39 — all rejected so
+        // hosts.yml interpolation can't smuggle in extra YAML fields
+        // (`user: foo\n  oauth_token: stolen`).
+        for bad in [
+            r#"{"login":"foo:bar","id":1,"name":"X","email":"x@y"}"#,
+            r#"{"login":"-leading","id":1,"name":"X","email":"x@y"}"#,
+            r#"{"login":"trailing-","id":1,"name":"X","email":"x@y"}"#,
+            r#"{"login":"a/b","id":1,"name":"X","email":"x@y"}"#,
+            // 40 chars (max is 39)
+            r#"{"login":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":1,"name":"X","email":"x@y"}"#,
+        ] {
+            assert!(
+                parse_gh_user_json(bad.as_bytes()).is_none(),
+                "expected None for: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_gh_user_json_accepts_unicode_name() {
+        // Non-ASCII printable chars are fine — only control bytes
+        // are rejected.
+        let payload = "{\"login\":\"u\",\"id\":1,\"name\":\"Évgeny Бoger 你好\",\"email\":\"a@b\"}";
+        let id = parse_gh_user_json(payload.as_bytes()).expect("parse");
+        assert_eq!(id.name, "Évgeny Бoger 你好");
+    }
+
+    #[test]
+    fn parse_gh_user_json_handles_large_user_id() {
+        // u64 user ids above i64::MAX would have been silently
+        // dropped by the old `as_i64` path; the noreply fallback
+        // must still work.
+        let payload = br#"{"login":"big","id":18446744073709551610,"name":null,"email":null}"#;
+        let id = parse_gh_user_json(payload).expect("parse");
+        assert_eq!(id.email, "18446744073709551610+big@users.noreply.github.com");
+    }
+
+    #[test]
+    fn is_config_safe_classifications() {
+        // Accept printable ASCII, common symbols, unicode.
+        assert!(is_config_safe("Evgeny Boger"));
+        assert!(is_config_safe("a@b.com"));
+        assert!(is_config_safe("Foo [Bar] = baz"));
+        assert!(is_config_safe("Évgeny 你好"));
+        // Reject ASCII controls.
+        assert!(!is_config_safe(""));
+        assert!(!is_config_safe("a\nb"));
+        assert!(!is_config_safe("a\rb"));
+        assert!(!is_config_safe("a\tb"));
+        assert!(!is_config_safe("a\0b"));
+        assert!(!is_config_safe("a\x7fb")); // DEL
+    }
+
+    #[test]
+    fn is_valid_gh_login_classifications() {
+        assert!(is_valid_gh_login("evgeny-boger"));
+        assert!(is_valid_gh_login("octocat"));
+        assert!(is_valid_gh_login("a"));
+        assert!(is_valid_gh_login(&"a".repeat(39)));
+        // Length cap.
+        assert!(!is_valid_gh_login(&"a".repeat(40)));
+        // Disallowed chars / positions.
+        assert!(!is_valid_gh_login(""));
+        assert!(!is_valid_gh_login("-leading"));
+        assert!(!is_valid_gh_login("trailing-"));
+        assert!(!is_valid_gh_login("has space"));
+        assert!(!is_valid_gh_login("has:colon"));
+        assert!(!is_valid_gh_login("has/slash"));
+        assert!(!is_valid_gh_login("has\nnewline"));
     }
 }

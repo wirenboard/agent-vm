@@ -309,8 +309,36 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // accepts the host-bind-mounted project despite the UID
     // mismatch). The credential-helper / gh hosts.yml stanzas are
     // gated on having actually captured a host gh token.
-    crate::secrets::write_guest_gh_config(&session.state_dir, creds.gh_token_file.is_some())
-        .context("writing guest gh/git config")?;
+    //
+    // Resolve the host's git author identity (gh api user, then host
+    // gitconfig) so in-VM commits land with the user's real
+    // name/email rather than the legacy `agent-vm`/`agent-vm@msb.local`
+    // placeholder. If neither source yields anything usable, the
+    // `[user]` section is omitted and git will refuse to commit
+    // until the user sets one — preferable to mis-attribution.
+    let host_identity = crate::secrets::discover_host_git_identity();
+    if let Some(id) = &host_identity {
+        eprintln!(
+            "==> Git author identity: {} <{}>{}",
+            id.name,
+            id.email,
+            id.gh_login
+                .as_deref()
+                .map(|l| format!(" (gh:{l})"))
+                .unwrap_or_default(),
+        );
+    } else {
+        eprintln!(
+            "==> Git author identity: <none> (gh not logged in and no host gitconfig user.name/email; \
+             in-VM `git commit` will refuse until you set one)"
+        );
+    }
+    crate::secrets::write_guest_gh_config(
+        &session.state_dir,
+        creds.gh_token_file.is_some(),
+        host_identity.as_ref(),
+    )
+    .context("writing guest gh/git config")?;
 
     let is_local_registry = crate::pull::is_plain_http_registry(&image);
     let mut builder = Sandbox::builder(&session.sandbox_name)
