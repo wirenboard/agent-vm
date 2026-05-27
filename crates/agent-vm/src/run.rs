@@ -746,10 +746,24 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
              fi\n",
         )
     };
+    // The `[ -t 0 ] || exec < /dev/null` redirect satisfies codex 0.133's
+    // exec subcommand under non-TTY launches, but breaks any agent that
+    // needs to read its stdin in non-TTY mode — notably
+    // `claude --print --input-format stream-json` as used by
+    // `claude remote-control` per-session subprocesses. Skip the redirect
+    // when AGENT_VM_FORWARD_STDIN=1; the launcher then also wires the
+    // streaming-exec path with `stdin_pipe()` below so our stdin reaches
+    // the in-guest agent.
+    let forward_stdin =
+        std::env::var("AGENT_VM_FORWARD_STDIN").as_deref() == Ok("1");
+    let stdin_null_line = if forward_stdin {
+        ""
+    } else {
+        "[ -t 0 ] || exec < /dev/null\n         "
+    };
     let prelude = format!(
         "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
-         [ -t 0 ] || exec < /dev/null\n\
-         {chrome_mcp_prelude}\
+         {stdin_null_line}{chrome_mcp_prelude}\
          _hook={path}/.agent-vm.runtime.sh\n\
          if [ -f \"$_hook\" ]; then\n\
          \techo \"==> sourcing $_hook\" >&2\n\
@@ -793,7 +807,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         use tokio::io::AsyncWriteExt as _;
         let mut handle = sandbox
             .exec_stream_with(cmd, |e| {
-                e.args(agent_args).cwd(project_guest_path.clone())
+                let e = e.args(agent_args).cwd(project_guest_path.clone());
+                if forward_stdin { e.stdin_pipe() } else { e }
             })
             .await
             .with_context(|| {
@@ -802,6 +817,29 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     sandbox_log_dir(&session.sandbox_name).display()
                 )
             })?;
+
+        // When AGENT_VM_FORWARD_STDIN=1, pump our stdin into the in-guest
+        // process's stdin. Required for stream-json mode under `claude --print
+        // --input-format stream-json` (used by `claude remote-control`
+        // per-session subprocesses).
+        if let Some(sink) = handle.take_stdin() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut stdin = tokio::io::stdin();
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match stdin.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sink.write(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = sink.close().await;
+            });
+        }
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
         // Track whether we actually saw an Exited event. The previous

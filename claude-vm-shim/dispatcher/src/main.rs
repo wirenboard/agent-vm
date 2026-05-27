@@ -143,6 +143,11 @@ fn run_vm_cloud_session(forwarded: &[OsString]) -> std::io::Result<i32> {
 
     let mut cmd = Command::new(&agent_vm);
     cmd.env("MSB_PATH", &msb_path)
+        // Tell agent-vm to (a) skip the default non-TTY stdin → /dev/null
+        // redirect and (b) wire stdin through the streaming exec API.
+        // Without this the in-guest claude can't read user messages from
+        // the cloud session.
+        .env("AGENT_VM_FORWARD_STDIN", "1")
         .arg("claude")
         .arg("--no-git")
         .current_dir(&vm_workdir)
@@ -180,13 +185,16 @@ fn resolve_agent_vm_binary() -> String {
             return p;
         }
     }
-    // The npm-installed `/usr/bin/agent-vm` is a `#!/usr/bin/env node` shim
-    // and won't resolve `node` under the daemon's scrubbed PATH. Prefer the
-    // native ELF binary in the platform subpackage.
+    // Prefer a local patched copy at /opt/claude-vm-shim/bin/agent-vm —
+    // the upstream npm one doesn't honor AGENT_VM_FORWARD_STDIN yet, which
+    // breaks stream-json input to in-VM claude. Fall back to the
+    // npm-installed platform subpackage's ELF (the `/usr/bin/agent-vm`
+    // shim is a `#!/usr/bin/env node` wrapper that won't resolve `node`
+    // under the daemon's scrubbed PATH).
     let candidates = [
+        "/opt/claude-vm-shim/bin/agent-vm",
         "/usr/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/agent-vm",
         "/usr/local/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/agent-vm",
-        "/opt/claude-vm-shim/bin/agent-vm",
         "/usr/bin/agent-vm",
         "/usr/local/bin/agent-vm",
     ];
