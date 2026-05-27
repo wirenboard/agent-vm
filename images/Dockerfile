@@ -4,9 +4,10 @@
 # @wirenboard/agent-vm on npm).
 #
 # Contents: Debian 13 slim + the three AI coding agents (Claude
-# Code, OpenCode, Codex) and the minimum dev tooling they need to be
-# useful. Heavier extras (Docker-in-VM, LSPs, additional MCP
-# servers) are deliberately deferred.
+# Code, OpenCode, Codex), minimum dev tooling, and the docker engine
+# (docker.io + containerd + runc + fuse-overlayfs). Other heavy
+# extras (LSPs, additional MCP servers, docker-buildx) are
+# deliberately deferred.
 #
 # Published to ghcr.io/wirenboard/agent-vm-template:latest by the
 # hourly CI workflow (.github/workflows/build-image.yml). Source-
@@ -179,6 +180,45 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
  || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
+# Docker engine — dockerd + cli + containerd + runc.
+#
+# Why each piece:
+#   - docker.io / docker-cli: the daemon and the CLI a user actually
+#     invokes; no buildx (legacy builder is fine for the small builds
+#     agents do in-VM; +20 MB compressed isn't worth the polish).
+#   - containerd / runc: the OCI runtime stack the daemon delegates to.
+#     Both are kernel-required (runc=container init, containerd=image
+#     management); without them dockerd refuses to start.
+#   - fuse-overlayfs: the storage driver we pin in daemon.json below.
+#     Native overlay2 doesn't work because the VM rootfs is already
+#     overlay (libkrun rootfs design), and overlay-on-overlay returns
+#     EINVAL inside dockerd's snapshotter. fuse-overlayfs sidesteps
+#     that at userspace level.
+#   - iptables: dockerd installs NAT rules on every container start;
+#     missing binary makes the daemon log a warning and disable bridge
+#     networking. The kernel-side iptables/nf_tables support comes
+#     from the libkrunfw-overrides patch (see libkrunfw-overrides/
+#     README.md).
+#
+# Storage-driver choice (daemon.json): see comment above. iptables
+# alternative left at debian's default (iptables-nft) — both nft and
+# legacy backends are functional in the patched kernel.
+#
+# Auto-start: not done in the image. The launcher (or a per-project
+# `.agent-vm.runtime.sh`) is the right place to `dockerd &` if the
+# session needs it — most sessions won't, so paying ~50 MB RSS at
+# every boot would be wasteful.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        docker.io docker-cli \
+        containerd runc \
+        fuse-overlayfs \
+        iptables \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /etc/docker \
+ && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
+        > /etc/docker/daemon.json
+
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
@@ -191,7 +231,8 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
 
 # Sanity check at build time so a broken installer surfaces before we push.
-RUN claude --version && opencode --version && codex --version
+RUN claude --version && opencode --version && codex --version \
+ && dockerd --version && docker --version && containerd --version && runc --version
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.
 CMD ["/bin/bash"]
