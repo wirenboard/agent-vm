@@ -300,23 +300,35 @@ fn run_vm_session(claim_sock_host: &std::path::Path) -> std::io::Result<()> {
     let (tcp_stream, peer) = accept_tcp_with_timeout(&tcp_listener, accept_timeout)?;
     debug_log(&format!("guest TCP connect accepted from {peer}"));
 
-    // Bidi-relay between UDS and TCP until either side closes.
-    let stopped = Arc::new(AtomicBool::new(false));
-    let stopped_a = stopped.clone();
-    let uds_a = uds_stream.try_clone()?;
-    let tcp_a = tcp_stream.try_clone()?;
-    let h_uds_to_tcp = thread::spawn(move || {
-        copy_until_eof(uds_a, tcp_a, "uds→tcp");
-        stopped_a.store(true, Ordering::SeqCst);
-    });
+    // Read the claim frame (single JSON line + "\n", followed by EOF on the
+    // daemon's write half) from UDS, translate host paths into in-VM
+    // equivalents, then write the translated frame to TCP.
+    let host_project = std::env::var("PWD").unwrap_or_else(|_| String::from("/"));
+    let translated = translate_claim_frame_from_uds(uds_stream.try_clone()?, &host_project)?;
+    {
+        use std::io::Write;
+        let mut tcp_writer = tcp_stream.try_clone()?;
+        tcp_writer.write_all(&translated)?;
+        let _ = shutdown_write(tcp_writer.as_raw_fd());
+        debug_log(&format!("forwarded translated claim frame ({} bytes) → TCP", translated.len()));
+        // Optional dump of the translated bytes for debugging.
+        if let Ok(p) = std::env::var("CLAUDE_VM_SHIM_DUMP_BYTES") {
+            if !p.is_empty() {
+                let fname = format!("{p}.translated.pid{}", std::process::id());
+                let _ = std::fs::write(&fname, &translated);
+            }
+        }
+    }
 
+    // After the claim, bg-spare may reply with bytes (or just close). Mirror
+    // any TCP→UDS traffic; the UDS→TCP direction is already drained.
+    let stopped = Arc::new(AtomicBool::new(false));
     let stopped_b = stopped.clone();
     let h_tcp_to_uds = thread::spawn(move || {
         copy_until_eof(tcp_stream, uds_stream, "tcp→uds");
         stopped_b.store(true, Ordering::SeqCst);
     });
 
-    let _ = h_uds_to_tcp.join();
     let _ = h_tcp_to_uds.join();
     debug_log("bidi-relay halted");
 
@@ -391,15 +403,33 @@ where
     R: Read,
     W: Write + AsRawFd,
 {
+    // Optional payload dump for protocol reverse-engineering. When
+    // CLAUDE_VM_SHIM_DUMP_BYTES is set, each direction's payload is appended
+    // to `<prefix>.<label>-pid<pid>`.
+    let dump_path = std::env::var("CLAUDE_VM_SHIM_DUMP_BYTES")
+        .ok()
+        .filter(|p| !p.is_empty());
+    let mut total: u64 = 0;
     let mut buf = [0u8; 16 * 1024];
     loop {
         match from.read(&mut buf) {
             Ok(0) => {
                 let _ = shutdown_write(to.as_raw_fd());
-                debug_log(&format!("{label}: EOF"));
+                debug_log(&format!("{label}: EOF ({total} bytes)"));
                 return;
             }
             Ok(n) => {
+                total += n as u64;
+                if let Some(p) = &dump_path {
+                    let fname = format!("{p}.{label}.pid{}", std::process::id());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&fname)
+                    {
+                        let _ = f.write_all(&buf[..n]);
+                    }
+                }
                 if let Err(e) = to.write_all(&buf[..n]) {
                     debug_log(&format!("{label}: write error: {e}"));
                     return;
@@ -411,6 +441,154 @@ where
             }
         }
     }
+}
+
+/// Read the daemon's claim frame from the UDS, translate it for the in-VM
+/// claude, and return the bytes to forward over TCP.
+///
+/// Wire format (from the daemon, see `Sbz`/`buildClaimFrame` in claude):
+/// a single line `JSON.stringify({cwd, env, argv, sessionId}) + "\n"`, then
+/// the daemon half-closes its write side (we'll see EOF on read).
+fn translate_claim_frame_from_uds(
+    mut uds: UnixStream,
+    host_project: &str,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut raw = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = uds.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        // Guard against truly pathological input.
+        if raw.len() > 4 * 1024 * 1024 {
+            return Err(std::io::Error::other(
+                "claim frame exceeded 4MiB; refusing to translate",
+            ));
+        }
+    }
+
+    // Trim trailing newline so the JSON parser is happy.
+    let json_bytes: &[u8] = match raw.last() {
+        Some(b'\n') => &raw[..raw.len() - 1],
+        _ => &raw,
+    };
+    let mut frame: serde_json::Value = match serde_json::from_slice(json_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            debug_log(&format!(
+                "claim frame is not JSON ({e}); forwarding verbatim {}b",
+                raw.len()
+            ));
+            return Ok(raw);
+        }
+    };
+
+    translate_claim_frame_value(&mut frame, host_project);
+
+    let mut out = serde_json::to_vec(&frame)
+        .map_err(|e| std::io::Error::other(format!("re-serialize claim frame: {e}")))?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Apply path/env translation to a parsed claim frame in place.
+fn translate_claim_frame_value(frame: &mut serde_json::Value, host_project: &str) {
+    use serde_json::Value;
+
+    // Determine the in-VM project root. agent-vm uses /workspace when the
+    // host path is under a tmpfs prefix (/tmp, /run, /dev/shm); otherwise it
+    // mirrors the host path.
+    let guest_project = host_to_guest_project_path(host_project);
+    debug_log(&format!(
+        "claim-frame translate: project {host_project:?} → {guest_project:?}"
+    ));
+
+    if let Some(obj) = frame.as_object_mut() {
+        // cwd: map if it equals or is under host_project
+        if let Some(Value::String(cwd)) = obj.get_mut("cwd") {
+            if let Some(mapped) = map_path(cwd, host_project, &guest_project) {
+                debug_log(&format!("claim-frame cwd {cwd:?} → {mapped:?}"));
+                *cwd = mapped;
+            }
+        }
+
+        // env: drop host-only / outer-VM / shim vars; rewrite PWD/OLDPWD.
+        if let Some(Value::Object(env)) = obj.get_mut("env") {
+            let to_drop: Vec<String> = env
+                .keys()
+                .filter(|k| should_drop_env(k))
+                .cloned()
+                .collect();
+            for k in &to_drop {
+                env.remove(k);
+            }
+            if !to_drop.is_empty() {
+                debug_log(&format!("claim-frame stripped {} env vars: {:?}", to_drop.len(), to_drop));
+            }
+            for key in ["PWD", "OLDPWD"] {
+                if let Some(Value::String(v)) = env.get_mut(key) {
+                    if let Some(mapped) = map_path(v, host_project, &guest_project) {
+                        debug_log(&format!("claim-frame env.{key} {v:?} → {mapped:?}"));
+                        *v = mapped;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn host_to_guest_project_path(host: &str) -> String {
+    // Same logic as agent-vm's `guest_path_is_safe`: paths under tmpfs prefixes
+    // can't be mirrored.
+    const TMPFS_PREFIXES: [&str; 3] = ["/tmp/", "/run/", "/dev/shm/"];
+    for p in TMPFS_PREFIXES {
+        if host.starts_with(p) || host == p.trim_end_matches('/') {
+            return "/workspace".to_string();
+        }
+    }
+    host.to_string()
+}
+
+fn map_path(s: &str, host: &str, guest: &str) -> Option<String> {
+    if s == host {
+        return Some(guest.to_string());
+    }
+    if let Some(tail) = s.strip_prefix(&format!("{host}/")) {
+        return Some(format!("{guest}/{tail}"));
+    }
+    None
+}
+
+/// Env vars that should be stripped from the claim frame before forwarding.
+/// These are either host-only paths or would cause recursion/misconfiguration
+/// inside the VM.
+fn should_drop_env(k: &str) -> bool {
+    matches!(
+        k,
+        // Shim plumbing: don't let it re-enter inside the VM.
+        "LD_PRELOAD" | "CLAUDE_VM_SHIM_LOG" | "CLAUDE_VM_SHIM_DISPATCHER"
+            | "CLAUDE_VM_SHIM_SO" | "CLAUDE_VM_SHIM_REAL_CLAUDE"
+            | "CLAUDE_VM_SHIM_PASSTHROUGH" | "CLAUDE_VM_SHIM_DUMP_BYTES"
+            | "CLAUDE_VM_SHIM_AGENT_VM_BIN" | "CLAUDE_VM_SHIM_BRIDGE_DIR"
+            | "CLAUDE_VM_SHIM_WORKDIR_ROOT" | "CLAUDE_VM_SHIM_HOST_IP"
+            | "CLAUDE_VM_SHIM_MSB_PATH"
+            // Outer-VM leakage (microsandbox / libkrun internals).
+            | "KRUN_WORKDIR" | "KRUN_ENV" | "KRUN_BOOT_START_NS"
+            | "MSB_HOSTNAME" | "MSB_NET" | "MSB_NET_IPV4" | "MSB_NET_IPV6"
+            | "MSB_TMPFS" | "MSB_DIR_MOUNTS" | "MSB_BLOCK_ROOT"
+            | "MSB_HOST_ALIAS" | "MSB_AGENT_VM_ANTHROPIC_UNUSED"
+            | "MSB_AGENT_VM_OPENAI_UNUSED" | "MSB_AGENT_VM_GH_UNUSED"
+            | "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED"
+            // The bg-rendezvous sock lives at a host path the in-VM claude
+            // can't reach. Stripping it forces the session into a simpler
+            // mode; relaying it is future work.
+            | "CLAUDE_BG_RENDEZVOUS_SOCK"
+    )
+        // Bun-injected wrapper var (varies per invocation, host-only).
+        || k == "_"
 }
 
 /// Find a non-loopback IPv4 address the guest can reach us at.

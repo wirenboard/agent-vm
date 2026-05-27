@@ -174,6 +174,7 @@ Read by the wrapper / dispatcher / bridge:
 | `CLAUDE_VM_SHIM_WORKDIR_ROOT`    | Override the per-session VM workdir root (defaults to `/tmp/claude-vm-shim-work`). |
 | `CLAUDE_VM_SHIM_HOST_IP`         | Override the host IP the guest bridge connects to. Auto-detected from `/proc/net/fib_trie`. |
 | `CLAUDE_VM_SHIM_MSB_PATH`        | `MSB_PATH` forwarded to the agent-vm child. Defaults to the npm-bundled `msb`. |
+| `CLAUDE_VM_SHIM_DUMP_BYTES`      | Path prefix; if set, the dispatcher appends raw relay traffic to `<prefix>.<dir>.pid<pid>` (and `<prefix>.translated.pid<pid>` for the rewritten claim frame). For protocol debugging. |
 | `AGENT_VM_ALLOW_LOCAL_EGRESS=1`  | Read by patched `agent-vm`; flips the network policy to `non_local()`. The dispatcher sets this on each spawn. |
 
 ## How interception works (LD_PRELOAD with Bun)
@@ -191,14 +192,45 @@ because the daemon spawns with `pinToCurrentBinary: true` and the path is
 The dispatcher unsets `CLAUDE_VM_SHIM_DISPATCHER` before any inner exec, so
 the shim short-circuits and never recurses.
 
+## Bg-spare claim protocol
+
+The wire format on the claim socket (verified by capturing real traffic):
+
+```
+daemon                                       bg-spare
+  │ connect(claim_sock)                            │
+  │ write(JSON.stringify({cwd, env, argv, sessionId}) + "\n")
+  │ shutdown(WR)                                   │
+  │                                                │ adopt: chdir(cwd),
+  │                                                │ set env, run session
+  │ read(...) ← (typically EOF; some sessions
+  │             reply before close)                │
+```
+
+The dispatcher reads the claim frame on the host side, applies these rewrites
+before forwarding to TCP:
+
+- **`cwd` and `env.PWD`** mapped from host path → in-VM path. When the host
+  project is under tmpfs (`/tmp/…`, `/run/…`, `/dev/shm/…`), agent-vm mounts
+  it at `/workspace`, so those paths map there; otherwise the path is mirrored.
+- **`env`** filtered to drop:
+  - shim plumbing (`LD_PRELOAD`, `CLAUDE_VM_SHIM_*`),
+  - outer-VM leakage (`KRUN_*`, `MSB_*`),
+  - host-only paths the in-VM claude can't reach (`CLAUDE_BG_RENDEZVOUS_SOCK`),
+  - Bun's `_` (invocation wrapper, host-specific).
+
+After translation, the daemon's "claim" is accepted by the in-VM claude and
+the daemon's session log records `bg settled <id> (done)`.
+
 ## Known gaps
 
-- **Claim-frame paths.** The daemon's claim frame contains `{cwd, env, argv}`
-  with paths from the host's userspace context. The in-VM claude tries to use
-  those paths and fails (e.g., the host cwd doesn't exist inside the VM). The
-  byte pipe works end-to-end — `claude --bg-spare` adopts, sees the claim,
-  fails to chdir/exec on the host paths, exits. Need either path translation
-  in the relay or guarantee path equivalence via `--mount`.
+- **Rendezvous-sock relay.** `CLAUDE_BG_RENDEZVOUS_SOCK` is currently stripped
+  from the claim frame. That socket is how the daemon streams the session's
+  stdout/stdin back to the user (`claude attach <id>`, `claude logs <id>`).
+  Without relaying it, sessions complete cleanly but their output is
+  unreachable. Same architecture as the claim-sock relay; the in-VM claude
+  would `bind()` a UDS, a guest helper would bridge to a second host TCP
+  listener.
 - **PTY / interactive stdio.** The dispatcher inherits the PTY slave fds from
   the outer `--bg-pty-host`, but `agent-vm shell -- bash -c …` runs
   non-interactive ("no TTY; streaming output"). The bg-spare protocol may
