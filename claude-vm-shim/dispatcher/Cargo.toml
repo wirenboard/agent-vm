@@ -1,0 +1,11 @@
+[package]
+name = "claude-vm-dispatcher"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "claude-vm-dispatcher"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

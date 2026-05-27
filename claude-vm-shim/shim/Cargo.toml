@@ -1,0 +1,8 @@
+[package]
+name = "claude-vm-shim"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"

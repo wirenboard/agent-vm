@@ -1,0 +1,8 @@
+[package]
+name = "claude-vm-bridge"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "claude-vm-bridge"
+path = "src/main.rs"

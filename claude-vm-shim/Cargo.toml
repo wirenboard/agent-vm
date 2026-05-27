@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["shim", "dispatcher", "bridge"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+
+[profile.release]
+panic = "abort"
+opt-level = 1
+strip = true
+lto = false

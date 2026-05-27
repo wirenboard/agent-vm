@@ -448,8 +448,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
+        let allow_local_egress =
+            std::env::var("AGENT_VM_ALLOW_LOCAL_EGRESS").as_deref() == Ok("1");
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
+            if allow_local_egress {
+                // Escape hatch: allow TCP egress to RFC1918 / CGNAT / ULA
+                // destinations in addition to public internet. Needed by
+                // claude-vm-shim's guest bridge which connects back to a
+                // host TCP listener via the host's primary (private) IP.
+                // `non_local()` is the existing preset that bundles
+                // public_only + private egress.
+                n = n.policy(microsandbox::sandbox::NetworkPolicy::non_local());
+            }
             // We only ever substitute into Authorization: Bearer headers.
             // Explicitly disable basic_auth so the proxy's per-chunk fast
             // path can short-circuit when the placeholder isn't present
