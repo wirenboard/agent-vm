@@ -141,6 +141,18 @@ pub struct Args {
     #[arg(long = "publish", short = 'p')]
     publish: Vec<String>,
 
+    /// Auto-detect new `0.0.0.0` / `[::]` TCP listeners inside the
+    /// guest and mirror each on `127.0.0.1:<same port>` on the host
+    /// (Lima-style). Polls `/proc/net/tcp{,6}` over the agentd
+    /// channel every ~2s; spawns a tokio TCP listener per detected
+    /// port and bridges each accepted connection through a
+    /// per-connection in-guest python3 tunneller. Loopback-only
+    /// guest binds (`127.0.0.1`) are intentionally NOT forwarded
+    /// (privacy / Lima parity). Heavy on overhead — fine for
+    /// dev tunnels, use `--publish` for high-throughput.
+    #[arg(long = "auto-publish", default_value_t = false)]
+    auto_publish: bool,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -668,6 +680,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::image_api_version::check(&sandbox)
         .await
         .context("verifying image-API contract version")?;
+
+    if args.auto_publish {
+        eprintln!("==> auto-publish: polling /proc/net/tcp every ~2s for new 0.0.0.0 listeners");
+        crate::auto_publish::spawn(sandbox.clone());
+    }
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
