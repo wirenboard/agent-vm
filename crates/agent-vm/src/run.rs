@@ -129,6 +129,18 @@ pub struct Args {
     #[arg(long = "mount")]
     mount: Vec<String>,
 
+    /// Publish a guest TCP port to the host. Format:
+    /// `[HOST_BIND:]HOST_PORT:GUEST_PORT` (docker-style). HOST_BIND
+    /// defaults to `127.0.0.1` — pass `0.0.0.0:HOST_PORT:GUEST_PORT`
+    /// to expose on every host interface. Repeatable.
+    ///
+    /// The guest service must listen on `0.0.0.0` (or the assigned
+    /// guest IP from `MSB_NET_IPV4`); a bare `127.0.0.1` bind inside
+    /// the guest is not reachable because the smoltcp dial target is
+    /// the guest's assigned VLAN address, not loopback.
+    #[arg(long = "publish", short = 'p')]
+    publish: Vec<String>,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -424,6 +436,24 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         })
         .env("CODEX_HOME", "/agent-vm-state/codex");
 
+    // Parse `--publish` into PublishedPort entries up front so we can
+    // wire them into the network builder below (the same place that
+    // sets up secrets/intercept). Done outside the conditional so it
+    // bails early on syntax errors regardless of cred state.
+    let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
+    for p in &publish_ports {
+        eprintln!(
+            "==> Publishing host {}:{}/{} → guest :{}",
+            p.host_bind,
+            p.host_port,
+            match p.protocol {
+                PublishProto::Tcp => "tcp",
+                PublishProto::Udp => "udp",
+            },
+            p.guest_port,
+        );
+    }
+
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
     // guest will send, then register the OAuth refresh endpoint as a
@@ -435,10 +465,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the VM at all (microsandbox's violation detector would block it
     // otherwise), even though substitution there is a no-op because
     // the body's refresh_token is a placeholder, not a header.
-    if creds.anthropic_token_file.is_some()
+    let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
-        || creds.gh_token_file.is_some()
-    {
+        || creds.gh_token_file.is_some();
+    if has_creds || !publish_ports.is_empty() {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
@@ -448,8 +478,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
+        let publish_ports_for_net = publish_ports.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
+            for p in &publish_ports_for_net {
+                let host_bind = p.host_bind;
+                n = match p.protocol {
+                    PublishProto::Tcp => n.port_bind(host_bind, p.host_port, p.guest_port),
+                    PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
+                };
+            }
+            if !has_creds {
+                return n;
+            }
             // We only ever substitute into Authorization: Bearer headers.
             // Explicitly disable basic_auth so the proxy's per-chunk fast
             // path can short-circuit when the placeholder isn't present
@@ -989,6 +1030,82 @@ struct ExtraMount {
     guest: PathBuf,
 }
 
+/// One `--publish [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]` entry, parsed.
+#[derive(Clone, Debug)]
+struct PublishPort {
+    host_bind: std::net::IpAddr,
+    host_port: u16,
+    guest_port: u16,
+    protocol: PublishProto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishProto {
+    Tcp,
+    Udp,
+}
+
+/// Parse `--publish` entries. Accepts docker-style:
+///   `HOST_PORT:GUEST_PORT`              → 127.0.0.1 bind, TCP
+///   `HOST_IP:HOST_PORT:GUEST_PORT`      → explicit bind, TCP
+///   either form + `/udp` or `/tcp`     → explicit protocol
+///
+/// The connection enters the smoltcp in-process stack as a dial to
+/// the guest's assigned MSB_NET_IPV4 (or v6) on `GUEST_PORT`, so the
+/// in-guest service has to listen on `0.0.0.0`/`::` (or that exact
+/// guest IP) — a bare `127.0.0.1` bind inside the guest is not
+/// reachable from the publisher.
+fn parse_publish_args(raw: &[String]) -> Result<Vec<PublishPort>> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let (body, proto) = match entry.rsplit_once('/') {
+            Some((b, p)) if matches!(p, "tcp" | "udp" | "TCP" | "UDP") => (b, p.to_ascii_lowercase()),
+            _ => (entry.as_str(), "tcp".to_string()),
+        };
+        let protocol = match proto.as_str() {
+            "udp" => PublishProto::Udp,
+            _ => PublishProto::Tcp,
+        };
+        let parts: Vec<&str> = body.split(':').collect();
+        let (host_bind, host_port, guest_port) = match parts.as_slice() {
+            [h, g] => (
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                h.parse::<u16>().with_context(|| {
+                    format!("--publish {entry:?}: HOST_PORT {h:?} is not a u16")
+                })?,
+                g.parse::<u16>().with_context(|| {
+                    format!("--publish {entry:?}: GUEST_PORT {g:?} is not a u16")
+                })?,
+            ),
+            [ip, h, g] => (
+                ip.parse::<IpAddr>().with_context(|| {
+                    format!("--publish {entry:?}: HOST_BIND {ip:?} is not an IP")
+                })?,
+                h.parse::<u16>().with_context(|| {
+                    format!("--publish {entry:?}: HOST_PORT {h:?} is not a u16")
+                })?,
+                g.parse::<u16>().with_context(|| {
+                    format!("--publish {entry:?}: GUEST_PORT {g:?} is not a u16")
+                })?,
+            ),
+            _ => anyhow::bail!(
+                "--publish {entry:?} must be [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]"
+            ),
+        };
+        if host_port == 0 || guest_port == 0 {
+            anyhow::bail!("--publish {entry:?}: port 0 is not allowed");
+        }
+        out.push(PublishPort {
+            host_bind,
+            host_port,
+            guest_port,
+            protocol,
+        });
+    }
+    Ok(out)
+}
+
 /// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
 /// `HOST` alone defaults `GUEST` to the same absolute path (mirror).
 /// `HOST:GUEST` lets you remap. Errors clearly on absolute-path
@@ -1390,6 +1507,50 @@ mod tests {
         // canonicalize fails on missing paths → Err propagates.
         let r = parse_extra_mounts(&["/this/path/does/not/exist/anywhere".into()]);
         assert!(r.is_err());
+    }
+
+    // ── parse_publish_args ───────────────────────────────────────
+
+    #[test]
+    fn parse_publish_args_two_part_defaults_to_loopback_tcp() {
+        let p = parse_publish_args(&["8080:80".into()]).expect("ok");
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(p[0].host_port, 8080);
+        assert_eq!(p[0].guest_port, 80);
+        assert_eq!(p[0].protocol, PublishProto::Tcp);
+    }
+
+    #[test]
+    fn parse_publish_args_three_part_with_bind() {
+        let p = parse_publish_args(&["0.0.0.0:5000:5000".into()]).expect("ok");
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(p[0].host_port, 5000);
+        assert_eq!(p[0].guest_port, 5000);
+    }
+
+    #[test]
+    fn parse_publish_args_udp_suffix() {
+        let p = parse_publish_args(&["53:53/udp".into()]).expect("ok");
+        assert_eq!(p[0].protocol, PublishProto::Udp);
+        let p = parse_publish_args(&["8080:80/tcp".into()]).expect("ok");
+        assert_eq!(p[0].protocol, PublishProto::Tcp);
+    }
+
+    #[test]
+    fn parse_publish_args_rejects_bad_input() {
+        assert!(parse_publish_args(&["80".into()]).is_err());
+        assert!(parse_publish_args(&["a:b".into()]).is_err());
+        assert!(parse_publish_args(&["0:80".into()]).is_err());
+        assert!(parse_publish_args(&["80:0".into()]).is_err());
+        assert!(parse_publish_args(&["999999:80".into()]).is_err());
+        assert!(parse_publish_args(&["1:2:3:4".into()]).is_err());
     }
 
     // ── mkdir_chain ──────────────────────────────────────────────
