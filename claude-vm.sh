@@ -239,14 +239,29 @@ _agent_vm_setup() {
   limactl delete "$CLAUDE_VM_TEMPLATE" --force &>/dev/null
 
   echo "Creating VM template..."
-  limactl create --name="$CLAUDE_VM_TEMPLATE" template:debian-13 \
+  if ! limactl create --name="$CLAUDE_VM_TEMPLATE" template:debian-13 \
     --set '.mounts=[]' \
     --set '.containerd.system=false' \
     --set '.containerd.user=false' \
     --disk="$disk" \
     --memory="$memory" \
-    --tty=false
-  limactl start "$CLAUDE_VM_TEMPLATE"
+    --tty=false; then
+    echo "Error: 'limactl create' failed for '$CLAUDE_VM_TEMPLATE' — setup aborted." >&2
+    return 1
+  fi
+
+  # Start the VM, capturing output so we can diagnose failures. The rest of setup
+  # runs `limactl shell` into this VM, so if it isn't Running every later step
+  # fails silently — abort here with an actionable message instead.
+  local _start_log
+  _start_log="$(mktemp 2>/dev/null || echo "/tmp/agent-vm-start.$$.log")"
+  if ! ( set -o pipefail; limactl start "$CLAUDE_VM_TEMPLATE" 2>&1 | tee "$_start_log" ) \
+     || [ "$(limactl list "$CLAUDE_VM_TEMPLATE" --format '{{.Status}}' 2>/dev/null)" != "Running" ]; then
+    _claude_vm_setup_start_failed "$_start_log"
+    rm -f "$_start_log"
+    return 1
+  fi
+  rm -f "$_start_log"
 
   # Disable needrestart's interactive prompts
   limactl shell "$CLAUDE_VM_TEMPLATE" sudo bash -c 'mkdir -p /etc/needrestart/conf.d && echo "\$nrconf{restart} = '"'"'a'"'"';" > /etc/needrestart/conf.d/no-prompt.conf'
@@ -428,6 +443,34 @@ CIEOF
   limactl stop "$CLAUDE_VM_TEMPLATE"
 
   echo "Template ready. Run 'agent-vm claude', 'agent-vm opencode', or 'agent-vm codex' in any project directory."
+}
+
+# Print an actionable diagnosis when the template VM fails to start. Called from
+# _agent_vm_setup with the path to the captured `limactl start` output.
+_claude_vm_setup_start_failed() {
+  local log="$1"
+  echo "" >&2
+  echo "Error: VM '$CLAUDE_VM_TEMPLATE' did not reach the Running state — setup aborted." >&2
+
+  if [ -n "$log" ] && grep -q "failed to create Watcher" "$log" 2>/dev/null; then
+    echo "" >&2
+    echo "Cause: the host ran out of inotify instances, so Lima could not create a" >&2
+    echo "file watcher (\"failed to create Watcher\")." >&2
+    if [ -r /proc/sys/fs/inotify/max_user_instances ]; then
+      echo "  Current fs.inotify.max_user_instances = $(cat /proc/sys/fs/inotify/max_user_instances)" >&2
+    fi
+    echo "" >&2
+    echo "Fix: raise the limit (persisting it across reboots), then re-run 'agent-vm setup':" >&2
+    echo "  sudo sysctl -w fs.inotify.max_user_instances=1024" >&2
+    echo "  echo 'fs.inotify.max_user_instances=1024' | sudo tee /etc/sysctl.d/99-inotify-instances.conf" >&2
+  else
+    echo "" >&2
+    echo "Check the output above for the cause. A common culprit on Linux is the host" >&2
+    echo "running out of inotify instances (look for \"failed to create Watcher\"):" >&2
+    echo "  sudo sysctl -w fs.inotify.max_user_instances=1024" >&2
+    echo "  echo 'fs.inotify.max_user_instances=1024' | sudo tee /etc/sysctl.d/99-inotify-instances.conf" >&2
+    echo "For more detail, run: limactl start $CLAUDE_VM_TEMPLATE --debug" >&2
+  fi
 }
 
 _claude_vm_install_host_proxy_ca() {
