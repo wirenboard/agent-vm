@@ -5,10 +5,15 @@
 //! listener forwards each accepted connection through a
 //! per-connection in-guest python3 tunneller (see [`crate::exec_tunnel`]).
 //!
-//! Mirrors Lima's default policy: only `0.0.0.0` / `[::]` binds are
-//! auto-forwarded — loopback-only guest services stay private. To
-//! reach a guest 127.0.0.1 service from the host, use `--publish`
-//! (native, declarative) instead.
+//! Forwards both `127.0.0.1` *and* `0.0.0.0` listeners. Lima's
+//! default is loopback-only (because on Lima's host-network model
+//! `0.0.0.0` inside the guest is genuinely reachable from the LAN,
+//! and silently re-exposing that on host loopback would change the
+//! security posture). For us, smoltcp is in-process — both 127.0.0.1
+//! and 0.0.0.0 inside the guest are reachable only from the
+//! agent-vm process anyway, so forwarding either is the same trust
+//! boundary and skipping 0.0.0.0 would just mean "the user has to
+//! remember which one their dev server picked."
 //!
 //! Cancellation: the discovery task aborts itself when reading
 //! `/proc/net/tcp` errors repeatedly (sandbox shutting down). On
@@ -124,13 +129,14 @@ struct ForwardedPort {
     task: JoinHandle<()>,
 }
 
-/// Decide whether to auto-forward this listener. Mirrors Lima's
-/// default: only forward wildcard binds; loopback-only services
-/// stay private to the guest.
+/// Decide whether to auto-forward this listener. Wildcard *and*
+/// loopback both qualify — see the module-level comment for why
+/// 0.0.0.0 is safe to forward in our in-process-smoltcp setup
+/// (unlike Lima).
 fn should_forward(entry: ListenEntry) -> bool {
     match entry.addr {
-        IpAddr::V4(a) => a.is_unspecified(),
-        IpAddr::V6(a) => a.is_unspecified(),
+        IpAddr::V4(a) => a.is_unspecified() || a.is_loopback(),
+        IpAddr::V6(a) => a.is_unspecified() || a.is_loopback(),
     }
 }
 
