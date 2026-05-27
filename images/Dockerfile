@@ -217,7 +217,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /etc/docker \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
-        > /etc/docker/daemon.json
+        > /etc/docker/daemon.json \
+ && ln -s /usr/sbin/dockerd /usr/local/bin/dockerd \
+ && ln -s /usr/sbin/runc    /usr/local/bin/runc
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
