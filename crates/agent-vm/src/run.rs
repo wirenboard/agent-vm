@@ -548,9 +548,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // The image's PATH was set inside the Dockerfile, but it lives in the
     // shell rc files of /root. attach() launches the agent directly via
     // execve, so re-publish the same PATH here.
+    //
+    // `/usr/sbin` is here because dockerd, runc, iptables and docker-proxy
+    // live there in debian, and dockerd does PATH lookups for its helper
+    // binaries at runtime (not just at exec). Keep this list in sync with
+    // the `ENV PATH=…` in images/Dockerfile.
     builder = builder.env(
         "PATH",
-        "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
+        "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
     );
 
     // Claude Code refuses to run as root with --dangerously-skip-permissions
