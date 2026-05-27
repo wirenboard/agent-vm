@@ -105,19 +105,36 @@ small patch to `crates/agent-vm/src/run.rs` (~14 lines) that adds the
 
 Prerequisites:
 
-- Rust toolchain (uses the agent-vm checkout's `.agent-vm-rust/`)
-- `gcc` + `libc6-dev` for linking
-- A patched `agent-vm` binary built from this branch (the npm-installed one
-  doesn't know about `AGENT_VM_ALLOW_LOCAL_EGRESS`)
+- `gcc` + `libc6-dev` + `libcap-ng-dev` + `libdbus-1-dev` + `pkg-config`
+- `npm install -g @wirenboard/agent-vm` (provides bundled `msb` + `libkrunfw`)
+  and `agent-vm setup --no-verify` to pull the OCI image
+- The repo's vendored Rust toolchain (use `PATH=$REPO/.agent-vm-rust/cargo/bin:$PATH`
+  and `RUSTUP_HOME`/`CARGO_HOME` pointing at `$REPO/.agent-vm-rust/`)
+- The `vendor/microsandbox` submodule. If you cloned this branch as a
+  worktree from a checkout that already has it, symlink to the existing
+  copy rather than re-cloning:
+
+    ```sh
+    rmdir vendor/microsandbox
+    ln -sfn /path/to/primary-checkout/vendor/microsandbox vendor/microsandbox
+    ```
+
+    Otherwise: `git submodule update --init vendor/microsandbox` (slower; clones afresh).
+
+Build:
 
 ```sh
-# from the repo root
+# patched agent-vm (adds AGENT_VM_ALLOW_LOCAL_EGRESS escape hatch)
+cd <repo-root>
 cargo build --release -p agent-vm
-# from this directory
+
+# shim + dispatcher + bridge
+cd claude-vm-shim
 cargo build --release
 ./install.sh                       # installs everything to /opt/claude-vm-shim/
-# manually copy the patched agent-vm next to the shim so the dispatcher
-# finds it via its candidate list
+# install.sh creates ~/.local/bin/claude-shimmed but doesn't copy the
+# patched agent-vm — do that manually so the dispatcher's binary-search
+# picks it up:
 cp ../target/release/agent-vm /opt/claude-vm-shim/bin/agent-vm
 ```
 
