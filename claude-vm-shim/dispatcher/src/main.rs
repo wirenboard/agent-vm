@@ -137,24 +137,45 @@ fn run_vm_cloud_session(forwarded: &[OsString]) -> std::io::Result<i32> {
     let _ = std::fs::create_dir_all(&vm_workdir);
 
     let agent_vm = resolve_agent_vm_binary();
-    let msb_path = std::env::var("CLAUDE_VM_SHIM_MSB_PATH").unwrap_or_else(|_| {
-        "/usr/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/msb".to_string()
-    });
+    let msb_path = resolve_msb_path();
+
+    // Capture agent-vm's stderr to a per-session log so we can diagnose
+    // boot failures without depending on the rc parent's terminal.
+    let vm_log_path = format!(
+        "/tmp/claude-vm-dispatcher.vm-{}.log",
+        std::process::id()
+    );
+    let vm_log = std::fs::File::create(&vm_log_path)
+        .map_err(|e| std::io::Error::other(format!("create vm log {vm_log_path}: {e}")))?;
+    debug_log(&format!("agent-vm stderr → {vm_log_path}"));
 
     let mut cmd = Command::new(&agent_vm);
-    cmd.env("MSB_PATH", &msb_path)
+    cmd
         // Tell agent-vm to (a) skip the default non-TTY stdin → /dev/null
         // redirect and (b) wire stdin through the streaming exec API.
         // Without this the in-guest claude can't read user messages from
         // the cloud session.
         .env("AGENT_VM_FORWARD_STDIN", "1")
+        // Disable TLS MITM for the Anthropic cloud-session SDK endpoint.
+        // The streaming transport at /v1/code/sessions/cse_… pins
+        // Anthropic's real certificate and stalls at `connecting_transport`
+        // through the microsandbox CA-signed MITM cert. Allowing this
+        // host to bypass interception is correct: cloud sessions
+        // authenticate with the real OAuth token directly (no
+        // placeholder injection involved).
+        .env("AGENT_VM_TLS_BYPASS", "api.anthropic.com")
         .arg("claude")
         .arg("--no-git")
         .current_dir(&vm_workdir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(vm_log))
         .arg("--");
+    // Pass MSB_PATH only when we actually resolved it — let agent-vm use
+    // its own discovery ladder otherwise.
+    if let Some(p) = msb_path.as_deref() {
+        cmd.env("MSB_PATH", p);
+    }
     for a in forwarded {
         cmd.arg(a);
     }
@@ -177,6 +198,24 @@ fn run_vm_cloud_session(forwarded: &[OsString]) -> std::io::Result<i32> {
     let code = status.code().unwrap_or(1);
     debug_log(&format!("cloud session exit: {status:?} → code={code}"));
     Ok(code)
+}
+
+fn resolve_msb_path() -> Option<String> {
+    if let Ok(p) = std::env::var("CLAUDE_VM_SHIM_MSB_PATH") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    let candidates = [
+        "/usr/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/msb",
+        "/usr/local/lib/node_modules/@wirenboard/agent-vm/node_modules/@wirenboard/agent-vm-linux-x64/bin/msb",
+    ];
+    for p in candidates {
+        if std::path::Path::new(p).is_file() {
+            return Some(p.to_string());
+        }
+    }
+    None
 }
 
 fn resolve_agent_vm_binary() -> String {

@@ -448,8 +448,22 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
+        // Comma-separated list of host patterns to skip TLS interception
+        // for. Needed for clients that pin Anthropic's public certificate
+        // (e.g. the `claude --print --sdk-url` cloud-session transport
+        // doesn't trust the microsandbox MITM CA and stalls at
+        // `connecting_transport`). Default behavior is unchanged.
+        let tls_bypass_hosts: Vec<String> = std::env::var("AGENT_VM_TLS_BYPASS")
+            .ok()
+            .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default();
         builder = builder.network(move |mut n| {
-            n = n.tls(|t| t);
+            n = n.tls(|mut t| {
+                for host in &tls_bypass_hosts {
+                    t = t.bypass(host);
+                }
+                t
+            });
             // We only ever substitute into Authorization: Bearer headers.
             // Explicitly disable basic_auth so the proxy's per-chunk fast
             // path can short-circuit when the placeholder isn't present
