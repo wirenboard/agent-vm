@@ -1,8 +1,11 @@
 # claude-vm-shim
 
-**Status: prototype.** The end-to-end byte pipe works; session protocol details
-(claim-frame path translation, PTY forwarding) are not yet wired up. See
-"Known gaps" below.
+**Status: working prototype.** End-to-end sessions run inside an agent-vm
+sandbox. Verified: `claude --bg "what is 2+2"` boots a VM, the in-VM claude
+adopts the session, calls api.anthropic.com (auth via `/agent-vm-state` mount),
+generates a session name ("math calculation"), streams output back to
+`claude logs <id>`, and respects `claude stop <id>`. See "Known gaps" for the
+parts that still need work.
 
 Run every Claude Code "remote control" session in its own `agent-vm` sandbox by
 intercepting the daemon's per-session `--bg-spare` exec and forwarding the
@@ -222,15 +225,37 @@ before forwarding to TCP:
 After translation, the daemon's "claim" is accepted by the in-VM claude and
 the daemon's session log records `bg settled <id> (done)`.
 
+## What works
+
+- ✅ Per-session VM boot (one fresh agent-vm per `--bg-spare`).
+- ✅ Daemon claims spare → adoption succeeds.
+- ✅ In-VM claude talks to api.anthropic.com (auth via `/agent-vm-state`).
+- ✅ Session output reaches `claude logs <id>` (via the inherited PTY).
+- ✅ `claude stop <id>` shuts down the VM session.
+- ✅ Multiple parallel spares pre-seeded by the daemon, each its own VM.
+
 ## Known gaps
 
 - **Rendezvous-sock relay.** `CLAUDE_BG_RENDEZVOUS_SOCK` is currently stripped
-  from the claim frame. That socket is how the daemon streams the session's
-  stdout/stdin back to the user (`claude attach <id>`, `claude logs <id>`).
-  Without relaying it, sessions complete cleanly but their output is
-  unreachable. Same architecture as the claim-sock relay; the in-VM claude
-  would `bind()` a UDS, a guest helper would bridge to a second host TCP
-  listener.
+  from the claim frame. That socket is how the daemon streams *state*
+  (heartbeats, agent-mode transitions, repaint coordination after resize, and
+  the `done` signal) — but **not** the output stream, which flows over the
+  PTY socket and works today. Sessions function without it; we'd want it
+  added for clean shutdown signaling and to avoid the daemon's
+  "heartbeat-missing" timeout path. Same architecture as the claim-sock
+  relay (host UDS bind + TCP listener + guest bridge), just long-lived.
+- **PTY size from in-VM.** The PTY is sized by the host's `--bg-pty-host`
+  args (`200x50` defaults). Resize messages over the rv channel can't reach
+  the in-VM claude, so terminal resize during a session won't propagate.
+- **Project paths outside tmpfs.** The path translator currently only handles
+  the `/tmp/`, `/run/`, `/dev/shm/` → `/workspace` case. For projects under
+  `/home/<user>/`, agent-vm mirrors the host path inside the VM and no
+  translation is needed; but we don't verify the patched mount actually
+  materialized that path inside the guest.
+- **OAuth refresh inside the VM.** The in-VM claude reads OAuth tokens from
+  `/agent-vm-state/claude/.credentials.json` via the state mount. Refresh
+  works through the existing intercept-hook + secrets layer. Not yet tested
+  with an expired token.
 - **PTY / interactive stdio.** The dispatcher inherits the PTY slave fds from
   the outer `--bg-pty-host`, but `agent-vm shell -- bash -c …` runs
   non-interactive ("no TTY; streaming output"). The bg-spare protocol may
