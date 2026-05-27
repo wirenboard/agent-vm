@@ -1,15 +1,12 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
-mod auto_publish;
 mod clipboard;
 mod defaults;
-mod exec_tunnel;
 mod host_paths;
 mod image_api_version;
 mod image_check;
 mod intercept_hook;
 mod msb_install;
-mod proc_net_tcp;
 mod pull;
 mod pull_progress;
 mod pulled_marker;
