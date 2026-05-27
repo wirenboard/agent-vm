@@ -111,16 +111,12 @@ fn maybe_redirect(path_c: &CStr, argv: &[CString]) -> Option<(CString, Vec<CStri
     }
     let arg1 = argv[1].to_string_lossy();
 
-    // Match either:
-    //   * `claude --bg-spare <sock>` (the `claude --bg` machinery), OR
-    //   * `claude --print --sdk-url <url> --session-id <id> …` (cloud sessions
-    //     opened via `claude remote-control`).
+    // Match the per-session spawn from `claude remote-control`:
+    //   `claude --print --sdk-url <url> --session-id <id> …`
     //
-    // The two paths use very different protocols (UDS handshake vs. JSON-stream
-    // over stdio) but both need to land inside a fresh agent-vm.
-    let is_bg_spare = arg1 == "--bg-spare";
-    let is_cloud_session = arg1 == "--print" && argv.iter().any(|a| a.to_bytes() == b"--sdk-url");
-    if !is_bg_spare && !is_cloud_session {
+    // `--print` alone is the same flag ordinary `claude --print "hi"` uses,
+    // so we also require `--sdk-url` to be present to discriminate.
+    if arg1 != "--print" || !argv.iter().any(|a| a.to_bytes() == b"--sdk-url") {
         return None;
     }
 
@@ -133,8 +129,7 @@ fn maybe_redirect(path_c: &CStr, argv: &[CString]) -> Option<(CString, Vec<CStri
         }
     };
     debug_log(&format!(
-        "intercept: {} (path={:?})",
-        if is_bg_spare { "--bg-spare" } else { "--print --sdk-url" },
+        "intercept: --print --sdk-url (path={:?})",
         path_c.to_string_lossy()
     ));
     let dispatcher_c = match CString::new(dispatcher.clone()) {
@@ -151,7 +146,7 @@ fn maybe_redirect(path_c: &CStr, argv: &[CString]) -> Option<(CString, Vec<CStri
     }
 
     debug_log(&format!(
-        "redirecting --bg-spare to dispatcher {:?} (orig path {:?})",
+        "redirecting to dispatcher {:?} (orig path {:?})",
         dispatcher,
         path_c.to_string_lossy()
     ));

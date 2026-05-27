@@ -18,12 +18,11 @@ bindir="${HOME}/.local/bin"
 # Make sure we've built first.
 shim="${here}/target/release/libclaude_vm_shim.so"
 dispatcher="${here}/target/release/claude-vm-dispatcher"
-bridge="${here}/target/release/claude-vm-bridge"
 # .so doesn't need the exec bit; bins do. Use -f for the lib and -x for bins.
-if [ ! -f "$shim" ] || [ ! -x "$dispatcher" ] || [ ! -x "$bridge" ]; then
+if [ ! -f "$shim" ] || [ ! -x "$dispatcher" ]; then
     echo "build artifacts missing — run \`cargo build --release\` from ${here} first" >&2
     echo "found:" >&2
-    ls -la "$shim" "$dispatcher" "$bridge" 2>&1 | sed 's/^/  /' >&2
+    ls -la "$shim" "$dispatcher" 2>&1 | sed 's/^/  /' >&2
     exit 1
 fi
 
@@ -43,7 +42,6 @@ echo "target root:      $target_root"
 mkdir -p "$target_root/bin" "$target_root/lib" "$bindir"
 install -m 0755 "$shim" "$target_root/lib/libclaude_vm_shim.so"
 install -m 0755 "$dispatcher" "$target_root/bin/claude-vm-dispatcher"
-install -m 0755 "$bridge" "$target_root/bin/claude-vm-bridge"
 # Copy the wrapper into the install prefix so we don't depend on source-tree
 # permissions (overlay FS sometimes strips the exec bit).
 install -m 0755 "${here}/wrapper/claude-wrapper.sh" "$target_root/bin/claude-wrapper.sh"
