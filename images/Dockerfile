@@ -21,7 +21,7 @@ LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm to
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
 
 # Image-API contract version. Bump on BREAKING image changes only
 # (new required mount points, changed env-var contracts, removed
@@ -217,9 +217,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /etc/docker \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
-        > /etc/docker/daemon.json \
- && ln -s /usr/sbin/dockerd /usr/local/bin/dockerd \
- && ln -s /usr/sbin/runc    /usr/local/bin/runc
+        > /etc/docker/daemon.json
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
