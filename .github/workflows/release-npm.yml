@@ -223,9 +223,10 @@ jobs:
         id: lk-cache
         uses: actions/cache@v4
         with:
-          # Key on version + arch + sha256 of the patch + workflow
-          # file so a patch edit or pin bump invalidates the cache.
-          key: libkrunfw-${{ steps.lkv.outputs.libkrunfw_version }}-${{ matrix.arch }}-${{ hashFiles('libkrunfw-overrides/config-libkrunfw_x86_64.patch', '.github/workflows/release-npm.yml') }}
+          # Key on version + arch + sha256 of the patches that affect
+          # this arch + workflow file. Hash only `*_${arch}.patch` so an
+          # aarch64 patch edit doesn't invalidate the x86_64 cache.
+          key: libkrunfw-${{ steps.lkv.outputs.libkrunfw_version }}-${{ matrix.arch }}-${{ hashFiles(format('libkrunfw-overrides/*_{0}.patch', matrix.arch), '.github/workflows/release-npm.yml') }}
           path: libkrunfw-out/
 
       - name: Install kernel build deps
@@ -248,7 +249,29 @@ jobs:
           git clone --branch "v${LK_V}" --depth 1 \
             https://github.com/containers/libkrunfw.git libkrunfw-src
           cd libkrunfw-src
+          # 1) kbuild .config seed (CONFIG_KVM=y + Intel/AMD backends).
           patch -p1 < ../libkrunfw-overrides/config-libkrunfw_${ARCH}.patch
+          # 2) Kernel source patches: libkrunfw's Makefile runs
+          # `patch -p1 -d $(KERNEL_SOURCES) < $patch` for every file
+          # matching `patches/0*.patch` after extracting the tarball.
+          # Drop arch-matching source patches from libkrunfw-overrides/
+          # there so they ride the same pipeline. File-naming convention:
+          # `<topic>_${ARCH}.patch` (arch-specific). The `0999-overrides-`
+          # prefix sorts them strictly after libkrunfw's own numbered
+          # patches (which currently top out in the 0010-range).
+          #
+          # `config-libkrunfw*` files are kbuild .config seeds, not
+          # kernel source patches — exclude them here. The skip pattern
+          # uses a bare `config-libkrunfw*` (no trailing underscore) so
+          # future variants like `config-libkrunfw-tdx_${ARCH}.patch`
+          # (hyphen) are also caught.
+          shopt -s nullglob
+          for p in ../libkrunfw-overrides/*_${ARCH}.patch; do
+            case "$(basename "$p")" in
+              config-libkrunfw*) continue;;
+            esac
+            cp "$p" "patches/0999-overrides-$(basename "$p")"
+          done
           # olddefconfig (run by make rule on first invocation) resolves
           # support symbols (KVM_X86, KVM_SMM, KVM_HYPERV, KVM_VFIO, …).
           make -j"$(nproc)"

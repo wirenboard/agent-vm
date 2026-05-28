@@ -1,0 +1,27 @@
+Bump x86_64 COMMAND_LINE_SIZE so libkrun's per-virtio-mmio cmdline entries
+don't truncate at higher --mount counts.
+
+x86 Linux statically allocates `boot_command_line[COMMAND_LINE_SIZE]` and
+silently truncates anything longer at setup_arch() time. libkrun appends
+one `virtio_mmio.device=4K@0xd0XXX000:NN` entry (~36 bytes) per virtio
+device, so the cmdline grows ~36 bytes per --mount on top of a ~1100-byte
+base (DEFAULT_KERNEL_CMDLINE + KRUN_ENV + MSB_BLOCK_ROOT / MSB_DIR_MOUNTS
+/ MSB_NET_* / PATH / ...). At ~26 virtio devices (N=11 user mounts) we
+hit 2048; one more mount pushes the trailing entries off the buffer,
+the kernel never registers those devices, and the guest hangs in early
+boot (kernel.log stays 0 bytes because virtio-console didn't probe).
+
+Bumping to 16384 leaves headroom for ~400 user mounts before re-hitting
+the cap.
+
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@ -4,7 +4,7 @@
+
+ #include <uapi/asm/setup.h>
+
+-#define COMMAND_LINE_SIZE 2048
++#define COMMAND_LINE_SIZE 16384
+
+ #include <linux/linkage.h>
+ #include <asm/page_types.h>

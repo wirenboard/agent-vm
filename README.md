@@ -95,7 +95,7 @@ Each launcher accepts:
 | `--no-update-check` | skip the registry HEAD on launch |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST]` | extra bind mount (subject to libkrun IRQ cap) |
+| `--mount HOST[:GUEST]` | extra bind mount (one virtio-fs each, ~210 mount headroom) |
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
@@ -155,9 +155,11 @@ exit aborts the launch.
 
 ## Troubleshooting
 
-- **`RegisterNetDevice(IrqsExhausted)` at boot** — libkrun's virtio
-  IRQ pool is saturated by project + state + net + secrets. Drop a
-  `--mount` or pass `--no-git`.
+- **`RegisterNetDevice(IrqsExhausted)` at boot** — the userspace split
+  irqchip raises the cap to ~219 IRQs, so this should only happen with
+  hundreds of `--mount`s or on a host whose KVM lacks
+  `KVM_CAP_SPLIT_IRQCHIP` (pre-Linux 4.7 or some nested-virt /
+  seccomp-restricted setups). Drop a `--mount` to recover.
 - **`handshake read id_offset: timed out`** — `free -h`; the VM needs
   more memory than is available. Try `--memory 1`.
 - **GitHub 403 from the proxy** — repo isn't in the allow-list.

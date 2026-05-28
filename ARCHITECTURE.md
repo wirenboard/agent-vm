@@ -219,10 +219,17 @@ project a given sandbox is bound to.
 
 ### Mounts: one for workspace, one for state, no third
 
-The microsandbox runtime caps virtio devices via libkrun's IRQ pool, and an
-OCI rootfs already consumes two slots (EROFS lower + ext4 upper). Adding a
-bind mount per agent state directory (claude, codex, opencode) puts us over
-the cap — `RegisterBlockDevice(IrqsExhausted)` at boot.
+When this layout was chosen, the microsandbox runtime was running with
+libkrun's default in-kernel IOAPIC, which hands ~11 IRQs to virtio-mmio
+devices total on x86_64. The OCI rootfs already consumes two slots (EROFS
+lower + ext4 upper), plus virtio-net + vsock + console + agentd's
+serial — adding a bind mount per agent state directory (claude, codex,
+opencode) pushed us over and `RegisterBlockDevice(IrqsExhausted)` at boot
+followed. We later lifted the underlying cap by enabling `msb_krun`'s
+userspace split irqchip (see "Split irqchip and the virtio-IRQ ceiling"
+below; cap is now ~219), but the one-workspace + one-state layout still
+makes sense regardless: one virtio-fs server, one rootfs `patch` entry
+per agent, and a stable on-host layout.
 
 Resolution:
 
@@ -237,7 +244,46 @@ Resolution:
     the codex binary itself and a symlink would shadow it.
 
 This keeps us at two virtio bind mounts no matter how many agents we add
-later.
+later, and leaves plenty of IRQ headroom for user-supplied `--mount`
+arguments now that the split irqchip is on.
+
+### Split irqchip and the virtio-IRQ ceiling
+
+`msb_krun` exposes a `MachineBuilder::split_irqchip(bool)` knob. With it
+off (default), libkrun uses KVM's in-kernel IOAPIC, which is hard-capped at
+24 pins and only hands IRQs 5..=15 to virtio-mmio — about 11 usable IRQs
+for the whole VM. That fills up fast: rootfs lower + rootfs upper +
+virtio-net + virtio-vsock + virtio-console + virtio-fs (project) +
+virtio-fs (state) already saturates it on this build, so an extra
+`--mount` would trip `RegisterNetDevice(IrqsExhausted)` at boot.
+
+With split_irqchip enabled, `msb_krun` runs a userspace IOAPIC backed by
+an event-loop thread it spawns automatically. The pin count rises to 219,
+which puts the practical ceiling on `--mount` well into the hundreds. The
+trade-off is one extra worker thread per VM and a slightly hotter IRQ
+delivery path; we accept it because the IRQ headroom is the difference
+between "one or two extra mounts work" and "you can stop worrying about
+the cap." aarch64/riscv64 ignore the knob — their GIC/AIA models already
+expose >200 IRQs.
+
+The runtime sets `split_irqchip(true)` unconditionally in
+`vendor/microsandbox/crates/runtime/lib/vm.rs`. The user-facing
+`--mount` doc and Phase 7's wiring in `crates/agent-vm/src/run.rs` were
+updated to drop the pre-cap warning that previously fronted the limit.
+
+The change also bumped `msb_krun` from 0.1.12 → 0.1.13 across the
+vendor crates (`runtime`, `filesystem`, `network`). 0.1.12's userspace
+IOAPIC was unusable in practice: its IRR was a single `u32` so any IRQ
+delivered on pin ≥ 32 was dropped without notice, and the redirection-
+table register-index calculation in `read`/`write` did an unchecked
+`ioregsel - IOAPIC_REG_REDTBL_BASE` that wrapped on any access below
+the redirection-table base — which the guest performs during normal
+IOAPIC programming. Both fixes landed in 0.1.13, published 2026-05-26.
+The PLAN's Discovered Upstream Issue #3 was originally attributed to
+"the libkrun IRQ cap"; with hindsight, the cap is a real KVM-level
+ceiling but the multi-mount boot failure that finally drove this work
+was a separate, fixable bug inside `msb_krun_devices`'s userspace
+IOAPIC, only ever reached once the split irqchip was turned on.
 
 ### Interactive attach vs. non-TTY exec
 
@@ -517,10 +563,13 @@ to the very next request, without rebuilding the sandbox.
 ### Token files live *outside* the guest bind mount
 
 The launcher bind-mounts the per-project `state_dir` into the guest at
-`/agent-vm-state` as a *single* mount (libkrun caps virtio IRQs, so we
-deliberately use one bind for all per-agent state instead of one per
-agent). That makes mount placement security-critical: **anything under
-`state_dir` is readable from inside the VM.**
+`/agent-vm-state` as a *single* mount. The single-bind shape originally
+fell out of libkrun's tight virtio-IRQ cap (one bind for all per-agent
+state instead of one per agent — see "Mounts: one for workspace, one
+for state, no third"), and we've kept it after lifting the cap because
+it gives a stable on-host layout and a single virtio-fs server. That
+makes mount placement security-critical: **anything under `state_dir`
+is readable from inside the VM.**
 
 The real access-token files therefore must *not* live under
 `state_dir`. They sit in a sibling host-only directory

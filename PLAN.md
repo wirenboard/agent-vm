@@ -454,9 +454,12 @@ Each is independent and lands as its own PR per the working agreement.
 **`--mount HOST:GUEST`** (repeatable). Pass extra host directories
 through to the guest as bind mounts. The launcher already mounts the
 project at its host path + the per-project state dir at
-`/agent-vm-state`; add user-supplied extras. **Mind the libkrun
-virtio-IRQ cap** (~6 devices; see Discovered Upstream Issue #3) — print
-a clear error if the user crosses it, *don't* silently fail at boot.
+`/agent-vm-state`; add user-supplied extras. Originally we worried
+about libkrun's tight virtio-IRQ cap (~11 IRQs with the in-kernel
+IOAPIC) and capped/warned on extras; that ceiling went away when we
+flipped on `msb_krun`'s userspace split irqchip in the runtime
+(`vendor/microsandbox/crates/runtime/lib/vm.rs`), raising the cap to
+~219 — see Discovered Upstream Issue #3 for the history.
 
 **Clipboard bridge.** Original `clipboard-pty.py` does a live PTY
 bridge; that's more than we need. v1 design: a per-project
@@ -629,9 +632,21 @@ or fixed in `wirenboard/microsandbox`:
    (we never see them with localhost). Only `LayerDownloadComplete` fires.
    Not exactly a bug, but undocumented and bit us when we tried to drive a
    download-bytes bar.
-3. **libkrun virtio IRQ cap is low** (~6 devices). We're constrained to
-   2 bind mounts on top of the OCI overlay's 2-device cost. Bigger fan-out
-   needs upstream tuning of the libkrun build.
+3. **libkrun virtio IRQ cap is low** with the default in-kernel IOAPIC
+   (~11 IRQs handed to virtio-mmio total on x86_64), so a config with
+   the OCI overlay's 2-device cost + virtio-net + vsock + console + a
+   couple of bind mounts saturates it and any extra `--mount` trips
+   `RegisterNetDevice(IrqsExhausted)` at boot. *Resolved* by enabling
+   `msb_krun`'s userspace split irqchip via `MachineBuilder::split_irqchip(true)`
+   in `vendor/microsandbox/crates/runtime/lib/vm.rs` — that swaps in a
+   userspace IOAPIC with ~219 usable IRQs at the cost of one extra
+   msb_krun worker thread. **Also required bumping `msb_krun` 0.1.12 →
+   0.1.13**: 0.1.12's userspace IOAPIC used a `u32` IRR (pins ≥32
+   silently dropped) and had an integer-underflow bug in the
+   redirection-table register-index reads/writes that crashed the VMM
+   mid-boot once the guest started programming RTEs. Both are fixed in
+   0.1.13. Verified e2e: 8 user --mount entries → guest brings up 19
+   virtio devices on IO-APIC pins 5..23. No effect on aarch64 / riscv64.
 4. **Manifest media-type assumptions.** Microsandbox stores the
    per-platform manifest digest; a registry HEAD on a tag returns the
    multi-arch index digest by default. Either would be fine to use, but
