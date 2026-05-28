@@ -121,11 +121,14 @@ pub struct Args {
     /// `HOST[:GUEST]`. `GUEST` defaults to `HOST` (mirror at the
     /// same absolute path). Repeatable.
     ///
-    /// Each `--mount` consumes one virtio device — libkrun caps the
-    /// IRQ pool around 6, so we only have room for a couple of
-    /// extras on top of the project + state binds. The launcher will
-    /// error clearly if you cross the cap rather than failing at
-    /// boot.
+    /// Each `--mount` consumes one virtio-fs device. The microsandbox
+    /// runtime enables msb_krun's userspace split irqchip, which on
+    /// x86_64 lifts the per-VM IRQ ceiling from 11 to ~219; aarch64 /
+    /// riscv64 always had >200 GIC/AIA IRQs and are unchanged. Either
+    /// way the practical cap on `--mount` is well into the hundreds
+    /// (shared with rootfs, network, vsock, console, and any
+    /// `--volume` disks — call it ~210 user mounts for the common
+    /// config). You can stop worrying about it for typical workloads.
     #[arg(long = "mount")]
     mount: Vec<String>,
 
@@ -183,12 +186,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // boot — that wipes any mount point our `patch` builder baked into the
     // rootfs. Fall back to /workspace and tell the user once.
     //
-    // microsandbox VMs also cap the number of virtio devices via libkrun's
-    // IRQ pool; each bind mount is one device on top of the OCI rootfs's two
-    // (EROFS lower + ext4 upper). We therefore bind a *single* host
-    // directory for all per-agent state and either symlink the agent's
-    // expected home (claude, opencode) or redirect via an env var (codex).
-    // Codex needs the env-var path because its CLI binary lives under
+    // Per-agent state lives behind a *single* bind mount, with the
+    // agent's expected home wired up via symlink (claude, opencode) or
+    // an env var (codex). The single-bind layout predates the
+    // split-irqchip switch in the runtime — it kept IRQ pressure down
+    // back when libkrun only handed out 11 virtio IRQs total. Today
+    // it's still the better shape: one virtio-fs server, one rootfs
+    // patch entry per agent, and a stable on-host layout. Codex needs
+    // the env-var path because its CLI binary lives under
     // /root/.codex/packages, which a symlink would shadow.
     let host_path = session
         .project_dir
@@ -339,6 +344,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         host_identity.as_ref(),
     )
     .context("writing guest gh/git config")?;
+
+    // Phase 7: parse `--mount HOST[:GUEST]` extras. The microsandbox
+    // runtime now enables msb_krun's userspace split irqchip (requires
+    // msb_krun >= 0.1.13 — earlier versions' userspace IOAPIC silently
+    // dropped IRQs on pin ≥ 32 and underflowed on RTE register
+    // accesses), raising the virtio-mmio IRQ cap from 11 to ~219, so
+    // we no longer need to warn or pre-cap on extra mounts. See the
+    // vendored vm.rs `build_vm` for details.
+    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    for em in &extra_mounts {
+        if !em.host.exists() {
+            anyhow::bail!("--mount host path {:?} does not exist", em.host);
+        }
+    }
 
     let is_local_registry = crate::pull::is_plain_http_registry(&image);
     let mut builder = Sandbox::builder(&session.sandbox_name)
