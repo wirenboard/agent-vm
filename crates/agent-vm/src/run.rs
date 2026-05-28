@@ -141,6 +141,19 @@ pub struct Args {
     #[arg(long = "publish", short = 'p')]
     publish: Vec<String>,
 
+    /// Lima-style host ← guest auto-port-forwarding. The runtime
+    /// polls `/proc/net/tcp{,6}` inside the guest every ~2s and
+    /// mirrors each detected wildcard (`0.0.0.0`/`[::]`) TCP LISTEN
+    /// socket onto a host listener at `127.0.0.1:<same port>` (or
+    /// an ephemeral host port if the preferred one is taken).
+    /// Loopback-only guest binds are NOT forwarded — the smoltcp
+    /// dial target is the guest's VLAN address, so a guest service
+    /// bound to `127.0.0.1` only refuses the connection. agent-vm
+    /// prints each new mapping to stderr as the runtime emits
+    /// `PortEvent`s. Off by default.
+    #[arg(long = "auto-publish", default_value_t = false)]
+    auto_publish: bool,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -468,7 +481,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
         || creds.gh_token_file.is_some();
-    if has_creds || !publish_ports.is_empty() {
+    let auto_publish = args.auto_publish;
+    if has_creds || !publish_ports.is_empty() || auto_publish {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
@@ -487,6 +501,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     PublishProto::Tcp => n.port_bind(host_bind, p.host_port, p.guest_port),
                     PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
                 };
+            }
+            if auto_publish {
+                n = n.auto_publish();
             }
             if !has_creds {
                 return n;
@@ -668,6 +685,41 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::image_api_version::check(&sandbox)
         .await
         .context("verifying image-API contract version")?;
+
+    // Subscribe to the runtime's auto-publish event stream and
+    // surface each mapping to the user. Spawned regardless of
+    // whether auto-publish is enabled — when disabled the runtime
+    // never emits events, so the subscriber just idles. Cheap.
+    if args.auto_publish {
+        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
+        let sb_for_events = sandbox.clone();
+        tokio::spawn(async move {
+            let mut events = sb_for_events.port_events().await;
+            use microsandbox::protocol::network::PortEvent;
+            while let Some(event) = events.recv().await {
+                match event {
+                    PortEvent::Added {
+                        host_bind,
+                        host_port,
+                        guest_port,
+                    } => {
+                        eprintln!(
+                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}"
+                        );
+                    }
+                    PortEvent::Removed {
+                        host_bind,
+                        host_port,
+                        guest_port,
+                    } => {
+                        eprintln!(
+                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port})"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
