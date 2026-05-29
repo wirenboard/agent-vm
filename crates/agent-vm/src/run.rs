@@ -143,14 +143,22 @@ pub struct Args {
 
     /// Lima-style host ← guest auto-port-forwarding. The runtime
     /// polls `/proc/net/tcp{,6}` inside the guest every ~2s and
-    /// mirrors each detected wildcard (`0.0.0.0`/`[::]`) TCP LISTEN
-    /// socket onto a host listener at `127.0.0.1:<same port>` (or
-    /// an ephemeral host port if the preferred one is taken).
-    /// Loopback-only guest binds are NOT forwarded — the smoltcp
-    /// dial target is the guest's VLAN address, so a guest service
-    /// bound to `127.0.0.1` only refuses the connection. agent-vm
-    /// prints each new mapping to stderr as the runtime emits
-    /// `PortEvent`s. Off by default.
+    /// mirrors each detected wildcard (`0.0.0.0`/`[::]`) OR
+    /// loopback (`127.0.0.1`/`[::1]`) TCP LISTEN socket onto a
+    /// host listener at `127.0.0.1:<same port>` (or an ephemeral
+    /// host port if the preferred one is taken). Loopback-only
+    /// guest services are reachable via an in-guest agentd
+    /// forwarder (`eth0_ip:port → 127.0.0.1:port`) — so anything
+    /// listening inside the guest, whether on the wildcard
+    /// interface or just loopback, becomes reachable on host
+    /// `127.0.0.1`. agent-vm prints each new mapping to stderr as
+    /// the runtime emits `PortEvent`s. Off by default.
+    ///
+    /// Security note: with this flag, every TCP service that
+    /// becomes reachable inside the guest is also reachable from
+    /// other processes on the host's loopback. If you don't want
+    /// that, omit `--auto-publish` and use `--publish` to expose
+    /// only the specific ports you mean to share.
     #[arg(long = "auto-publish", default_value_t = false)]
     auto_publish: bool,
 
