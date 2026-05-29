@@ -28,6 +28,7 @@ dependencies = [
  "clap",
  "console",
  "indicatif",
+ "ipnetwork",
  "libc",
  "microsandbox",
  "microsandbox-network",

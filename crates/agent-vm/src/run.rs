@@ -162,6 +162,35 @@ pub struct Args {
     #[arg(long = "auto-publish", default_value_t = false)]
     auto_publish: bool,
 
+    /// Punch a hole through the default egress policy for one IP
+    /// or CIDR. Repeatable. Examples:
+    ///   `--allow-egress 10.100.1.75`         (single host)
+    ///   `--allow-egress 10.100.1.0/24`       (CIDR)
+    ///   `--allow-egress fd00::1/128`         (IPv6)
+    ///
+    /// The default policy (`NetworkPolicy::public_only`) only
+    /// allows DNS and the `Public` destination group, so RFC1918
+    /// (10/8, 172.16/12, 192.168/16, 100.64/10), loopback, link-
+    /// local, and metadata addresses are all denied with
+    /// ECONNREFUSED. Use this flag to reach a specific dev box on
+    /// the same LAN as the host. Use `--allow-lan` instead if you
+    /// want to open the entire Private group at once.
+    #[arg(long = "allow-egress")]
+    allow_egress: Vec<String>,
+
+    /// Switch the egress policy from `public_only` to `non_local`
+    /// — adds the entire `DestinationGroup::Private` (10/8,
+    /// 172.16/12, 192.168/16, 100.64/10, fc00::/7) to the allow
+    /// list. Coarser than `--allow-egress <CIDR>`; useful for
+    /// "trust everything on my LAN". Loopback, link-local, and
+    /// metadata are still denied.
+    ///
+    /// Security note: a compromised in-guest process gets full
+    /// access to every device on your LAN with this flag. Prefer
+    /// `--allow-egress <CIDR>` for production-ish uses.
+    #[arg(long = "allow-lan", default_value_t = false)]
+    allow_lan: bool,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -475,6 +504,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         );
     }
 
+    // Parse --allow-egress entries into IpNetwork values. Same
+    // up-front-bail rule as --publish: syntax errors fail before
+    // we boot the sandbox.
+    let allow_egress_cidrs =
+        parse_allow_egress(&args.allow_egress).context("parsing --allow-egress")?;
+    for cidr in &allow_egress_cidrs {
+        eprintln!("==> Egress policy: allowing {cidr}");
+    }
+    if args.allow_lan {
+        eprintln!(
+            "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
+        );
+    }
+
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
     // guest will send, then register the OAuth refresh endpoint as a
@@ -490,7 +533,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         || creds.openai_token_file.is_some()
         || creds.gh_token_file.is_some();
     let auto_publish = args.auto_publish;
-    if has_creds || !publish_ports.is_empty() || auto_publish {
+    let allow_lan = args.allow_lan;
+    let has_egress_overrides = !allow_egress_cidrs.is_empty() || allow_lan;
+    if has_creds || !publish_ports.is_empty() || auto_publish || has_egress_overrides {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
@@ -501,6 +546,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
         let publish_ports_for_net = publish_ports.clone();
+        let allow_egress_for_net = allow_egress_cidrs.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
             for p in &publish_ports_for_net {
@@ -512,6 +558,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             }
             if auto_publish {
                 n = n.auto_publish();
+            }
+            if allow_lan {
+                use microsandbox::microsandbox_network::policy::DestinationGroup;
+                n = n.allow_egress_group(DestinationGroup::Private);
+            }
+            for cidr in &allow_egress_for_net {
+                n = n.allow_egress_cidr(*cidr);
             }
             if !has_creds {
                 return n;
@@ -1203,6 +1256,30 @@ fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
         .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
 }
 
+/// Parse `--allow-egress` entries. Each entry is an IP literal or
+/// a CIDR (e.g. `10.100.1.75` or `10.100.1.0/24`). A bare IP is
+/// expanded to a /32 (v4) or /128 (v6) CIDR — that matches the
+/// shape the policy builder's `Destination::Cidr` expects.
+fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        // Try CIDR first (foo/N); fall back to bare IP.
+        let cidr = if entry.contains('/') {
+            entry
+                .parse::<ipnetwork::IpNetwork>()
+                .with_context(|| format!("--allow-egress {entry:?}: not a valid CIDR"))?
+        } else {
+            let ip: std::net::IpAddr = entry.parse().with_context(|| {
+                format!("--allow-egress {entry:?}: not an IP address or CIDR")
+            })?;
+            // /32 for v4, /128 for v6 — single-host rule.
+            ipnetwork::IpNetwork::from(ip)
+        };
+        out.push(cidr);
+    }
+    Ok(out)
+}
+
 /// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
 /// `HOST` alone defaults `GUEST` to the same absolute path (mirror).
 /// `HOST:GUEST` lets you remap. Errors clearly on absolute-path
@@ -1678,6 +1755,44 @@ mod tests {
         // `[::1` without `]:` should be a clear error, not a silent
         // misparse.
         assert!(parse_publish_args(&["[::1:8080:80".into()]).is_err());
+    }
+
+    // ── parse_allow_egress ───────────────────────────────────────
+
+    #[test]
+    fn parse_allow_egress_accepts_bare_ipv4() {
+        let r = parse_allow_egress(&["10.100.1.75".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        // Bare IPv4 → /32 single-host CIDR.
+        assert_eq!(r[0].prefix(), 32);
+        assert_eq!(r[0].network().to_string(), "10.100.1.75");
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_ipv4_cidr() {
+        let r = parse_allow_egress(&["10.100.1.0/24".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].prefix(), 24);
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_ipv6_cidr() {
+        let r = parse_allow_egress(&["fd00::/64".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].prefix(), 64);
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_bare_ipv6() {
+        let r = parse_allow_egress(&["fd00::1".into()]).expect("ok");
+        assert_eq!(r[0].prefix(), 128);
+    }
+
+    #[test]
+    fn parse_allow_egress_rejects_garbage() {
+        assert!(parse_allow_egress(&["not-an-ip".into()]).is_err());
+        assert!(parse_allow_egress(&["10.0.0.1/99".into()]).is_err());
+        assert!(parse_allow_egress(&["".into()]).is_err());
     }
 
     #[test]
