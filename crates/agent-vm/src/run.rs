@@ -132,6 +132,68 @@ pub struct Args {
     #[arg(long = "mount")]
     mount: Vec<String>,
 
+    /// Publish a guest TCP port to the host. Format:
+    /// `[HOST_BIND:]HOST_PORT:GUEST_PORT` (docker-style). HOST_BIND
+    /// defaults to `127.0.0.1` — pass `0.0.0.0:HOST_PORT:GUEST_PORT`
+    /// to expose on every host interface. Repeatable.
+    ///
+    /// The guest service must listen on `0.0.0.0` (or the assigned
+    /// guest IP from `MSB_NET_IPV4`); a bare `127.0.0.1` bind inside
+    /// the guest is not reachable because the smoltcp dial target is
+    /// the guest's assigned VLAN address, not loopback.
+    #[arg(long = "publish", short = 'p')]
+    publish: Vec<String>,
+
+    /// Lima-style host ← guest auto-port-forwarding. The runtime
+    /// polls `/proc/net/tcp{,6}` inside the guest every ~2s and
+    /// mirrors each detected wildcard (`0.0.0.0`/`[::]`) OR
+    /// loopback (`127.0.0.1`/`[::1]`) TCP LISTEN socket onto a
+    /// host listener at `127.0.0.1:<same port>` (or an ephemeral
+    /// host port if the preferred one is taken). Loopback-only
+    /// guest services are reachable via an in-guest agentd
+    /// forwarder (`eth0_ip:port → 127.0.0.1:port`) — so anything
+    /// listening inside the guest, whether on the wildcard
+    /// interface or just loopback, becomes reachable on host
+    /// `127.0.0.1`. agent-vm prints each new mapping to stderr as
+    /// the runtime emits `PortEvent`s. Off by default.
+    ///
+    /// Security note: with this flag, every TCP service that
+    /// becomes reachable inside the guest is also reachable from
+    /// other processes on the host's loopback. If you don't want
+    /// that, omit `--auto-publish` and use `--publish` to expose
+    /// only the specific ports you mean to share.
+    #[arg(long = "auto-publish", default_value_t = false)]
+    auto_publish: bool,
+
+    /// Punch a hole through the default egress policy for one IP
+    /// or CIDR. Repeatable. Examples:
+    ///   `--allow-egress 10.100.1.75`         (single host)
+    ///   `--allow-egress 10.100.1.0/24`       (CIDR)
+    ///   `--allow-egress fd00::1/128`         (IPv6)
+    ///
+    /// The default policy (`NetworkPolicy::public_only`) only
+    /// allows DNS and the `Public` destination group, so RFC1918
+    /// (10/8, 172.16/12, 192.168/16, 100.64/10), loopback, link-
+    /// local, and metadata addresses are all denied with
+    /// ECONNREFUSED. Use this flag to reach a specific dev box on
+    /// the same LAN as the host. Use `--allow-lan` instead if you
+    /// want to open the entire Private group at once.
+    #[arg(long = "allow-egress")]
+    allow_egress: Vec<String>,
+
+    /// Switch the egress policy from `public_only` to `non_local`
+    /// — adds the entire `DestinationGroup::Private` (10/8,
+    /// 172.16/12, 192.168/16, 100.64/10, fc00::/7) to the allow
+    /// list. Coarser than `--allow-egress <CIDR>`; useful for
+    /// "trust everything on my LAN". Loopback, link-local, and
+    /// metadata are still denied.
+    ///
+    /// Security note: a compromised in-guest process gets full
+    /// access to every device on your LAN with this flag. Prefer
+    /// `--allow-egress <CIDR>` for production-ish uses.
+    #[arg(long = "allow-lan", default_value_t = false)]
+    allow_lan: bool,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -443,6 +505,38 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         })
         .env("CODEX_HOME", "/agent-vm-state/codex");
 
+    // Parse `--publish` into PublishedPort entries up front so we can
+    // wire them into the network builder below (the same place that
+    // sets up secrets/intercept). Done outside the conditional so it
+    // bails early on syntax errors regardless of cred state.
+    let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
+    for p in &publish_ports {
+        eprintln!(
+            "==> Publishing host {}:{}/{} → guest :{}",
+            p.host_bind,
+            p.host_port,
+            match p.protocol {
+                PublishProto::Tcp => "tcp",
+                PublishProto::Udp => "udp",
+            },
+            p.guest_port,
+        );
+    }
+
+    // Parse --allow-egress entries into IpNetwork values. Same
+    // up-front-bail rule as --publish: syntax errors fail before
+    // we boot the sandbox.
+    let allow_egress_cidrs =
+        parse_allow_egress(&args.allow_egress).context("parsing --allow-egress")?;
+    for cidr in &allow_egress_cidrs {
+        eprintln!("==> Egress policy: allowing {cidr}");
+    }
+    if args.allow_lan {
+        eprintln!(
+            "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
+        );
+    }
+
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
     // guest will send, then register the OAuth refresh endpoint as a
@@ -454,10 +548,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the VM at all (microsandbox's violation detector would block it
     // otherwise), even though substitution there is a no-op because
     // the body's refresh_token is a placeholder, not a header.
-    if creds.anthropic_token_file.is_some()
+    let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
-        || creds.gh_token_file.is_some()
-    {
+        || creds.gh_token_file.is_some();
+    let auto_publish = args.auto_publish;
+    let allow_lan = args.allow_lan;
+    let has_egress_overrides = !allow_egress_cidrs.is_empty() || allow_lan;
+    if has_creds || !publish_ports.is_empty() || auto_publish || has_egress_overrides {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
@@ -467,8 +564,30 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
+        let publish_ports_for_net = publish_ports.clone();
+        let allow_egress_for_net = allow_egress_cidrs.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
+            for p in &publish_ports_for_net {
+                let host_bind = p.host_bind;
+                n = match p.protocol {
+                    PublishProto::Tcp => n.port_bind(host_bind, p.host_port, p.guest_port),
+                    PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
+                };
+            }
+            if auto_publish {
+                n = n.auto_publish();
+            }
+            if allow_lan {
+                use microsandbox::microsandbox_network::policy::DestinationGroup;
+                n = n.allow_egress_group(DestinationGroup::Private);
+            }
+            for cidr in &allow_egress_for_net {
+                n = n.allow_egress_cidr(*cidr);
+            }
+            if !has_creds {
+                return n;
+            }
             // We only ever substitute into Authorization: Bearer headers.
             // Explicitly disable basic_auth so the proxy's per-chunk fast
             // path can short-circuit when the placeholder isn't present
@@ -646,6 +765,41 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::image_api_version::check(&sandbox)
         .await
         .context("verifying image-API contract version")?;
+
+    // Subscribe to the runtime's auto-publish event stream and
+    // surface each mapping to the user. Spawned regardless of
+    // whether auto-publish is enabled — when disabled the runtime
+    // never emits events, so the subscriber just idles. Cheap.
+    if args.auto_publish {
+        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
+        let sb_for_events = sandbox.clone();
+        tokio::spawn(async move {
+            let mut events = sb_for_events.port_events().await;
+            use microsandbox::protocol::network::PortEvent;
+            while let Some(event) = events.recv().await {
+                match event {
+                    PortEvent::Added {
+                        host_bind,
+                        host_port,
+                        guest_port,
+                    } => {
+                        eprintln!(
+                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}"
+                        );
+                    }
+                    PortEvent::Removed {
+                        host_bind,
+                        host_port,
+                        guest_port,
+                    } => {
+                        eprintln!(
+                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port})"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
@@ -1006,6 +1160,143 @@ fn pid_alive(pid: u32) -> bool {
 struct ExtraMount {
     host: PathBuf,
     guest: PathBuf,
+}
+
+/// One `--publish [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]` entry, parsed.
+#[derive(Clone, Debug)]
+struct PublishPort {
+    host_bind: std::net::IpAddr,
+    host_port: u16,
+    guest_port: u16,
+    protocol: PublishProto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishProto {
+    Tcp,
+    /// Reserved for when the underlying PortPublisher gains UDP
+    /// support. Parser currently rejects `/udp` so this variant
+    /// is unreachable from user input, but kept so the eventual
+    /// enable change is a single-site edit.
+    #[allow(dead_code)]
+    Udp,
+}
+
+/// Parse `--publish` entries. Accepts docker-style:
+///   `HOST_PORT:GUEST_PORT`                 → 127.0.0.1 bind, TCP
+///   `HOST_IP:HOST_PORT:GUEST_PORT`         → explicit IPv4 bind
+///   `[HOST_IP6]:HOST_PORT:GUEST_PORT`      → explicit IPv6 bind (bracket form)
+///   any of the above + `/tcp` (UDP rejected — not implemented)
+///
+/// The connection enters the smoltcp in-process stack as a dial to
+/// the guest's assigned MSB_NET_IPV4 (or v6) on `GUEST_PORT`, so the
+/// in-guest service has to listen on `0.0.0.0`/`::` (or that exact
+/// guest IP) — a bare `127.0.0.1` bind inside the guest is not
+/// reachable from the publisher.
+///
+/// `/udp` is parsed but REJECTED with a clear error: the underlying
+/// `PortPublisher::spawn_listener_one` short-circuits non-TCP ports
+/// silently, so silently accepting `/udp` would leave the user with
+/// a "published" port that has no listener. When UDP support lands
+/// upstream, drop the rejection here.
+fn parse_publish_args(raw: &[String]) -> Result<Vec<PublishPort>> {
+    use std::net::IpAddr;
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let (body, proto) = match entry.rsplit_once('/') {
+            Some((b, p)) if matches!(p, "tcp" | "udp" | "TCP" | "UDP") => {
+                (b, p.to_ascii_lowercase())
+            }
+            _ => (entry.as_str(), "tcp".to_string()),
+        };
+        if proto == "udp" {
+            anyhow::bail!(
+                "--publish {entry:?}: UDP is not yet supported by the underlying smoltcp \
+                 PortPublisher; remove `/udp` to publish a TCP port instead"
+            );
+        }
+        let protocol = PublishProto::Tcp;
+
+        // Split off an IPv6 bracketed prefix first (docker convention)
+        // so `[::1]:8080:80` doesn't trip the generic colon split.
+        let (host_bind, rest) = if let Some(after_bracket) = body.strip_prefix('[') {
+            let (v6_str, after) = after_bracket.split_once("]:").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--publish {entry:?}: bracketed IPv6 must be `[ADDR]:HOST_PORT:GUEST_PORT`"
+                )
+            })?;
+            let addr = v6_str.parse::<std::net::Ipv6Addr>().with_context(|| {
+                format!("--publish {entry:?}: HOST_BIND {v6_str:?} is not an IPv6")
+            })?;
+            (Some(IpAddr::V6(addr)), after)
+        } else {
+            (None, body)
+        };
+
+        let parts: Vec<&str> = rest.split(':').collect();
+        let (host_bind, host_port, guest_port) = match (host_bind, parts.as_slice()) {
+            (Some(bind), [h, g]) => (
+                bind,
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
+            ),
+            (None, [h, g]) => (
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
+            ),
+            (None, [ip, h, g]) => (
+                ip.parse::<IpAddr>().with_context(|| {
+                    format!("--publish {entry:?}: HOST_BIND {ip:?} is not an IP")
+                })?,
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
+            ),
+            _ => anyhow::bail!(
+                "--publish {entry:?} must be [HOST_BIND:]HOST_PORT:GUEST_PORT or \
+                 [IPv6_BIND]:HOST_PORT:GUEST_PORT"
+            ),
+        };
+        if host_port == 0 || guest_port == 0 {
+            anyhow::bail!("--publish {entry:?}: port 0 is not allowed");
+        }
+        out.push(PublishPort {
+            host_bind,
+            host_port,
+            guest_port,
+            protocol,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
+    s.parse::<u16>()
+        .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
+}
+
+/// Parse `--allow-egress` entries. Each entry is an IP literal or
+/// a CIDR (e.g. `10.100.1.75` or `10.100.1.0/24`). A bare IP is
+/// expanded to a /32 (v4) or /128 (v6) CIDR — that matches the
+/// shape the policy builder's `Destination::Cidr` expects.
+fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        // Try CIDR first (foo/N); fall back to bare IP.
+        let cidr = if entry.contains('/') {
+            entry
+                .parse::<ipnetwork::IpNetwork>()
+                .with_context(|| format!("--allow-egress {entry:?}: not a valid CIDR"))?
+        } else {
+            let ip: std::net::IpAddr = entry.parse().with_context(|| {
+                format!("--allow-egress {entry:?}: not an IP address or CIDR")
+            })?;
+            // /32 for v4, /128 for v6 — single-host rule.
+            ipnetwork::IpNetwork::from(ip)
+        };
+        out.push(cidr);
+    }
+    Ok(out)
 }
 
 /// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
@@ -1409,6 +1700,128 @@ mod tests {
         // canonicalize fails on missing paths → Err propagates.
         let r = parse_extra_mounts(&["/this/path/does/not/exist/anywhere".into()]);
         assert!(r.is_err());
+    }
+
+    // ── parse_publish_args ───────────────────────────────────────
+
+    #[test]
+    fn parse_publish_args_two_part_defaults_to_loopback_tcp() {
+        let p = parse_publish_args(&["8080:80".into()]).expect("ok");
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(p[0].host_port, 8080);
+        assert_eq!(p[0].guest_port, 80);
+        assert_eq!(p[0].protocol, PublishProto::Tcp);
+    }
+
+    #[test]
+    fn parse_publish_args_three_part_with_bind() {
+        let p = parse_publish_args(&["0.0.0.0:5000:5000".into()]).expect("ok");
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(p[0].host_port, 5000);
+        assert_eq!(p[0].guest_port, 5000);
+    }
+
+    #[test]
+    fn parse_publish_args_explicit_tcp_suffix() {
+        let p = parse_publish_args(&["8080:80/tcp".into()]).expect("ok");
+        assert_eq!(p[0].protocol, PublishProto::Tcp);
+    }
+
+    /// UDP must be REJECTED with a clear error. Previously the parser
+    /// accepted it, the stderr banner said "Publishing …/udp", and
+    /// `PortPublisher::spawn_listener_one` silently dropped it — user
+    /// got a "successful" publish that actually had no listener.
+    #[test]
+    fn parse_publish_args_rejects_udp() {
+        let err = parse_publish_args(&["53:53/udp".into()])
+            .expect_err("UDP must be rejected until upstream supports it")
+            .to_string();
+        assert!(
+            err.contains("UDP is not yet supported"),
+            "error should mention UDP unsupported, got: {err}"
+        );
+    }
+
+    /// IPv6 host bind must work via the docker-style `[ADDR]:p:p`
+    /// bracket form. Previously the parser split the whole body on
+    /// `:` and IPv6 was unreachable.
+    #[test]
+    fn parse_publish_args_ipv6_bracket_bind() {
+        let p = parse_publish_args(&["[::1]:8080:80".into()]).expect("ok");
+        assert_eq!(p[0].host_bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(p[0].host_port, 8080);
+        assert_eq!(p[0].guest_port, 80);
+    }
+
+    #[test]
+    fn parse_publish_args_ipv6_bracket_wildcard() {
+        let p = parse_publish_args(&["[::]:5000:5000".into()]).expect("ok");
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn parse_publish_args_ipv6_bracket_missing_closer_is_rejected() {
+        // `[::1` without `]:` should be a clear error, not a silent
+        // misparse.
+        assert!(parse_publish_args(&["[::1:8080:80".into()]).is_err());
+    }
+
+    // ── parse_allow_egress ───────────────────────────────────────
+
+    #[test]
+    fn parse_allow_egress_accepts_bare_ipv4() {
+        let r = parse_allow_egress(&["10.100.1.75".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        // Bare IPv4 → /32 single-host CIDR.
+        assert_eq!(r[0].prefix(), 32);
+        assert_eq!(r[0].network().to_string(), "10.100.1.75");
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_ipv4_cidr() {
+        let r = parse_allow_egress(&["10.100.1.0/24".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].prefix(), 24);
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_ipv6_cidr() {
+        let r = parse_allow_egress(&["fd00::/64".into()]).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].prefix(), 64);
+    }
+
+    #[test]
+    fn parse_allow_egress_accepts_bare_ipv6() {
+        let r = parse_allow_egress(&["fd00::1".into()]).expect("ok");
+        assert_eq!(r[0].prefix(), 128);
+    }
+
+    #[test]
+    fn parse_allow_egress_rejects_garbage() {
+        assert!(parse_allow_egress(&["not-an-ip".into()]).is_err());
+        assert!(parse_allow_egress(&["10.0.0.1/99".into()]).is_err());
+        assert!(parse_allow_egress(&["".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_publish_args_rejects_bad_input() {
+        assert!(parse_publish_args(&["80".into()]).is_err());
+        assert!(parse_publish_args(&["a:b".into()]).is_err());
+        assert!(parse_publish_args(&["0:80".into()]).is_err());
+        assert!(parse_publish_args(&["80:0".into()]).is_err());
+        assert!(parse_publish_args(&["999999:80".into()]).is_err());
+        assert!(parse_publish_args(&["1:2:3:4".into()]).is_err());
     }
 
     // ── mkdir_chain ──────────────────────────────────────────────
