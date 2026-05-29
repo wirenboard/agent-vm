@@ -1102,55 +1102,87 @@ struct PublishPort {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublishProto {
     Tcp,
+    /// Reserved for when the underlying PortPublisher gains UDP
+    /// support. Parser currently rejects `/udp` so this variant
+    /// is unreachable from user input, but kept so the eventual
+    /// enable change is a single-site edit.
+    #[allow(dead_code)]
     Udp,
 }
 
 /// Parse `--publish` entries. Accepts docker-style:
-///   `HOST_PORT:GUEST_PORT`              → 127.0.0.1 bind, TCP
-///   `HOST_IP:HOST_PORT:GUEST_PORT`      → explicit bind, TCP
-///   either form + `/udp` or `/tcp`     → explicit protocol
+///   `HOST_PORT:GUEST_PORT`                 → 127.0.0.1 bind, TCP
+///   `HOST_IP:HOST_PORT:GUEST_PORT`         → explicit IPv4 bind
+///   `[HOST_IP6]:HOST_PORT:GUEST_PORT`      → explicit IPv6 bind (bracket form)
+///   any of the above + `/tcp` (UDP rejected — not implemented)
 ///
 /// The connection enters the smoltcp in-process stack as a dial to
 /// the guest's assigned MSB_NET_IPV4 (or v6) on `GUEST_PORT`, so the
 /// in-guest service has to listen on `0.0.0.0`/`::` (or that exact
 /// guest IP) — a bare `127.0.0.1` bind inside the guest is not
 /// reachable from the publisher.
+///
+/// `/udp` is parsed but REJECTED with a clear error: the underlying
+/// `PortPublisher::spawn_listener_one` short-circuits non-TCP ports
+/// silently, so silently accepting `/udp` would leave the user with
+/// a "published" port that has no listener. When UDP support lands
+/// upstream, drop the rejection here.
 fn parse_publish_args(raw: &[String]) -> Result<Vec<PublishPort>> {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
     let mut out = Vec::with_capacity(raw.len());
     for entry in raw {
         let (body, proto) = match entry.rsplit_once('/') {
-            Some((b, p)) if matches!(p, "tcp" | "udp" | "TCP" | "UDP") => (b, p.to_ascii_lowercase()),
+            Some((b, p)) if matches!(p, "tcp" | "udp" | "TCP" | "UDP") => {
+                (b, p.to_ascii_lowercase())
+            }
             _ => (entry.as_str(), "tcp".to_string()),
         };
-        let protocol = match proto.as_str() {
-            "udp" => PublishProto::Udp,
-            _ => PublishProto::Tcp,
+        if proto == "udp" {
+            anyhow::bail!(
+                "--publish {entry:?}: UDP is not yet supported by the underlying smoltcp \
+                 PortPublisher; remove `/udp` to publish a TCP port instead"
+            );
+        }
+        let protocol = PublishProto::Tcp;
+
+        // Split off an IPv6 bracketed prefix first (docker convention)
+        // so `[::1]:8080:80` doesn't trip the generic colon split.
+        let (host_bind, rest) = if let Some(after_bracket) = body.strip_prefix('[') {
+            let (v6_str, after) = after_bracket.split_once("]:").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--publish {entry:?}: bracketed IPv6 must be `[ADDR]:HOST_PORT:GUEST_PORT`"
+                )
+            })?;
+            let addr = v6_str.parse::<std::net::Ipv6Addr>().with_context(|| {
+                format!("--publish {entry:?}: HOST_BIND {v6_str:?} is not an IPv6")
+            })?;
+            (Some(IpAddr::V6(addr)), after)
+        } else {
+            (None, body)
         };
-        let parts: Vec<&str> = body.split(':').collect();
-        let (host_bind, host_port, guest_port) = match parts.as_slice() {
-            [h, g] => (
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                h.parse::<u16>().with_context(|| {
-                    format!("--publish {entry:?}: HOST_PORT {h:?} is not a u16")
-                })?,
-                g.parse::<u16>().with_context(|| {
-                    format!("--publish {entry:?}: GUEST_PORT {g:?} is not a u16")
-                })?,
+
+        let parts: Vec<&str> = rest.split(':').collect();
+        let (host_bind, host_port, guest_port) = match (host_bind, parts.as_slice()) {
+            (Some(bind), [h, g]) => (
+                bind,
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
             ),
-            [ip, h, g] => (
+            (None, [h, g]) => (
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
+            ),
+            (None, [ip, h, g]) => (
                 ip.parse::<IpAddr>().with_context(|| {
                     format!("--publish {entry:?}: HOST_BIND {ip:?} is not an IP")
                 })?,
-                h.parse::<u16>().with_context(|| {
-                    format!("--publish {entry:?}: HOST_PORT {h:?} is not a u16")
-                })?,
-                g.parse::<u16>().with_context(|| {
-                    format!("--publish {entry:?}: GUEST_PORT {g:?} is not a u16")
-                })?,
+                parse_port(entry, "HOST_PORT", h)?,
+                parse_port(entry, "GUEST_PORT", g)?,
             ),
             _ => anyhow::bail!(
-                "--publish {entry:?} must be [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]"
+                "--publish {entry:?} must be [HOST_BIND:]HOST_PORT:GUEST_PORT or \
+                 [IPv6_BIND]:HOST_PORT:GUEST_PORT"
             ),
         };
         if host_port == 0 || guest_port == 0 {
@@ -1164,6 +1196,11 @@ fn parse_publish_args(raw: &[String]) -> Result<Vec<PublishPort>> {
         });
     }
     Ok(out)
+}
+
+fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
+    s.parse::<u16>()
+        .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
 }
 
 /// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
@@ -1596,11 +1633,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_publish_args_udp_suffix() {
-        let p = parse_publish_args(&["53:53/udp".into()]).expect("ok");
-        assert_eq!(p[0].protocol, PublishProto::Udp);
+    fn parse_publish_args_explicit_tcp_suffix() {
         let p = parse_publish_args(&["8080:80/tcp".into()]).expect("ok");
         assert_eq!(p[0].protocol, PublishProto::Tcp);
+    }
+
+    /// UDP must be REJECTED with a clear error. Previously the parser
+    /// accepted it, the stderr banner said "Publishing …/udp", and
+    /// `PortPublisher::spawn_listener_one` silently dropped it — user
+    /// got a "successful" publish that actually had no listener.
+    #[test]
+    fn parse_publish_args_rejects_udp() {
+        let err = parse_publish_args(&["53:53/udp".into()])
+            .expect_err("UDP must be rejected until upstream supports it")
+            .to_string();
+        assert!(
+            err.contains("UDP is not yet supported"),
+            "error should mention UDP unsupported, got: {err}"
+        );
+    }
+
+    /// IPv6 host bind must work via the docker-style `[ADDR]:p:p`
+    /// bracket form. Previously the parser split the whole body on
+    /// `:` and IPv6 was unreachable.
+    #[test]
+    fn parse_publish_args_ipv6_bracket_bind() {
+        let p = parse_publish_args(&["[::1]:8080:80".into()]).expect("ok");
+        assert_eq!(p[0].host_bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(p[0].host_port, 8080);
+        assert_eq!(p[0].guest_port, 80);
+    }
+
+    #[test]
+    fn parse_publish_args_ipv6_bracket_wildcard() {
+        let p = parse_publish_args(&["[::]:5000:5000".into()]).expect("ok");
+        assert_eq!(
+            p[0].host_bind,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn parse_publish_args_ipv6_bracket_missing_closer_is_rejected() {
+        // `[::1` without `]:` should be a clear error, not a silent
+        // misparse.
+        assert!(parse_publish_args(&["[::1:8080:80".into()]).is_err());
     }
 
     #[test]
