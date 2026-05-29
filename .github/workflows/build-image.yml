@@ -79,6 +79,17 @@ jobs:
           # microsandbox's `tar_ingest.rs:427` already accepts the
           # `application/vnd.oci.image.layer.v1.tar+zstd` media type.
           outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true
+          # Cache-bust the three agent-installer RUN layers each run
+          # by passing the per-build timestamp as a build-arg the
+          # Dockerfile references right before those RUNs. Without
+          # this, `cache-from: type=gha` matches the invariant
+          # `RUN curl … install.sh | bash` instruction strings and
+          # the hourly cron silently reused the same baked-in
+          # agent binaries instead of fetching new releases (the
+          # whole point of the schedule). The heavy apt/chromium/
+          # docker/node layers above the ARG stay cached.
+          build-args: |
+            AGENT_INSTALL_CACHEBUST=${{ steps.ts.outputs.tag }}
           # `cache-from`/`cache-to` keep layer rebuilds fast when only
           # the agent-version layers at the top of the Dockerfile
           # change (the common hourly case).
