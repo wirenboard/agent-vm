@@ -179,6 +179,17 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
  || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
+# Cache-bust for the three agent installers below. The workflow
+# passes the hourly timestamp tag as the value so each scheduled
+# build invalidates exactly these RUN layers (and the sanity check
+# that follows) while leaving the heavy apt/chromium/docker/node
+# layers cached. Without this the GHA layer cache reuses the
+# `curl … install.sh | bash` layers indefinitely, so hourly cron
+# runs never picked up new claude-code/codex/opencode releases.
+# Local `images/build.sh` builds leave the default empty value and
+# get the normal Docker layer-cache behaviour.
+ARG AGENT_INSTALL_CACHEBUST=
+
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
