@@ -21,12 +21,13 @@ pub struct Args {
     #[arg(long)]
     no_verify: bool,
 
-    /// Override the image reference. Defaults to
-    /// `ghcr.io/wirenboard/agent-vm-template:latest`. Source-checkout users
-    /// who built a local image can point at it
+    /// Override the image reference.
+    ///
+    /// Defaults to `ghcr.io/wirenboard/agent-vm-template:latest`.
+    /// Source-checkout users who built a local image can point at it
     /// (`--image localhost:5000/agent-vm-template:latest`) — agent-vm
     /// detects local registries and uses plain HTTP.
-    #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
+    #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
     image: Option<String>,
 }
 

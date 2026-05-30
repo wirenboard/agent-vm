@@ -18,8 +18,23 @@ mod setup;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+// Shown under the top-level `agent-vm --help`, after the command list.
+const TOP_AFTER_HELP: &str = "\
+Getting started:
+  agent-vm setup       fetch and verify the base image (run once first)
+  cd ~/your-project
+  agent-vm claude      launch in this project — or codex / opencode / shell
+
+claude, codex, opencode and shell share the same options;
+see `agent-vm claude --help` for mounts, ports, networking and credentials.";
+
 #[derive(Parser)]
-#[command(name = "agent-vm", about = "Sandboxed VMs for AI coding agents.")]
+#[command(
+    name = "agent-vm",
+    version,
+    about = "Sandboxed microVMs for AI coding agents.",
+    after_help = TOP_AFTER_HELP
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -27,26 +42,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build (and verify) the agent-vm base image.
+    /// Pull and verify the base image (run once first).
     Setup(setup::Args),
 
-    /// Pull the latest image from the registry into the microsandbox cache.
+    /// Refresh the cached base image.
     Pull(pull::Args),
 
-    /// Launch Claude Code in a sandbox mounted at the project's host path.
+    /// Launch Claude Code in a per-project sandbox.
     Claude(run::Args),
 
-    /// Launch Codex CLI in a sandbox mounted at the project's host path.
+    /// Launch Codex CLI in a per-project sandbox.
     Codex(run::Args),
 
-    /// Launch OpenCode in a sandbox mounted at the project's host path.
+    /// Launch OpenCode in a per-project sandbox.
     Opencode(run::Args),
 
-    /// Open a bash shell in a sandbox mounted at the project's host path.
+    /// Open a bash shell in a per-project sandbox.
     Shell(run::Args),
 
-    /// Exchange a string between the host and the per-project sandbox.
-    /// See `agent-vm clipboard --help`.
+    /// Exchange a string between the host and the sandbox.
     Clipboard(clipboard::Args),
 
     /// Internal: invoked by msb's interceptor hook for matched OAuth

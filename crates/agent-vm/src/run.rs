@@ -94,32 +94,77 @@ impl Agent {
     }
 }
 
+// Footer shown under `-h` (the short summary). A few high-value
+// examples plus a pointer to `--help`. Printed verbatim by clap, so
+// this is exactly what the user sees. Kept command-agnostic: all four
+// launch verbs (claude/codex/opencode/shell) share this `Args`.
+const LAUNCH_AFTER_HELP: &str = "\
+Examples:
+  agent-vm claude                  launch Claude Code in the current project
+  agent-vm shell                   open a bash shell instead
+  agent-vm claude -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
+  agent-vm claude -- --model opus  forward args to the agent (after --)
+
+Trailing args go to the agent. Run with --help for networking, security, and env details.";
+
+// Fuller footer shown under `--help`. Same command-agnostic constraint.
+const LAUNCH_AFTER_LONG_HELP: &str = "\
+Examples:
+  agent-vm claude                             launch in the current project
+  agent-vm shell                              open a bash shell instead
+  agent-vm shell -- -c 'cargo test'           run one command, then exit
+  agent-vm claude -- --model opus --resume    forward args to the agent
+  agent-vm claude --memory 8 --cpus 4         a bigger sandbox
+  agent-vm claude --mount ~/ref -p 3000:3000  extra mount + publish a port
+  agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
+
+Networking (deny-by-default; flags compose):
+  --publish [BIND:]HOST:GUEST   host  → guest   open an inbound port
+  --auto-publish                guest → host    mirror every guest listener to loopback
+  --allow-egress IP|CIDR        guest → IP/LAN  open one address or subnet
+  --allow-lan                   guest → LAN     open the whole private range
+  --allow-host                  guest → host    reach services on host 127.0.0.1
+
+Environment:
+  AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
+  AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_PROFILE                      print per-phase boot timings
+  AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
+  AGENT_VM_NO_CHROME_MCP                skip the Chrome DevTools MCP setup
+  RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
+
 #[derive(ClapArgs)]
+#[command(after_help = LAUNCH_AFTER_HELP, after_long_help = LAUNCH_AFTER_LONG_HELP)]
 pub struct Args {
-    /// Sandbox memory in GiB.
-    #[arg(long, env = "AGENT_VM_MEMORY_GIB", default_value_t = 2)]
+    /// Sandbox memory, in GiB.
+    #[arg(long, env = "AGENT_VM_MEMORY_GIB", default_value_t = 2,
+          value_name = "GIB", help_heading = "Sandbox resources")]
     memory: u32,
 
     /// vCPU count for the sandbox.
-    #[arg(long, env = "AGENT_VM_CPUS", default_value_t = 2)]
+    #[arg(long, env = "AGENT_VM_CPUS", default_value_t = 2,
+          value_name = "N", help_heading = "Sandbox resources")]
     cpus: u8,
 
-    /// Don't inject host gh/git credentials into the guest. With this
-    /// set, no gh auth flows through the proxy and the guest agent
-    /// can't `git push` / `gh pr create` etc. Useful for one-off
+    /// Don't inject host gh/git credentials into the guest.
+    ///
+    /// With this set, no gh auth flows through the proxy and the guest
+    /// agent can't `git push` / `gh pr create` etc. Useful for one-off
     /// throwaway sessions on a repo you don't trust the agent with.
-    #[arg(long = "no-git", default_value_t = false)]
+    #[arg(long = "no-git", default_value_t = false, help_heading = "GitHub access")]
     no_git: bool,
 
-    /// Add a GitHub `owner/repo` slug to the per-launch allow-list
-    /// (repeatable). The cwd's `git remote -v` GitHub entries are
-    /// always included; use this to widen for cross-repo work.
-    #[arg(long = "repo")]
+    /// Add a repo to the GitHub allow-list (repeatable).
+    ///
+    /// The cwd's `git remote -v` GitHub entries are always included;
+    /// use this to widen the allow-list for cross-repo work.
+    #[arg(long = "repo", value_name = "OWNER/REPO", help_heading = "GitHub access")]
     repo: Vec<String>,
 
-    /// Extra host directories to bind into the guest. Format:
-    /// `HOST[:GUEST]`. `GUEST` defaults to `HOST` (mirror at the
-    /// same absolute path). Repeatable.
+    /// Bind an extra host directory into the guest (repeatable).
+    ///
+    /// Format `HOST[:GUEST]`; `GUEST` defaults to `HOST` (mirror at the
+    /// same absolute path).
     ///
     /// Each `--mount` consumes one virtio-fs device. The microsandbox
     /// runtime enables msb_krun's userspace split irqchip, which on
@@ -129,24 +174,27 @@ pub struct Args {
     /// (shared with rootfs, network, vsock, console, and any
     /// `--volume` disks — call it ~210 user mounts for the common
     /// config). You can stop worrying about it for typical workloads.
-    #[arg(long = "mount")]
+    #[arg(long = "mount", value_name = "HOST[:GUEST]", help_heading = "Mounts & ports")]
     mount: Vec<String>,
 
-    /// Publish a guest TCP port to the host. Format:
-    /// `[HOST_BIND:]HOST_PORT:GUEST_PORT` (docker-style). HOST_BIND
-    /// defaults to `127.0.0.1` — pass `0.0.0.0:HOST_PORT:GUEST_PORT`
-    /// to expose on every host interface. Repeatable.
+    /// Publish a guest TCP port to the host, docker-style (repeatable).
+    ///
+    /// Format `[HOST_BIND:]HOST_PORT:GUEST_PORT`. HOST_BIND defaults to
+    /// `127.0.0.1` — pass `0.0.0.0:HOST_PORT:GUEST_PORT` to expose on
+    /// every host interface.
     ///
     /// The guest service must listen on `0.0.0.0` (or the assigned
     /// guest IP from `MSB_NET_IPV4`); a bare `127.0.0.1` bind inside
     /// the guest is not reachable because the smoltcp dial target is
     /// the guest's assigned VLAN address, not loopback.
-    #[arg(long = "publish", short = 'p')]
+    #[arg(long = "publish", short = 'p', value_name = "[BIND:]HOST:GUEST",
+          help_heading = "Mounts & ports")]
     publish: Vec<String>,
 
-    /// Lima-style host ← guest auto-port-forwarding. The runtime
-    /// polls `/proc/net/tcp{,6}` inside the guest every ~2s and
-    /// mirrors each detected wildcard (`0.0.0.0`/`[::]`) OR
+    /// Auto-forward every guest listener onto the host (Lima-style).
+    ///
+    /// The runtime polls `/proc/net/tcp{,6}` inside the guest every ~2s
+    /// and mirrors each detected wildcard (`0.0.0.0`/`[::]`) OR
     /// loopback (`127.0.0.1`/`[::1]`) TCP LISTEN socket onto a
     /// host listener at `127.0.0.1:<same port>` (or an ephemeral
     /// host port if the preferred one is taken). Loopback-only
@@ -162,14 +210,14 @@ pub struct Args {
     /// other processes on the host's loopback. If you don't want
     /// that, omit `--auto-publish` and use `--publish` to expose
     /// only the specific ports you mean to share.
-    #[arg(long = "auto-publish", default_value_t = false)]
+    #[arg(long = "auto-publish", default_value_t = false, help_heading = "Mounts & ports")]
     auto_publish: bool,
 
-    /// Punch a hole through the default egress policy for one IP
-    /// or CIDR. Repeatable. Examples:
-    ///   `--allow-egress 10.100.1.75`         (single host)
-    ///   `--allow-egress 10.100.1.0/24`       (CIDR)
-    ///   `--allow-egress fd00::1/128`         (IPv6)
+    /// Allow guest egress to one IP or CIDR (repeatable).
+    ///
+    /// Examples: `--allow-egress 10.100.1.75` (single host),
+    /// `--allow-egress 10.100.1.0/24` (CIDR),
+    /// `--allow-egress fd00::1/128` (IPv6).
     ///
     /// The default policy (`NetworkPolicy::public_only`) only
     /// allows DNS and the `Public` destination group, so RFC1918
@@ -178,10 +226,12 @@ pub struct Args {
     /// ECONNREFUSED. Use this flag to reach a specific dev box on
     /// the same LAN as the host. Use `--allow-lan` instead if you
     /// want to open the entire Private group at once.
-    #[arg(long = "allow-egress")]
+    #[arg(long = "allow-egress", value_name = "IP|CIDR", help_heading = "Network egress")]
     allow_egress: Vec<String>,
 
-    /// Switch the egress policy from `public_only` to `non_local`
+    /// Allow guest egress to the whole private LAN.
+    ///
+    /// Switches the egress policy from `public_only` to `non_local`
     /// — adds the entire `DestinationGroup::Private` (10/8,
     /// 172.16/12, 192.168/16, 100.64/10, fc00::/7) to the allow
     /// list. Coarser than `--allow-egress <CIDR>`; useful for
@@ -191,11 +241,12 @@ pub struct Args {
     /// Security note: a compromised in-guest process gets full
     /// access to every device on your LAN with this flag. Prefer
     /// `--allow-egress <CIDR>` for production-ish uses.
-    #[arg(long = "allow-lan", default_value_t = false)]
+    #[arg(long = "allow-lan", default_value_t = false, help_heading = "Network egress")]
     allow_lan: bool,
 
-    /// Allow the guest to reach services bound to `127.0.0.1` on the
-    /// host. The smoltcp stack rewrites the per-sandbox gateway IP
+    /// Allow the guest to reach the host's 127.0.0.1 services.
+    ///
+    /// The smoltcp stack rewrites the per-sandbox gateway IP
     /// (resolves as `host.microsandbox.internal` inside the guest)
     /// to host's loopback, so e.g. a dev server bound to
     /// `127.0.0.1:8080` on the host becomes reachable from the guest
@@ -209,22 +260,27 @@ pub struct Args {
     /// listening on a TCP port — becomes reachable from a possibly-
     /// compromised in-guest process. Use only when you actually need
     /// it.
-    #[arg(long = "allow-host", default_value_t = false)]
+    #[arg(long = "allow-host", default_value_t = false, help_heading = "Network egress")]
     allow_host: bool,
 
-    /// Override the OCI image reference. Default:
-    /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
-    /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
-    #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
+    /// Override the OCI image reference.
+    ///
+    /// Default: `ghcr.io/wirenboard/agent-vm-template:latest`. Use a
+    /// timestamped tag (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
+    #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF", help_heading = "Image")]
     image: Option<String>,
 
-    /// Don't HEAD the registry for a newer manifest digest at
-    /// launch (skips the "==> A newer image is available …" banner).
-    /// Useful in CI and on flaky networks.
-    #[arg(long = "no-update-check", default_value_t = false)]
+    /// Skip the launch-time registry update check.
+    ///
+    /// Don't HEAD the registry for a newer manifest digest (skips the
+    /// "==> A newer image is available …" banner). Useful in CI and on
+    /// flaky networks.
+    #[arg(long = "no-update-check", default_value_t = false, help_heading = "Image")]
     no_update_check: bool,
 
-    /// Args forwarded verbatim to the in-sandbox agent command. Use `--` if
+    /// Args passed verbatim to the agent; use -- before any agent flags.
+    ///
+    /// Forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     agent_args: Vec<String>,

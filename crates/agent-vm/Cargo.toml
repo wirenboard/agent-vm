@@ -13,7 +13,10 @@ path = "src/main.rs"
 [dependencies]
 microsandbox = { path = "../../vendor/microsandbox/crates/microsandbox" }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
-clap = { version = "4.5", features = ["derive", "env"] }
+# `wrap_help` makes clap detect the terminal width and wrap long help
+# text to it; without it the multi-paragraph `--help` prose renders as
+# unbroken one-line-per-paragraph walls.
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 anyhow = "1.0"
 base64 = "0.22"
 sha2 = "0.10"
