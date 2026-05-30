@@ -1921,8 +1921,16 @@ mod tests {
 
 async fn notify_if_update_available(image: &str) {
     use crate::image_check::{UpdateState, check_for_update};
-    match check_for_update(image).await {
-        Ok(Some(UpdateState::UpdateAvailable { cached, remote })) => {
+    // The probe does up to three sequential registry round-trips for a
+    // token-auth registry (manifest GET → 401 → token → authed GET),
+    // each carrying its own 5s per-request timeout. This runs inline on
+    // the launch hot path before boot, so cap the whole thing: a slow or
+    // flaky registry must never delay launch by more than a single
+    // request's worth of wait. The banner is best-effort — on timeout we
+    // simply stay quiet and continue with the cached image.
+    let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
+    match probe.await {
+        Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) => {
             eprintln!(
                 "==> A newer image is available in the registry (cached {cached}, registry {remote})"
             );
@@ -1931,8 +1939,15 @@ async fn notify_if_update_available(image: &str) {
             );
         }
         // UpToDate / NotCached: nothing to say.
-        // None / Err: registry unreachable etc. — stay quiet.
+        // Ok(Err)/None: registry unreachable etc. — stay quiet.
+        // Err(Elapsed): probe exceeded the budget — stay quiet.
         _ => {}
     }
 }
+
+/// Wall-clock budget for the launch-path update probe. Bounds the worst
+/// case across all of the probe's registry round-trips so a slow or
+/// unreachable registry can't stall boot; matches a single request's
+/// per-request timeout in `image_check`.
+const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
