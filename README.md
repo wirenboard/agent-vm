@@ -153,6 +153,28 @@ the launcher sources it inside the guest before exec'ing the agent.
 Use for `npm install`, env exports, dev-server startup. Non-zero
 exit aborts the launch.
 
+## Ports & egress
+
+The default network policy (`public_only`) lets the guest reach
+the public internet plus DNS, and denies everything else
+(loopback, RFC1918 LAN, link-local, cloud-metadata, the host).
+Open holes per-launch with these flags — they compose:
+
+| flag | what it opens | guest-side address |
+|---|---|---|
+| `--publish HOST:GUEST[/proto]` | host port `HOST` → guest port `GUEST` (`tcp` default; `/udp` for UDP) | inbound to the guest |
+| `--auto-publish` | every `0.0.0.0:*` / `127.0.0.1:*` listener inside the guest is mirrored to the host loopback (Lima-style) | host: `127.0.0.1:<guest-port>` |
+| `--allow-egress IP\|CIDR` (repeatable) | one IP or one CIDR through the egress deny | dial directly by IP |
+| `--allow-lan` | the whole `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) | dial any LAN IP |
+| `--allow-host` | the per-sandbox gateway IP, which the smoltcp stack rewrites to host `127.0.0.1` | `host.microsandbox.internal:<port>` (already in guest `/etc/hosts`) |
+
+Loopback (guest's own `127.0.0.1`), link-local, and cloud metadata
+(`169.254.169.254`) stay denied even with `--allow-lan` — they're
+disjoint groups by design. `--allow-host` is the narrowest way to
+reach a dev server bound to host `127.0.0.1`; `--allow-lan` is the
+broadest. A compromised in-guest process gets full access to
+whatever you open, so prefer the narrowest flag that fits.
+
 ## Troubleshooting
 
 - **`RegisterNetDevice(IrqsExhausted)` at boot** — the userspace split
