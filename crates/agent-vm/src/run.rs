@@ -194,6 +194,24 @@ pub struct Args {
     #[arg(long = "allow-lan", default_value_t = false)]
     allow_lan: bool,
 
+    /// Allow the guest to reach services bound to `127.0.0.1` on the
+    /// host. The smoltcp stack rewrites the per-sandbox gateway IP
+    /// (resolves as `host.microsandbox.internal` inside the guest)
+    /// to host's loopback, so e.g. a dev server bound to
+    /// `127.0.0.1:8080` on the host becomes reachable from the guest
+    /// at `host.microsandbox.internal:8080`. Adds the
+    /// `DestinationGroup::Host` (the gateway IP only) to the allow
+    /// list; loopback, link-local, metadata, and the wider LAN
+    /// remain denied.
+    ///
+    /// Security note: anything bound to the host's loopback —
+    /// including admin UIs, dev DBs, the Docker socket if it's
+    /// listening on a TCP port — becomes reachable from a possibly-
+    /// compromised in-guest process. Use only when you actually need
+    /// it.
+    #[arg(long = "allow-host", default_value_t = false)]
+    allow_host: bool,
+
     /// Override the OCI image reference. Default:
     /// `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
@@ -536,6 +554,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
         );
     }
+    if args.allow_host {
+        eprintln!(
+            "==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable)"
+        );
+    }
 
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
@@ -553,7 +576,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         || creds.gh_token_file.is_some();
     let auto_publish = args.auto_publish;
     let allow_lan = args.allow_lan;
-    let has_egress_overrides = !allow_egress_cidrs.is_empty() || allow_lan;
+    let allow_host = args.allow_host;
+    let has_egress_overrides = !allow_egress_cidrs.is_empty() || allow_lan || allow_host;
     if has_creds || !publish_ports.is_empty() || auto_publish || has_egress_overrides {
         use crate::secrets::*;
         let anthropic = creds.anthropic_token_file.clone();
@@ -581,6 +605,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             if allow_lan {
                 use microsandbox::microsandbox_network::policy::DestinationGroup;
                 n = n.allow_egress_group(DestinationGroup::Private);
+            }
+            if allow_host {
+                use microsandbox::microsandbox_network::policy::DestinationGroup;
+                n = n.allow_egress_group(DestinationGroup::Host);
             }
             for cidr in &allow_egress_for_net {
                 n = n.allow_egress_cidr(*cidr);
