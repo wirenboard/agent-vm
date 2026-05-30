@@ -24,11 +24,12 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Override the image reference. Defaults to
-    /// `ghcr.io/wirenboard/agent-vm-template:latest` or the value of
-    /// `AGENT_VM_IMAGE_TAG`. Use a timestamped tag
+    /// Override the image reference.
+    ///
+    /// Defaults to `ghcr.io/wirenboard/agent-vm-template:latest` or the
+    /// value of `AGENT_VM_IMAGE_TAG`. Use a timestamped tag
     /// (`...:YYYY-MM-DDTHH`) to pin a specific build.
-    #[arg(long, env = "AGENT_VM_IMAGE_TAG")]
+    #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
     image: Option<String>,
 }
 
