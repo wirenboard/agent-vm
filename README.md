@@ -171,3 +171,6 @@ exit aborts the launch.
 - [PLAN.md](PLAN.md) — phased roadmap, what's done, what's deferred.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
+- [AGENTS.md](AGENTS.md) — conventions for coding agents (Claude
+  Code, Codex, etc.) working on this repo: post-merge version bump,
+  submodule-merge ordering, what not to do.
