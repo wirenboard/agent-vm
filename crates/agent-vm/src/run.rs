@@ -294,6 +294,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // image available — the user runs `agent-vm pull` explicitly to
     // fetch it.
     if !args.no_update_check {
+        // Give the banner a baseline to compare against on *this* launch,
+        // not just future ones: if the image is already cached but we have
+        // no recorded pulled-digest yet, seed the marker from the cache
+        // first, then probe.
+        seed_pulled_marker_if_absent(image.as_str()).await;
         notify_if_update_available(image.as_str()).await;
     }
 
@@ -1944,6 +1949,42 @@ mod tests {
         let slugs = parse_gitmodules_github_slugs(&tmp);
         std::fs::remove_dir_all(&tmp).ok();
         assert!(slugs.is_empty(), "no .gitmodules → no slugs, got {slugs:?}");
+    }
+}
+
+/// Seed the pulled-digest marker from microsandbox's cache when we have
+/// no record yet, so the update banner has a baseline to diff against on
+/// this very launch.
+///
+/// The marker (what the banner compares to the registry) was historically
+/// written *only* by `agent-vm pull`. A user who acquired the image via a
+/// launch's `IfMissing` auto-pull — or via an older agent-vm that never
+/// wrote it — had no baseline, so the banner could never fire. Here, if
+/// the image is already cached and unmarked, we record its per-platform
+/// manifest digest. Then a stale cache trips the banner on the next probe
+/// (i.e. immediately, since the call below seeds before we probe).
+///
+/// Safe on the launch path: `IfMissing` never re-pulls, so `Image::get`'s
+/// digest is accurate (the re-pull staleness that makes pull.rs avoid
+/// `Image::get` — see pulled_marker.rs — can't apply here). Verified
+/// empirically that `Image::get(...).manifest_digest()` is the same
+/// per-platform digest `image_check::fetch_remote_digest` returns, so the
+/// comparison is apples-to-apples. Only ever *seed* — never overwrite an
+/// existing marker, which is the authoritative record of our last pull.
+async fn seed_pulled_marker_if_absent(image: &str) {
+    if crate::pulled_marker::read(image).is_some() {
+        return;
+    }
+    // Not cached yet (genuine first run) → Image::get errors → nothing to
+    // seed, and there's correctly nothing newer to flag: the imminent
+    // IfMissing pull lands the current image.
+    if let Ok(handle) = microsandbox::Image::get(image).await
+        && let Some(digest) = handle.manifest_digest()
+    {
+        match crate::pulled_marker::write(image, digest) {
+            Ok(()) => tracing::debug!(image, digest, "seeded pulled-digest baseline from cache"),
+            Err(e) => tracing::warn!(error = %e, "failed to seed pulled-digest marker"),
+        }
     }
 }
 
