@@ -3,8 +3,8 @@
 # tool itself (that's the Rust binary published as
 # @wirenboard/agent-vm on npm).
 #
-# Contents: Debian 13 slim + the three AI coding agents (Claude
-# Code, OpenCode, Codex), minimum dev tooling, and the docker engine
+# Contents: Debian 13 slim + the four AI coding agents (Claude
+# Code, OpenCode, Codex, GitHub Copilot), minimum dev tooling, and the docker engine
 # (docker.io + containerd + runc + fuse-overlayfs). Other heavy
 # extras (LSPs, additional MCP servers, docker-buildx) are
 # deliberately deferred.
@@ -17,7 +17,7 @@
 FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="agent-vm guest template"
-LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
+LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
@@ -241,8 +241,15 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 # Codex CLI official installer.
 RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
 
+# D1: GitHub Copilot CLI. Its own RUN layer so the AGENT_INSTALL_CACHEBUST
+# arg above invalidates it on the hourly build like the other agents, and
+# so a wrong package/binary name fails the image build loudly (via the
+# `copilot --version` smoke check) instead of surfacing as a
+# command-not-found inside the guest at `agent-vm copilot` time.
+RUN npm install -g @github/copilot && copilot --version
+
 # Sanity check at build time so a broken installer surfaces before we push.
-RUN claude --version && opencode --version && codex --version \
+RUN claude --version && opencode --version && codex --version && copilot --version \
  && dockerd --version && docker --version && containerd --version && runc --version
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.

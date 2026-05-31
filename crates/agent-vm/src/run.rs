@@ -61,6 +61,7 @@ pub enum Agent {
     Claude,
     Codex,
     Opencode,
+    Copilot,
     Shell,
 }
 
@@ -70,6 +71,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Opencode => "opencode",
+            Agent::Copilot => "copilot",
             Agent::Shell => "bash",
         }
     }
@@ -89,6 +91,14 @@ impl Agent {
         match self {
             Agent::Claude => &["--dangerously-skip-permissions"],
             Agent::Shell => &["-O", "histappend"],
+            // Copilot CLI's `--allow-all-tools` disables its in-VM
+            // "may I run this?" confirmations. The microVM is the
+            // security boundary, so the extra prompts add no
+            // protection and break non-interactive / agent-mode
+            // flows — same reasoning as `--dangerously-skip-permissions`
+            // for Claude. Drop it (`-> &[]`) if the user already
+            // passed it; the filter in `launch` handles that.
+            Agent::Copilot => &["--allow-all-tools"],
             Agent::Codex | Agent::Opencode => &[],
         }
     }
@@ -96,8 +106,8 @@ impl Agent {
 
 // Footer shown under `-h` (the short summary). A few high-value
 // examples plus a pointer to `--help`. Printed verbatim by clap, so
-// this is exactly what the user sees. Kept command-agnostic: all four
-// launch verbs (claude/codex/opencode/shell) share this `Args`.
+// this is exactly what the user sees. Kept command-agnostic: all
+// launch verbs (claude/codex/opencode/copilot/shell) share this `Args`.
 const LAUNCH_AFTER_HELP: &str = "\
 Examples:
   agent-vm claude                  launch Claude Code in the current project
@@ -107,7 +117,8 @@ Examples:
 
 Trailing args go to the agent. Run with --help for networking, security, and env details.";
 
-// Fuller footer shown under `--help`. Same command-agnostic constraint.
+// Fuller footer shown under `--help`. Same command-agnostic
+// constraint: claude/codex/opencode/copilot/shell all share this.
 const LAUNCH_AFTER_LONG_HELP: &str = "\
 Examples:
   agent-vm claude                             launch in the current project
@@ -433,8 +444,33 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("==> GitHub repo scope: <none> (no api.github.com access)");
     }
 
-    let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
-        .context("snapshotting host credentials")?;
+    // D1: the Copilot API is reached with a GitHub OAuth token, but
+    // unlike the gh CLI / repo-push path it is not repo-scoped — so
+    // Copilot's token capture and egress must follow the *selected
+    // agent*, not `use_github`. A user running `agent-vm copilot` in a
+    // non-GitHub project (or with `--no-git`) still expects Copilot to
+    // work; conversely a claude/codex/opencode/shell session in a
+    // GitHub repo should NOT get Copilot egress opened or a duplicate
+    // gh token written to a copilot secret file it never uses.
+    let want_copilot = matches!(agent, Agent::Copilot);
+
+    let creds =
+        crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github, want_copilot)
+            .context("snapshotting host credentials")?;
+
+    // D1: when Copilot is the selected agent but no usable token could
+    // be captured, fail loudly here. Otherwise the guest would send
+    // `Authorization: Bearer msb-copilot-placeholder-v2` to the Copilot
+    // API with no registered substitution entry — the proxy drops the
+    // connection (violation scan) or GitHub returns a confusing 401.
+    if want_copilot && creds.copilot_token_file.is_none() {
+        anyhow::bail!(
+            "no GitHub Copilot token found on the host. Sign in on the host \
+             (e.g. `gh auth login` with a Copilot seat, or run the Copilot \
+             device-flow login that writes ~/.cache/claude-vm/copilot-token.json) \
+             and retry, or pick another agent."
+        );
+    }
 
     // RAII guard so the Phase-5 host-cred mutation check runs on
     // *every* exit path from launch() — including `?` propagation
@@ -563,6 +599,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     "/root/.config/opencode",
                     true,
                 )
+                // D1: GitHub Copilot CLI reads/writes ~/.copilot/
+                // (config.json with trusted_folders + the placeholder
+                // token, plus its session state). secrets::refresh
+                // writes the config under <state>/copilot; this exposes
+                // it at the standard path inside the guest.
+                .symlink("/agent-vm-state/copilot", "/root/.copilot", true)
                 // Phase 6: gh/git config sits at /root/.gitconfig and
                 // /root/.config/gh. write_guest_gh_config writes both
                 // into state_dir; these symlinks expose them at the
@@ -634,7 +676,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the body's refresh_token is a placeholder, not a header.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
-        || creds.gh_token_file.is_some();
+        || creds.gh_token_file.is_some()
+        || creds.copilot_token_file.is_some();
     let auto_publish = args.auto_publish;
     let allow_lan = args.allow_lan;
     let allow_host = args.allow_host;
@@ -646,6 +689,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let opencode = creds.opencode_openai_access_token_file.clone();
         let gh = creds.gh_token_file.clone();
         let has_gh = gh.is_some();
+        // D1 least-privilege: only wire the Copilot secret (and thus
+        // open Copilot-API egress) when Copilot is the selected agent.
+        // `creds.copilot_token_file` can be `Some` for a claude/codex
+        // session too (gh-fallback capture when `use_github`), but a
+        // non-Copilot launch must not carry a Copilot egress allow-host
+        // or a duplicated gh token in a secret it never uses.
+        let copilot = if want_copilot {
+            creds.copilot_token_file.clone()
+        } else {
+            None
+        };
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
@@ -743,6 +797,23 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .allow_host(GITHUB_OBJECTS_HOST)
                 });
             }
+            // D1: GitHub Copilot CLI sends `Authorization: Bearer
+            // <COPILOT_TOKEN_PLACEHOLDER>` to the Copilot API; the
+            // proxy swaps the placeholder for the real GitHub OAuth
+            // token. Copilot streams responses, so disable basic_auth
+            // to keep the per-chunk fast path (same reasoning as the
+            // Anthropic/OpenAI secrets above — only the bearer header
+            // ever needs substitution here).
+            if let Some(file) = copilot {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_COPILOT_UNUSED")
+                        .value(file)
+                        .placeholder(COPILOT_TOKEN_PLACEHOLDER)
+                        .inject_basic_auth(false)
+                        .allow_host(COPILOT_API_HOST)
+                        .allow_host(COPILOT_API_INDIVIDUAL_HOST)
+                });
+            }
             n.intercept(|i| {
                 let mut hook_argv: Vec<String> = vec![
                     self_path.to_string_lossy().to_string(),
@@ -819,6 +890,28 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // in-guest CLI's extra guard would just block us from getting work
     // done. Same env var the original Bash agent-vm used.
     builder = builder.env("IS_SANDBOX", "1");
+
+    // D1: GitHub Copilot CLI reads its token from COPILOT_GITHUB_TOKEN.
+    // Hand it the placeholder; the credential proxy substitutes the real
+    // GitHub OAuth token for it on the wire to the Copilot API. We set
+    // it via env (not just ~/.copilot/config.json) because attach()'s
+    // execve never sources /etc/profile.d, unlike the original Bash
+    // agent-vm.
+    //
+    // Only set when Copilot is the selected agent. Exporting the
+    // placeholder for a claude/codex/opencode/shell session would have
+    // the guest emit `Authorization: Bearer msb-copilot-placeholder-v2`
+    // to the Copilot API with no registered substitution entry (the
+    // copilot secret is gated on the same condition above), which the
+    // proxy drops as a violation or GitHub rejects with a 401. By here,
+    // a Copilot launch is guaranteed to have a captured token (we bailed
+    // earlier otherwise), so the placeholder always resolves.
+    if want_copilot {
+        builder = builder.env(
+            "COPILOT_GITHUB_TOKEN",
+            crate::secrets::COPILOT_TOKEN_PLACEHOLDER,
+        );
+    }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
     eprintln!(
