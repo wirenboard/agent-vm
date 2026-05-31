@@ -966,7 +966,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     //    `secrets::write_default_claude_root_state` on the same env
     //    var keeps the opt-out actually opt-out — no sudo, no
     //    certutil fork.
-    let project_guest_path_escaped = shell_escape(&project_guest_path);
     // Env-var semantics: `AGENT_VM_NO_CHROME_MCP` set to *any* value
     // (including empty) opts out. Matches `AGENT_VM_PROFILE` /
     // `AGENT_VM_DEBUG_CONFIG` in the same codebase. Unconventional vs
@@ -1008,25 +1007,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
              fi\n",
         )
     };
-    let prelude = format!(
-        "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
-         [ -t 0 ] || exec < /dev/null\n\
-         {chrome_mcp_prelude}\
-         _hook={path}/.agent-vm.runtime.sh\n\
-         if [ -f \"$_hook\" ]; then\n\
-         \techo \"==> sourcing $_hook\" >&2\n\
-         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
-         fi",
-        path = project_guest_path_escaped,
+    // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
+    // which is unit-tested directly. The IPv6-nameserver strip is the
+    // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
+    let shell_line = build_agent_shell_line(
+        &project_guest_path,
+        &chrome_mcp_prelude,
+        inner_cmd,
+        &inner_args,
     );
-    let prelude = prelude.as_str();
-    let mut shell_line = String::from(prelude);
-    shell_line.push_str("; exec ");
-    shell_line.push_str(&shell_escape(inner_cmd));
-    for a in &inner_args {
-        shell_line.push(' ');
-        shell_line.push_str(&shell_escape(a));
-    }
     let cmd = "bash";
     let agent_args: Vec<String> = vec!["-c".into(), shell_line];
 
@@ -1632,6 +1621,66 @@ fn parse_github_slug(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// Bash snippet (one logical line) that removes **only** IPv6 `nameserver`
+/// entries from the guest's `/etc/resolv.conf`.
+///
+/// microsandbox's agentd writes both an IPv4 and an IPv6 gateway-DNS
+/// `nameserver` line at boot. The IPv6 entry is unresponsive in at least
+/// one nested-libkrun config (the gateway times out on v6 DNS queries —
+/// PLAN.md item B3 / upstream microsandbox issue #5). glibc's
+/// `getaddrinfo` quietly falls through to the working v4 server, but a
+/// strict async resolver (codex's hickory) returns `EAI_AGAIN`
+/// ("Try again") and hangs at startup with "failed to lookup address
+/// information", even though `getent hosts <host>` resolves instantly.
+///
+/// The sed address `/^nameserver .*:/` deletes a line iff it starts with
+/// `nameserver ` *and* its value contains a colon. Every IPv6 literal
+/// contains a colon; no IPv4 dotted-quad does — so v4 `nameserver` lines,
+/// `# comments` (the `^nameserver` anchor won't match a leading `#`),
+/// `search` and `options` lines are all left intact. `2>/dev/null
+/// || true` keeps a read-only or absent resolv.conf from aborting the
+/// prelude.
+///
+/// This is the cheaper of the two B3 options: a microsandbox-side
+/// `network.dns(disable_ipv6)` knob would mean a submodule change to
+/// agentd's resolv.conf writer; stripping one line in the launcher
+/// prelude is self-contained and has no upstream-merge dependency.
+const STRIP_IPV6_NAMESERVERS: &str =
+    "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
+
+/// Build the `bash -c` line that runs inside the guest: the prelude
+/// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
+/// optional project runtime hook) followed by `exec`'ing the chosen
+/// agent with its args. Pure and string-only so it can be unit-tested
+/// without booting a sandbox — the launch path calls exactly this, so
+/// the tested behavior and the live behavior cannot drift.
+fn build_agent_shell_line(
+    project_guest_path: &str,
+    chrome_mcp_prelude: &str,
+    inner_cmd: &str,
+    inner_args: &[String],
+) -> String {
+    let path = shell_escape(project_guest_path);
+    let prelude = format!(
+        "{STRIP_IPV6_NAMESERVERS}\n\
+         [ -t 0 ] || exec < /dev/null\n\
+         {chrome_mcp_prelude}\
+         _hook={path}/.agent-vm.runtime.sh\n\
+         if [ -f \"$_hook\" ]; then\n\
+         \techo \"==> sourcing $_hook\" >&2\n\
+         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
+         fi",
+    );
+    let mut shell_line = prelude;
+    shell_line.push_str("; exec ");
+    shell_line.push_str(&shell_escape(inner_cmd));
+    for a in inner_args {
+        shell_line.push(' ');
+        shell_line.push_str(&shell_escape(a));
+    }
+    shell_line
+}
+
 /// Single-quote `s` for use as a single argv element in a `bash -c`
 /// line. Embedded single quotes are split out with the standard
 /// `'\''` trick. Adequate for forwarding arbitrary user-supplied agent
@@ -1660,6 +1709,92 @@ mod tests {
         assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
         assert_eq!(shell_escape("don't"), "'don'\\''t'");
         assert_eq!(shell_escape(""), "''");
+    }
+
+    // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
+
+    #[test]
+    fn build_agent_shell_line_starts_with_v6_strip_and_execs() {
+        let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
+        // The prelude opens with the IPv6-nameserver strip, sourced from
+        // the single `STRIP_IPV6_NAMESERVERS` const so the live launch
+        // path and this test can't drift.
+        assert!(line.starts_with(STRIP_IPV6_NAMESERVERS), "got: {line}");
+        assert!(line.starts_with("sed -i '/^nameserver .*:/d' /etc/resolv.conf"));
+        assert!(line.contains("exec 'claude'"));
+    }
+
+    #[test]
+    fn build_agent_shell_line_includes_chrome_prelude_and_args() {
+        let line =
+            build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
+        assert!(line.contains("CHROME_CA_STUFF"));
+        assert!(line.contains("exec 'codex' 'exec'"));
+    }
+
+    /// Guard the exact `sed` program in `STRIP_IPV6_NAMESERVERS`. The
+    /// regex is load-bearing (see the const's doc comment): an accidental
+    /// edit that dropped the `^` anchor or the `:` class would silently
+    /// start eating IPv4 nameservers or comment lines, leaving the guest
+    /// with no DNS at all.
+    #[test]
+    fn strip_ipv6_nameservers_snippet_is_the_expected_sed() {
+        assert_eq!(
+            STRIP_IPV6_NAMESERVERS,
+            "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true",
+        );
+    }
+
+    /// Reimplement the `sed '/^nameserver .*:/d'` predicate in Rust and
+    /// assert it removes **only** IPv6 `nameserver` lines: IPv4
+    /// nameservers, comments, `search` and `options` must survive. This
+    /// exercises the regex *intent* without needing a live VM (the real
+    /// strip runs inside the guest, which we can't boot here).
+    #[test]
+    fn sed_predicate_removes_only_ipv6_nameservers() {
+        // Mirror `sed` address `/^nameserver .*:/`: delete iff the line
+        // begins exactly with "nameserver " (so a leading '#' comment is
+        // NOT matched — the `^` anchors before `nameserver`) AND a colon
+        // appears somewhere after that prefix (i.e. in the value).
+        fn deleted_by_sed(line: &str) -> bool {
+            match line.strip_prefix("nameserver ") {
+                Some(value) => value.contains(':'),
+                None => false,
+            }
+        }
+
+        let resolv = "\
+# generated by agentd
+nameserver 10.0.2.3
+nameserver 192.168.1.1
+nameserver fec0::3
+nameserver fe80::1%eth0
+nameserver 2001:4860:4860::8888
+# nameserver 2001:db8::1
+search lan example.com
+options ndots:2 timeout:1";
+
+        let kept: Vec<&str> = resolv.lines().filter(|l| !deleted_by_sed(l)).collect();
+
+        // IPv4 nameservers survive.
+        assert!(kept.contains(&"nameserver 10.0.2.3"));
+        assert!(kept.contains(&"nameserver 192.168.1.1"));
+        // Comments survive, including a commented-out IPv6 nameserver.
+        assert!(kept.contains(&"# generated by agentd"));
+        assert!(kept.contains(&"# nameserver 2001:db8::1"));
+        // `search` / `options` survive even though `options` contains a
+        // colon (the `^nameserver` anchor protects them).
+        assert!(kept.contains(&"search lan example.com"));
+        assert!(kept.contains(&"options ndots:2 timeout:1"));
+
+        // Every IPv6 nameserver line is gone (global, link-local with a
+        // zone id, and ULA forms all carry a colon).
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver fec0::3")));
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver fe80::1")));
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver 2001:")));
+
+        // No surviving line is an (uncommented) IPv6 nameserver.
+        assert!(!kept.iter().any(|l| deleted_by_sed(l)));
     }
 
     // ── parse_github_slug ────────────────────────────────────────
