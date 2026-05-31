@@ -682,7 +682,15 @@ fn write_response(bytes: &[u8]) -> Result<()> {
 }
 
 fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
-    trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
+    // Single-flight: serialize host-side rotations for this provider so
+    // two racing in-guest refreshes don't each spawn `claude -p`. The
+    // first waiter rotates; the second, on acquiring the lock, finds the
+    // token file freshly rewritten and skips its own host CLI. The lock
+    // is Anthropic-specific so a concurrent OpenAI refresh isn't blocked.
+    let _flight = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC)?;
+    if !token_recently_rotated(&secrets::anthropic_token_path(state_dir)) {
+        trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
+    }
 
     let host_path = host_claude_creds_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
@@ -720,15 +728,22 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
-    trigger_host_refresh(
-        "codex",
-        &[
-            "exec",
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "Reply with OK",
-        ],
-    )?;
+    // Single-flight (see `refresh_anthropic`): serialize host rotations
+    // and skip the `codex exec` if the token file was just rewritten by
+    // the launcher that held the lock before us. OpenAI-specific lock so
+    // an in-flight Anthropic refresh doesn't serialize against this one.
+    let _flight = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI)?;
+    if !token_recently_rotated(&secrets::openai_token_path(state_dir)) {
+        trigger_host_refresh(
+            "codex",
+            &[
+                "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "Reply with OK",
+            ],
+        )?;
+    }
 
     let host_path = host_codex_auth_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
@@ -758,13 +773,301 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
     Ok(http_200_json(&serde_json::to_vec(&body)?))
 }
 
+/// How recently a token file must have been rewritten for the
+/// single-flight waiter to trust it and skip its own host rotation.
+///
+/// Tied to [`HOST_REFRESH_TIMEOUT`]: a host `claude -p` / `codex exec`
+/// is *allowed* to take up to that long, so a fixed 10 s window would
+/// silently no-op in exactly the slow-rotation case the optimization is
+/// meant to help — the holder finishes after, say, 25 s, and the waiter
+/// then sees an mtime older than 10 s and redundantly re-runs the host
+/// CLI even though the token it would read is current. Matching the
+/// window to the rotation budget means a just-completed slow rotation is
+/// still recognized as fresh. This is safe: the file's mtime is only
+/// bumped by an actual successful rotation write, and host access tokens
+/// live far longer than 90 s, so we never serve a stale token. A small
+/// slack is added so a waiter that wakes slightly after the holder
+/// returns still counts the rotation as fresh.
+const REFRESH_FRESHNESS_WINDOW: std::time::Duration =
+    HOST_REFRESH_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
+
+/// True if `path` exists and was modified within
+/// [`REFRESH_FRESHNESS_WINDOW`]. Used by the second single-flight
+/// waiter to decide it can re-read the just-rotated token file instead
+/// of spawning another host CLI. Any error (missing file, clock skew
+/// making mtime appear in the future) conservatively returns `false`
+/// so we fall back to actually refreshing.
+fn token_recently_rotated(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    match modified.elapsed() {
+        Ok(age) => age <= REFRESH_FRESHNESS_WINDOW,
+        Err(_) => false,
+    }
+}
+
+/// Advisory cross-process lock serializing host-side OAuth refreshes
+/// for one provider within a single project. Held for the duration of
+/// one `refresh_anthropic` / `refresh_openai` call so two in-guest
+/// agents (or two launchers) racing the *same* provider's token
+/// rotation don't each spawn a host `claude -p` / `codex exec`.
+///
+/// The lock is keyed per provider (see [`secrets::refresh_lock_path_for`]):
+/// an Anthropic rotation and an OpenAI rotation touch independent host
+/// artifacts, so they hold different lock files and may run
+/// concurrently — only same-provider refreshes serialize.
+///
+/// Uses a non-blocking `flock(LOCK_EX|LOCK_NB)` polled with a deadline
+/// — already available via the `libc` dependency, so no new crate. The
+/// lock is associated with the open file description and released
+/// automatically when the fd is closed on `Drop` (or if the process
+/// dies), so a crashed refresh can't wedge future rotations.
+struct RefreshLock {
+    /// `Some` when we actually hold the flock; `None` when [`acquire`]
+    /// timed out waiting for a wedged-but-live holder and we degraded
+    /// to proceeding without serialization (see [`acquire`]). The fd is
+    /// still kept open in that case so `Drop` is uniform, but no
+    /// `LOCK_UN` is issued.
+    file: Option<std::fs::File>,
+}
+
+impl RefreshLock {
+    /// Acquire the per-provider refresh lock named `lock_name` (e.g.
+    /// [`secrets::REFRESH_LOCK_ANTHROPIC`]).
+    ///
+    /// Bounded wait: a live-but-wedged holder must not block a waiter
+    /// indefinitely, which would reintroduce the unbounded stall the
+    /// [`HOST_REFRESH_TIMEOUT`] cap was added to prevent (review #8).
+    /// We poll `LOCK_EX|LOCK_NB` until the ceiling, then degrade to
+    /// proceeding *without* the lock — i.e. the pre-feature behavior of
+    /// just refreshing. That can cost a redundant host CLI spawn in the
+    /// rare wedged-holder case, but keeps the whole refresh path time
+    /// bounded, which matters more.
+    fn acquire(state_dir: &Path, lock_name: &str) -> Result<Self> {
+        Self::acquire_with_ceiling(state_dir, lock_name, HOST_REFRESH_TIMEOUT)
+    }
+
+    fn acquire_with_ceiling(
+        state_dir: &Path,
+        lock_name: &str,
+        ceiling: std::time::Duration,
+    ) -> Result<Self> {
+        let path = secrets::refresh_lock_path_for(state_dir, lock_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating secrets dir {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening refresh lock {}", path.display()))?;
+        use std::os::unix::io::AsRawFd as _;
+        use std::time::Instant;
+        let fd = file.as_raw_fd();
+        let start = Instant::now();
+        // Poll interval is small relative to a host rotation (seconds);
+        // the extra wakeups over a ~90 s ceiling are negligible.
+        let poll = std::time::Duration::from_millis(50);
+        loop {
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(Self { file: Some(file) });
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // Held by someone else — wait and retry until the ceiling.
+                Some(libc::EWOULDBLOCK) => {
+                    if start.elapsed() >= ceiling {
+                        // Degrade to no-lock rather than block forever on
+                        // a wedged-but-live holder. `file: None` so Drop
+                        // issues no LOCK_UN we never took.
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "refresh lock contended past {}s; proceeding without single-flight",
+                            ceiling.as_secs(),
+                        );
+                        return Ok(Self { file: None });
+                    }
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                _ => {
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("flock(LOCK_EX|LOCK_NB) on {}", path.display())));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // Only unlock if we actually acquired it; a timed-out acquire
+        // never took the lock, so issuing LOCK_UN would be wrong (and
+        // could release a lock another fd in this process holds, though
+        // that doesn't happen here).
+        if let Some(file) = &self.file {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod refresh_lock_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn token_recently_rotated_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("anthropic");
+        // Missing file -> not fresh.
+        assert!(!token_recently_rotated(&f));
+        // Just-written file -> fresh.
+        std::fs::write(&f, b"tok").unwrap();
+        assert!(token_recently_rotated(&f));
+    }
+
+    /// Two threads contending the same project lock must run their
+    /// critical sections one at a time. We track the number of holders
+    /// inside the locked region and assert it never exceeds one.
+    #[test]
+    fn contending_threads_serialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("proj");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let in_section = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+
+        let spawn = |state: std::path::PathBuf,
+                     in_section: Arc<AtomicUsize>,
+                     max_concurrent: Arc<AtomicUsize>,
+                     acquisitions: Arc<AtomicUsize>| {
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _guard = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
+                        .expect("acquire");
+                    acquisitions.fetch_add(1, Ordering::SeqCst);
+                    let now = in_section.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Record the peak observed concurrency.
+                    max_concurrent.fetch_max(now, Ordering::SeqCst);
+                    // Hold briefly to widen the race window.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    in_section.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let t1 = spawn(
+            state.clone(),
+            in_section.clone(),
+            max_concurrent.clone(),
+            acquisitions.clone(),
+        );
+        let t2 = spawn(
+            state.clone(),
+            in_section.clone(),
+            max_concurrent.clone(),
+            acquisitions.clone(),
+        );
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 40);
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "flock failed to serialize: two holders entered the critical section at once"
+        );
+    }
+
+    /// Different providers use different lock files, so a holder of the
+    /// Anthropic lock must not block an OpenAI acquire (and vice versa).
+    #[test]
+    fn distinct_providers_do_not_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("proj");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let anthropic = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
+            .expect("anthropic acquire");
+        // Holding the Anthropic lock, an OpenAI acquire must succeed
+        // immediately (not time out, not degrade) — it's a different file.
+        let openai = RefreshLock::acquire_with_ceiling(
+            &state,
+            secrets::REFRESH_LOCK_OPENAI,
+            std::time::Duration::from_millis(50),
+        )
+        .expect("openai acquire");
+        // Both genuinely hold their locks.
+        assert!(openai.file.is_some(), "openai should hold its own lock");
+        drop(anthropic);
+        drop(openai);
+    }
+
+    /// A live-but-wedged holder must not block a waiter past the
+    /// ceiling: the second acquire returns within the bound and degrades
+    /// to the no-lock state instead of hanging forever.
+    #[test]
+    fn bounded_wait_degrades_when_holder_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("proj");
+        std::fs::create_dir_all(&state).unwrap();
+
+        // First holder keeps the lock for the whole test.
+        let _held = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
+            .expect("first acquire");
+
+        let ceiling = std::time::Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let second = RefreshLock::acquire_with_ceiling(
+            &state,
+            secrets::REFRESH_LOCK_ANTHROPIC,
+            ceiling,
+        )
+        .expect("second acquire returns Ok (degraded)");
+        let waited = start.elapsed();
+
+        // Returned within a small multiple of the ceiling (not blocked
+        // indefinitely), and degraded to no-lock.
+        assert!(
+            waited < ceiling * 4,
+            "acquire blocked {waited:?}, expected ~{ceiling:?}"
+        );
+        assert!(
+            second.file.is_none(),
+            "contended acquire past ceiling must degrade to the no-lock state"
+        );
+    }
+}
+
+/// Bound on how long we'll wait for a host `claude -p` / `codex exec`
+/// to drive a token rotation. A hung host CLI must not keep the in-VM
+/// agent's OAuth refresh waiting indefinitely (review #8). 90 s is
+/// enough for normal claude/codex round-trips and small enough to
+/// surface a problem before the guest agent's own timeout fires.
+///
+/// Shared so the single-flight lock-wait ceiling
+/// ([`RefreshLock::acquire`]) and the freshness window
+/// ([`REFRESH_FRESHNESS_WINDOW`]) stay tied to the actual rotation
+/// budget rather than drifting from it.
+const HOST_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
-    // Bounded wait so a hung host CLI doesn't keep the in-VM agent's
-    // OAuth refresh waiting indefinitely (review #8). 90 s is enough
-    // for normal claude/codex round-trips and small enough to surface
-    // a problem before the guest agent's own timeout fires.
     use std::time::{Duration, Instant};
-    const TIMEOUT: Duration = Duration::from_secs(90);
+    const TIMEOUT: Duration = HOST_REFRESH_TIMEOUT;
 
     let mut child = Command::new(cmd)
         .args(args)

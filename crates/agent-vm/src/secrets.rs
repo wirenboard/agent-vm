@@ -174,6 +174,64 @@ pub fn gh_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir(state_dir).join("gh")
 }
 
+/// Per-provider advisory lock file serializing host-side OAuth refreshes
+/// for one provider within a single project. The in-VM agent's
+/// `_intercept-hook` acquires an exclusive `flock` on this path before
+/// spawning a host `claude -p` / `codex exec` to drive a token rotation,
+/// so two racing in-guest refreshes of the *same* provider don't each
+/// launch their own host CLI.
+///
+/// Keyed per provider (`name` is e.g. [`REFRESH_LOCK_ANTHROPIC`]) so a
+/// concurrent Anthropic and OpenAI in-guest refresh don't serialize
+/// against each other — they rotate independent host credential files
+/// and write distinct token files, so there is no shared state to guard
+/// across providers. Lives in the host-only [`host_secret_dir`] (never
+/// bind-mounted into the guest), alongside the token files the refresh
+/// rewrites.
+///
+/// Note: the launcher's [`refresh`] uses a *different*, single shared
+/// lock ([`ProjectRefreshLock`]) because it does read-modify-write on
+/// per-project state files shared across all providers (`claude.json`,
+/// `claude/settings.json`, `opencode-config/opencode.json`), so its
+/// critical section genuinely spans every provider.
+pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
+    host_secret_dir(state_dir).join(name)
+}
+
+/// Lock basename for the Anthropic in-guest refresh single-flight.
+pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
+/// Lock basename for the OpenAI in-guest refresh single-flight.
+pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+
+#[cfg(test)]
+mod refresh_lock_tests {
+    use super::*;
+
+    #[test]
+    fn per_provider_lock_paths_are_distinct_and_in_secret_dir() {
+        let state = Path::new("/home/u/.cache/agent-vm/abc123");
+        let anthropic = refresh_lock_path_for(state, REFRESH_LOCK_ANTHROPIC);
+        let openai = refresh_lock_path_for(state, REFRESH_LOCK_OPENAI);
+        // Two providers must not share a lock file.
+        assert_ne!(anthropic, openai);
+        // Expected concrete paths in the sibling `<name>.secrets/` dir.
+        assert_eq!(
+            anthropic,
+            Path::new("/home/u/.cache/agent-vm/abc123.secrets/.refresh.anthropic.lock")
+        );
+        assert_eq!(
+            openai,
+            Path::new("/home/u/.cache/agent-vm/abc123.secrets/.refresh.openai.lock")
+        );
+        // Both live in the host-only secrets dir, never under state_dir
+        // (which is bind-mounted into the guest).
+        assert_eq!(anthropic.parent(), anthropic_token_path(state).parent());
+        assert_eq!(openai.parent(), anthropic_token_path(state).parent());
+        assert!(!anthropic.starts_with(state));
+        assert!(!openai.starts_with(state));
+    }
+}
+
 /// OpenCode reuses the same OpenAI access token file: both Codex and
 /// OpenCode hit api.openai.com / chatgpt.com and the proxy substitutes
 /// each provider's distinct placeholder string for the same real
