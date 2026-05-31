@@ -350,12 +350,18 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // image available — the user runs `agent-vm pull` explicitly to
     // fetch it.
     if !args.no_update_check {
-        // Give the banner a baseline to compare against on *this* launch,
-        // not just future ones: if the image is already cached but we have
-        // no recorded pulled-digest yet, seed the marker from the cache
-        // first, then probe.
-        seed_pulled_marker_if_absent(image.as_str()).await;
-        notify_if_update_available(image.as_str()).await;
+        // The update banner is purely informational, so keep it OFF the
+        // launch critical path: seed the baseline pulled-digest marker
+        // (so the banner has something to compare against on this launch,
+        // not just future ones) and probe the registry in the background.
+        // The banner prints if the ~0.9s ghcr.io round-trip resolves
+        // during boot; otherwise it's simply skipped and the next launch
+        // catches up. Previously this was awaited and blocked every boot.
+        let img = image.clone();
+        tokio::spawn(async move {
+            seed_pulled_marker_if_absent(&img).await;
+            notify_if_update_available(&img).await;
+        });
     }
 
     // Snapshot host credentials into per-project token files and place
@@ -951,67 +957,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // docker compose up, env-var exports). Runs once per launch with
     // PWD set to the project dir; non-zero exit aborts the launch
     // with the same exit code.
-    // 3. Adds the microsandbox MITM CA to the `chrome` user's NSS DB
-    //    so chromium (launched by chrome-devtools-mcp under that user
-    //    via /usr/local/bin/agent-vm-chrome-mcp) verifies the
-    //    intercepted TLS chain instead of failing every HTTPS page
-    //    with ERR_CERT_AUTHORITY_INVALID. The CA file
-    //    `/usr/local/share/ca-certificates/microsandbox-ca.crt` is
-    //    written into the guest by agentd at boot, so this can't be
-    //    baked into the image — the per-boot CA is what we have to
-    //    inject. Trust string is `-t C,,` (trusted issuer of *server*
-    //    certs only; the leading `T` would also mark it as a trusted
-    //    issuer of client certs, which we don't want). Only injected
-    //    when the chrome MCP is enabled: gating both here and in
-    //    `secrets::write_default_claude_root_state` on the same env
-    //    var keeps the opt-out actually opt-out — no sudo, no
-    //    certutil fork.
+    // (Importing the microsandbox MITM CA into the `chrome` user's NSS
+    // DB — needed because chromium on Linux ignores the system CA bundle
+    // and honours only its per-user NSS DB, so the chrome-devtools MCP
+    // would otherwise fail every HTTPS page with ERR_CERT_AUTHORITY_INVALID
+    // — used to run here, a ~270ms `certutil` fork on *every* launch's
+    // critical path. It now lives in the in-image `agent-vm-chrome-mcp`
+    // wrapper, so it runs once when the chrome MCP actually starts: off
+    // the launch path, and skipped entirely when chrome is unused. The CA
+    // is per-install (not bakeable into the shared image); see
+    // images/Dockerfile.)
     let project_guest_path_escaped = shell_escape(&project_guest_path);
-    // Env-var semantics: `AGENT_VM_NO_CHROME_MCP` set to *any* value
-    // (including empty) opts out. Matches `AGENT_VM_PROFILE` /
-    // `AGENT_VM_DEBUG_CONFIG` in the same codebase. Unconventional vs
-    // "VAR=0 means off" — documented here so the next reader doesn't
-    // re-flag it.
-    let chrome_mcp_prelude = if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
-        String::new()
-    } else {
-        // Image-fresh NSS DB starts empty on every launch (the sandbox
-        // name carries the launcher PID — see session.rs — so every
-        // invocation creates a fresh rootfs upper layer rather than
-        // reusing a prior one), so `certutil -A` always runs against
-        // the same baseline; no chance of accumulating duplicate trust
-        // entries across boots.
-        //
-        // Failure modes worth surfacing (vs silently swallowing with
-        // `|| true` like the original Phase 7 patch): sudoers
-        // dropped/world-writable, NSS DB corrupted, CA file missing
-        // because agentd's TLS init didn't run, or chrome user
-        // removed in a downstream image. Without a warning, every
-        // chrome MCP HTTPS request would return
-        // `ERR_CERT_AUTHORITY_INVALID` with no breadcrumb back to the
-        // launcher. Stderr is captured in a temp file and tail'd on
-        // failure so the user sees the actual certutil/sudo error
-        // rather than a generic "non-zero exit".
-        String::from(
-            "if [ -f /usr/local/share/ca-certificates/microsandbox-ca.crt ] \\\n\
-                     && [ -d /home/chrome/.pki/nssdb ]; then\n\
-             \t_cu_err=$(mktemp)\n\
-             \tif ! sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \\\n\
-             \t\t-t C,, -n microsandbox \\\n\
-             \t\t-i /usr/local/share/ca-certificates/microsandbox-ca.crt 2>\"$_cu_err\"; then\n\
-             \t\techo \"==> warning: failed to install microsandbox CA into chrome NSS DB;\" >&2\n\
-             \t\techo \"==>          HTTPS in chrome-devtools MCP will fail with ERR_CERT_AUTHORITY_INVALID.\" >&2\n\
-             \t\techo \"==>          certutil/sudo stderr:\" >&2\n\
-             \t\tsed 's/^/==>          /' \"$_cu_err\" >&2\n\
-             \tfi\n\
-             \trm -f \"$_cu_err\"\n\
-             fi\n",
-        )
-    };
     let prelude = format!(
         "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
          [ -t 0 ] || exec < /dev/null\n\
-         {chrome_mcp_prelude}\
          _hook={path}/.agent-vm.runtime.sh\n\
          if [ -f \"$_hook\" ]; then\n\
          \techo \"==> sourcing $_hook\" >&2\n\

@@ -311,10 +311,76 @@ pub struct HostGitIdentity {
 /// which makes git refuse to commit rather than silently attribute to
 /// `agent-vm`.
 pub fn discover_host_git_identity() -> Option<HostGitIdentity> {
-    if let Some(id) = gh_api_user_identity() {
+    // `gh api user` is an HTTPS round-trip to api.github.com that costs
+    // ~0.3–1.3s and runs on the *pre-boot critical path* of every
+    // launch — yet the answer (your name/email/login) almost never
+    // changes. Cache the resolved identity with a short TTL so only the
+    // first launch in the window pays the network cost; subsequent
+    // launches resolve it instantly. The cache holds only display-level
+    // strings (already validated by `is_config_safe`), never tokens.
+    if let Some(id) = read_identity_cache() {
         return Some(id);
     }
-    host_git_config_identity()
+    let id = gh_api_user_identity().or_else(host_git_config_identity);
+    if let Some(ref id) = id {
+        write_identity_cache(id);
+    }
+    id
+}
+
+/// TTL for the cached host git identity. Long enough to take the
+/// `gh api user` round-trip off essentially every launch, short enough
+/// that switching `gh` accounts / editing `git config user.*` is
+/// reflected the same day.
+const GIT_IDENTITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+fn identity_cache_path() -> Option<PathBuf> {
+    Some(
+        crate::host_paths::state_root()?
+            .join("cache")
+            .join("host-git-identity"),
+    )
+}
+
+/// Read the cached identity if present and fresher than
+/// [`GIT_IDENTITY_CACHE_TTL`]. Re-validates with [`is_config_safe`] so a
+/// tampered cache file can't smuggle gitconfig sections into the guest.
+fn read_identity_cache() -> Option<HostGitIdentity> {
+    let p = identity_cache_path()?;
+    let age = std::fs::metadata(&p).ok()?.modified().ok()?.elapsed().ok()?;
+    if age > GIT_IDENTITY_CACHE_TTL {
+        return None;
+    }
+    let data = std::fs::read_to_string(&p).ok()?;
+    let mut lines = data.lines();
+    let name = lines.next()?.to_string();
+    let email = lines.next()?.to_string();
+    let gh = lines.next().unwrap_or("");
+    if name.is_empty() || email.is_empty() || !is_config_safe(&name) || !is_config_safe(&email) {
+        return None;
+    }
+    Some(HostGitIdentity {
+        name,
+        email,
+        gh_login: (!gh.is_empty()).then(|| gh.to_string()),
+    })
+}
+
+/// Persist the resolved identity (best-effort; cache misses are cheap).
+fn write_identity_cache(id: &HostGitIdentity) {
+    let Some(p) = identity_cache_path() else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = format!(
+        "{}\n{}\n{}\n",
+        id.name,
+        id.email,
+        id.gh_login.as_deref().unwrap_or("")
+    );
+    let _ = atomic_write(&p, body.as_bytes(), 0o600);
 }
 
 /// Cap on how long we'll wait for `gh api user`. The call is an HTTPS
