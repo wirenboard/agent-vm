@@ -1,0 +1,15 @@
+# Cross-compilation linkers.
+#
+# The `agent-vm` binary and the patched `msb` link a handful of C
+# libraries (libcap-ng, libdbus, libsqlite3) plus the usual libc, so a
+# cross build needs the matching cross linker — the default `cc` only
+# knows how to emit host (x86_64) objects.
+#
+# CI (release-npm.yml, build-agent-vm/build-msb aarch64 matrix legs)
+# installs `gcc-aarch64-linux-gnu` for the linker and the arm64 dev
+# libraries (`libcap-ng-dev:arm64 libdbus-1-dev:arm64
+# libsqlite3-dev:arm64`, enabled via `dpkg --add-architecture arm64`)
+# so the final link resolves. Locally, install the same Debian/Ubuntu
+# packages to reproduce.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

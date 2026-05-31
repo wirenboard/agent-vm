@@ -9,15 +9,14 @@ Templates and tooling for distributing `agent-vm` via npm.
   and `execve`s the prebuilt native binary from the matching
   per-platform subpackage. Declares per-platform subpackages as
   `optionalDependencies` so npm installs only the right one.
-- `agent-vm-linux-x64/` — per-platform subpackage. Ships the
-  prebuilt `bin/agent-vm`, the patched `bin/msb`, and
-  `lib/libkrunfw.so.5.2.1`. agent-vm finds `msb` and `libkrunfw` via
-  `current_exe()`-relative paths so a user's separate microsandbox
-  install never shadows them.
-- Future per-platform subpackages: `-linux-arm64`, `-darwin-arm64`,
-  `-darwin-x64`, `-win32-x64`. Add to the launcher's
-  `PLATFORM_PACKAGES` map and to the main package's
-  `optionalDependencies`.
+- `agent-vm-linux-x64/`, `agent-vm-linux-arm64/` — per-platform
+  subpackages. Each ships the prebuilt `bin/agent-vm`, the patched
+  `bin/msb`, and `lib/libkrunfw.so.5.2.1`. agent-vm finds `msb` and
+  `libkrunfw` via `current_exe()`-relative paths so a user's separate
+  microsandbox install never shadows them.
+- Future per-platform subpackages: `-darwin-arm64`, `-darwin-x64`,
+  `-win32-x64`. Add to the launcher's `PLATFORM_PACKAGES` map and to
+  the main package's `optionalDependencies`.
 
 ## How releases happen
 

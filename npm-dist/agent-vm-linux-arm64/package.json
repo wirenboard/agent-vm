@@ -1,0 +1,22 @@
+{
+  "name": "@wirenboard/agent-vm-linux-arm64",
+  "version": "0.0.0",
+  "description": "agent-vm prebuilt binary + patched msb + libkrunfw for linux-arm64.",
+  "homepage": "https://github.com/wirenboard/agent-vm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wirenboard/agent-vm.git"
+  },
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": [
+    "bin/agent-vm",
+    "bin/msb",
+    "lib/libkrunfw.so.*",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
