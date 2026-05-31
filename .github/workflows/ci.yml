@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev
+
+      - name: Build
+        run: cargo build --release -p agent-vm
+
+      - name: Test
+        run: cargo test -p agent-vm
+
+      - name: Format check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy -p agent-vm --release -- -D warnings
