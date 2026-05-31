@@ -96,10 +96,11 @@ impl Agent {
 
 // Footer shown under `-h` (the short summary). A few high-value
 // examples plus a pointer to `--help`. Printed verbatim by clap, so
-// this is exactly what the user sees. Kept command-agnostic: all four
-// launch verbs (claude/codex/opencode/shell) share this `Args`.
+// this is exactly what the user sees. One `Args` backs all four launch
+// verbs (claude/codex/opencode/shell), so this footer can't vary per
+// verb — the examples use `claude` and the header says so.
 const LAUNCH_AFTER_HELP: &str = "\
-Examples:
+Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude                  launch Claude Code in the current project
   agent-vm shell                   open a bash shell instead
   agent-vm claude -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
@@ -107,27 +108,29 @@ Examples:
 
 Trailing args go to the agent. Run with --help for networking, security, and env details.";
 
-// Fuller footer shown under `--help`. Same command-agnostic constraint.
+// Fuller footer shown under `--help`. Same single-`Args` constraint.
 const LAUNCH_AFTER_LONG_HELP: &str = "\
-Examples:
+Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude                             launch in the current project
   agent-vm shell                              open a bash shell instead
-  agent-vm shell -- -c 'cargo test'           run one command, then exit
+  agent-vm shell -- cargo test                run one command, then exit
   agent-vm claude -- --model opus --resume    forward args to the agent
   agent-vm claude --memory 8 --cpus 4         a bigger sandbox
   agent-vm claude --mount ~/ref -p 3000:3000  extra mount + publish a port
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
 
 Networking (deny-by-default; flags compose):
-  --publish [BIND:]HOST:GUEST   host  → guest   open an inbound port
-  --auto-publish                guest → host    mirror every guest listener to loopback
-  --allow-egress IP|CIDR        guest → IP/LAN  open one address or subnet
-  --allow-lan                   guest → LAN     open the whole private range
-  --allow-host                  guest → host    reach services on host 127.0.0.1
+  --publish        host  → guest   open an inbound port to a guest service
+  --auto-publish   guest → host    mirror guest listeners onto host loopback
+  --allow-egress   guest → IP/LAN  reach one IP or subnet
+  --allow-lan      guest → LAN     reach the whole private range
+  --allow-host     guest → host    reach the host's 127.0.0.1 services
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls
+  AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                skip the Chrome DevTools MCP setup
@@ -187,7 +190,7 @@ pub struct Args {
     /// guest IP from `MSB_NET_IPV4`); a bare `127.0.0.1` bind inside
     /// the guest is not reachable because the smoltcp dial target is
     /// the guest's assigned VLAN address, not loopback.
-    #[arg(long = "publish", short = 'p', value_name = "[BIND:]HOST:GUEST",
+    #[arg(long = "publish", short = 'p', value_name = "[BIND:]HOST_PORT:GUEST_PORT",
           help_heading = "Mounts & ports")]
     publish: Vec<String>,
 
