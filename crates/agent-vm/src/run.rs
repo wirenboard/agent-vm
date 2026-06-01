@@ -23,6 +23,26 @@ use crate::session::ProjectSession;
 /// a host project rooted here and fall back to `/workspace` instead.
 const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 
+/// Environment variables agent-vm injects into *every* guest, regardless of
+/// agent or project. Listed in one place so the set is discoverable and
+/// guard-testable.
+///
+/// - `IS_SANDBOX=1`: Claude Code refuses to run as root with
+///   `--dangerously-skip-permissions` unless this is set. The microVM is our
+///   security boundary, so the in-guest CLI's extra guard is redundant; same
+///   var the original Bash agent-vm used.
+/// - `LANG=C.UTF-8`: the base image ships with no locale (`LANG`/`LC_*`
+///   empty → C/POSIX). That breaks non-ASCII paths two ways: bash/readline
+///   draws a Cyrillic cwd as `M-P…` meta-escapes instead of glyphs, and
+///   locale-driven filesystem encodings default to ASCII so Python/Node/
+///   ripgrep mis-handle or error on a non-ASCII path even when it mounted
+///   fine. C.UTF-8 is always present in glibc (no `locale-gen`), ASCII-
+///   sorting + English-messages but UTF-8-aware — the right neutral sandbox
+///   default. We don't propagate the host's `$LANG` (that locale may not
+///   exist in the guest image and would silently fall back to C). Also
+///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
+const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
+
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
         Some(s) => s,
@@ -31,6 +51,66 @@ fn guest_path_is_safe(project: &Path) -> bool {
     !TMPFS_GUEST_PREFIXES
         .iter()
         .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+}
+
+/// Whether `s` is safe to place on the guest **kernel command line**.
+///
+/// libkrun packs the guest workdir (`KRUN_WORKDIR=<path>`) into the kernel
+/// command line, which its `Cmdline` builder validates as printable ASCII
+/// only (`valid_char` accepts `' '..='~'`) and `.unwrap()`s — a non-ASCII
+/// byte panics the VMM (`InvalidAscii`) before boot, and a space is
+/// mis-tokenized by the guest kernel (`/proc/cmdline` splits on whitespace).
+/// So a path that isn't printable, non-space ASCII (`is_ascii_graphic`,
+/// `0x21..=0x7e`) can't be the `KRUN_WORKDIR` value.
+///
+/// Note the *mount* specs no longer ride the cmdline — they travel via the
+/// boot-params side channel (see [`microsandbox`]'s runtime), so the project
+/// itself is still mirrored at its real (possibly Cyrillic) path. This
+/// predicate only governs the `KRUN_WORKDIR` placeholder: when it fails we
+/// hand libkrun `/` and pin the agent's real cwd via the exec request
+/// instead (see [`launch`]).
+fn guest_path_is_cmdline_safe(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Whether `s` can be carried into the guest as a mount point at all.
+///
+/// Mount specs travel via the boot-params side channel, framed as
+/// `KEY\tVALUE\n` lines. That transport is byte-transparent for everything
+/// except a control character — a TAB or newline in the path would break
+/// the framing, and other control bytes have no business in a mount point.
+/// Such a path can't be mirrored and falls back to `/workspace`.
+fn guest_path_is_mountable(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control())
+}
+
+/// Decide the in-guest path to mirror the project at, plus a one-line
+/// reason when we had to fall back to `/workspace` (for the launch
+/// notice). The host bind always targets the real `project_dir`
+/// regardless; only the *guest-visible* path changes.
+///
+/// A non-ASCII or whitespace path is mirrored at its **real** location:
+/// the mount spec rides the boot-params side channel (not the cmdline),
+/// the mount-point dir is baked byte-for-byte into the rootfs, and the
+/// agent's cwd is delivered over the byte-safe exec channel. Only two
+/// things still force `/workspace`: a path under a guest tmpfs mount (see
+/// [`guest_path_is_safe`]) would be wiped at boot, and a path with control
+/// characters (see [`guest_path_is_mountable`]) can't be framed for the
+/// side channel.
+fn resolve_project_guest_path(
+    project_dir: &Path,
+    host_path: &str,
+) -> (String, Option<&'static str>) {
+    if !guest_path_is_safe(project_dir) {
+        ("/workspace".to_string(), Some("is under a tmpfs mount"))
+    } else if !guest_path_is_mountable(host_path) {
+        (
+            "/workspace".to_string(),
+            Some("contains control characters that can't be carried into the guest"),
+        )
+    } else {
+        (host_path.to_string(), None)
+    }
 }
 
 /// Absolute directories that must exist inside the guest rootfs before
@@ -338,14 +418,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .project_dir
         .to_str()
         .context("project path contains non-UTF-8 bytes; not supported")?;
-    let project_guest_path = if guest_path_is_safe(&session.project_dir) {
-        host_path.to_string()
-    } else {
-        eprintln!(
-            "==> Project path {host_path} is under a tmpfs mount; mounting at /workspace instead"
-        );
-        "/workspace".to_string()
-    };
+    let (project_guest_path, remap_reason) =
+        resolve_project_guest_path(&session.project_dir, host_path);
+    if let Some(reason) = remap_reason {
+        eprintln!("==> Project path {host_path} {reason}; mounting at /workspace instead");
+    }
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
     // PullPolicy::IfMissing keeps the slow part (pull + materialize) off
     // every launch. We separately HEAD the manifest at the registry via
@@ -510,13 +587,27 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     let is_local_registry = crate::pull::is_plain_http_registry(&image);
+    // `.workdir()` becomes libkrun's `KRUN_WORKDIR`, which rides the
+    // printable-ASCII-only kernel command line. When the real project path
+    // isn't cmdline-safe (non-ASCII / whitespace) we hand libkrun `/` and
+    // pin the agent's real cwd via the exec request below instead — the
+    // exec cwd travels over the byte-safe vsock channel, and the project is
+    // still bind-mounted (and the agent still runs) at its true path. The
+    // mount spec itself reaches the guest via the boot-params side channel,
+    // not the cmdline. (`KRUN_WORKDIR` only sets PID-1's initial chdir,
+    // which agentd overrides per-exec, so the placeholder is invisible.)
+    let krun_workdir = if guest_path_is_cmdline_safe(&project_guest_path) {
+        project_guest_path.clone()
+    } else {
+        "/".to_string()
+    };
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
         .registry(|r| if is_local_registry { r.insecure() } else { r })
         .pull_policy(PullPolicy::IfMissing)
         .cpus(cpus)
         .memory(memory_mib)
-        .workdir(project_guest_path.clone())
+        .workdir(krun_workdir)
         .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
         .volume("/agent-vm-state", |m| m.bind(&session.state_dir));
     // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
@@ -822,12 +913,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
     );
 
-    // Claude Code refuses to run as root with --dangerously-skip-permissions
-    // unless this env var is set. The whole point of running it in a
-    // microVM is that the sandbox IS our security boundary, so the
-    // in-guest CLI's extra guard would just block us from getting work
-    // done. Same env var the original Bash agent-vm used.
-    builder = builder.env("IS_SANDBOX", "1");
+    // Environment injected into every guest regardless of agent/project.
+    // Kept as one list so the set is discoverable and guard-testable (see
+    // `guest_always_env_pins_utf8_locale_and_sandbox_flag`).
+    for (key, value) in GUEST_ALWAYS_ENV {
+        builder = builder.env(*key, *value);
+    }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
     eprintln!(
@@ -854,6 +945,27 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let sandbox = result?;
     if profile {
         eprintln!("[profile] create: {:?}", t_create.elapsed());
+    }
+    // When the project path isn't cmdline-safe we handed libkrun the `/`
+    // workdir placeholder, so create-time validation only confirmed that
+    // `/` exists — not that the real (non-ASCII) mount point materialized.
+    // agentd's per-exec `chdir` ignores failure (it would silently drop the
+    // agent into `/`), so verify the real path is present now over the
+    // byte-safe fs channel and fail loudly otherwise. ASCII paths were
+    // already validated at create time (workdir == the real path).
+    if !guest_path_is_cmdline_safe(&project_guest_path)
+        && !sandbox
+            .fs()
+            .exists(&project_guest_path)
+            .await
+            .unwrap_or(false)
+    {
+        let _ = sandbox.stop().await;
+        anyhow::bail!(
+            "project path {project_guest_path} did not appear inside the guest \
+             (the bind mount failed to materialize); full logs: {}",
+            sandbox_log_dir(&session.sandbox_name).display()
+        );
     }
 
     // Confirm the image's API contract matches what this binary
@@ -995,8 +1107,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
         eprintln!("==> Attaching to {inner_cmd}");
+        // Pin the agent's cwd to the real project path via the exec request
+        // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
+        // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
+        // leaves cwd unset, falling back to that placeholder; `attach_with`
+        // lets us set it, matching the streaming path below.
         sandbox
-            .attach(cmd, agent_args)
+            .attach_with(cmd, |a| a.args(agent_args).cwd(project_guest_path.clone()))
             .await
             .with_context(|| {
                 format!(
@@ -1208,6 +1325,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// One `--mount HOST[:GUEST]` argument resolved into separate paths.
+#[derive(Debug)]
 struct ExtraMount {
     host: PathBuf,
     guest: PathBuf,
@@ -1371,6 +1489,17 @@ fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
         }
         if !guest.is_absolute() {
             anyhow::bail!("--mount guest path {guest_s:?} must be absolute");
+        }
+        // The guest mount point reaches agentd via the boot-params side
+        // channel (not the kernel command line), so non-ASCII and spaces
+        // are fine — but a control character (TAB/newline) would break the
+        // `KEY\tVALUE\n` framing, so reject those. See
+        // `guest_path_is_mountable`.
+        if !guest_path_is_mountable(&guest_s) {
+            anyhow::bail!(
+                "--mount guest path {guest_s:?} contains control characters that can't be \
+                 carried into the guest; pass a guest path without tabs/newlines"
+            );
         }
         // Canonicalize host so we follow symlinks; the bind target
         // needs to be a real path on the host.
@@ -1751,6 +1880,109 @@ mod tests {
         // canonicalize fails on missing paths → Err propagates.
         let r = parse_extra_mounts(&["/this/path/does/not/exist/anywhere".into()]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn parse_extra_mounts_allows_non_ascii_guest_rejects_control_chars() {
+        // A non-ASCII guest mount point now travels via the boot-params
+        // side channel (not the cmdline), so it is accepted and mirrored.
+        // Host `/` exists so canonicalize succeeds.
+        let parsed = parse_extra_mounts(&["/:/монтаж".into()]).expect("non-ASCII guest is ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/монтаж"));
+        // Plain ASCII guest path still works.
+        assert!(parse_extra_mounts(&["/:/mnt/ref".into()]).is_ok());
+        // A control char (TAB) would break the KEY\tVALUE boot-params
+        // framing, so it's rejected with guidance.
+        let err = parse_extra_mounts(&["/:/mnt/a\tb".into()])
+            .expect_err("control char in guest path must be rejected")
+            .to_string();
+        assert!(
+            err.contains("control characters"),
+            "error should call out control characters, got: {err}"
+        );
+    }
+
+    // ── guest-path predicates / resolve_project_guest_path ───────
+
+    #[test]
+    fn guest_path_is_cmdline_safe_accepts_plain_ascii_only() {
+        // This predicate now governs only the KRUN_WORKDIR placeholder
+        // (the one path that still rides the cmdline). Plain ASCII passes.
+        assert!(guest_path_is_cmdline_safe("/home/boger/work/agent-vm"));
+        assert!(guest_path_is_cmdline_safe("/workspace"));
+        // '=' is safe in a path (the kernel splits a KEY=value token only
+        // on its first '='); only whitespace and non-ASCII are unsafe.
+        assert!(guest_path_is_cmdline_safe("/home/a=b/c-d.e_f+g"));
+        // Cyrillic/emoji (non-ASCII), space, tab, DEL are all NOT
+        // cmdline-safe → the workdir falls back to the "/" placeholder.
+        assert!(!guest_path_is_cmdline_safe("/home/boger/проект-тест"));
+        assert!(!guest_path_is_cmdline_safe("/home/boger/😀proj"));
+        assert!(!guest_path_is_cmdline_safe("/home/My Project"));
+        assert!(!guest_path_is_cmdline_safe("/home/x\ty"));
+        assert!(!guest_path_is_cmdline_safe("/home/x\u{7f}y"));
+    }
+
+    #[test]
+    fn guest_path_is_mountable_allows_non_ascii_and_space_not_control() {
+        // Mount points travel via the byte-transparent boot-params side
+        // channel, so non-ASCII and spaces are mountable.
+        assert!(guest_path_is_mountable("/home/boger/проект-тест"));
+        assert!(guest_path_is_mountable("/home/boger/😀proj"));
+        assert!(guest_path_is_mountable("/home/My Project"));
+        assert!(guest_path_is_mountable("/home/boger/work"));
+        // Control characters (TAB/newline/DEL) break the KEY\tVALUE\n
+        // framing and are rejected.
+        assert!(!guest_path_is_mountable("/home/x\ty"));
+        assert!(!guest_path_is_mountable("/home/x\ny"));
+        assert!(!guest_path_is_mountable("/home/x\u{7f}y"));
+    }
+
+    #[test]
+    fn guest_always_env_pins_utf8_locale_and_sandbox_flag() {
+        let map: std::collections::HashMap<&str, &str> =
+            GUEST_ALWAYS_ENV.iter().copied().collect();
+        // Claude Code's root-guard bypass must stay set.
+        assert_eq!(map.get("IS_SANDBOX"), Some(&"1"));
+        // A UTF-8 locale must be pinned: without it the guest is C/POSIX,
+        // which renders a Cyrillic cwd as `M-P…` escapes and makes the
+        // agents' filesystem encoding ASCII (mishandling non-ASCII paths).
+        // Removing or non-UTF-8-ing this regresses Cyrillic-path support.
+        let lang = map.get("LANG").expect("guest LANG must be pinned to a UTF-8 locale");
+        assert!(
+            lang.to_ascii_lowercase().replace('-', "").contains("utf8"),
+            "guest LANG must be a UTF-8 locale, got {lang:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_guest_path_mirrors_real_path_and_only_remaps_unmountable() {
+        // Plain ASCII path is mirrored 1:1 with no remap notice.
+        let (guest, reason) =
+            resolve_project_guest_path(Path::new("/home/boger/proj"), "/home/boger/proj");
+        assert_eq!(guest, "/home/boger/proj");
+        assert!(reason.is_none());
+
+        // Cyrillic, emoji, and space are now mirrored at their REAL path —
+        // the mount spec rides the side channel and the cwd the exec
+        // channel, so there's no /workspace fallback and no remap notice.
+        for p in ["/home/boger/проект", "/home/boger/😀p", "/home/My Project"] {
+            let (guest, reason) = resolve_project_guest_path(Path::new(p), p);
+            assert_eq!(guest, p, "{p:?} should be mirrored at its real path");
+            assert!(reason.is_none(), "{p:?} should not report a remap reason");
+        }
+
+        // A path under a guest tmpfs mount still remaps (would be wiped at
+        // boot), regardless of being otherwise ASCII-clean.
+        let (guest, reason) = resolve_project_guest_path(Path::new("/tmp/proj"), "/tmp/proj");
+        assert_eq!(guest, "/workspace");
+        assert!(reason.is_some_and(|r| r.contains("tmpfs")));
+
+        // A control character in the path can't be framed for the side
+        // channel → defensive /workspace fallback.
+        let (guest, reason) =
+            resolve_project_guest_path(Path::new("/home/a\tb"), "/home/a\tb");
+        assert_eq!(guest, "/workspace");
+        assert!(reason.is_some_and(|r| r.contains("control characters")));
     }
 
     // ── parse_publish_args ───────────────────────────────────────

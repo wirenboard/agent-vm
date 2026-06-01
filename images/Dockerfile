@@ -19,9 +19,18 @@ FROM debian:13-slim
 LABEL org.opencontainers.image.title="agent-vm guest template"
 LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
+# LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
+# C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
+# escapes in bash/readline AND makes locale-driven filesystem encodings
+# default to ASCII, so Python/Node/ripgrep mis-handle or error on a non-ASCII
+# path even when it mounted fine. C.UTF-8 is always present in glibc (no
+# locale-gen needed), ASCII-sorting + English-messages but UTF-8-aware.
+# agent-vm's launcher also sets this for every exec; having it in the image
+# makes any other use of the image correct too.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
+    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
+    LANG=C.UTF-8
 
 # Image-API contract version. Bump on BREAKING image changes only
 # (new required mount points, changed env-var contracts, removed

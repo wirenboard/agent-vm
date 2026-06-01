@@ -170,10 +170,35 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
 
+      - name: Build agentd from source (musl) so msb embeds the matching guest agent
+        run: |
+          # agentd (the guest PID-1 agent) is embedded into msb and injected
+          # at boot. Build it from the pinned source rather than downloading a
+          # release prebuilt, so the producer (msb) and consumer (agentd)
+          # always ship in lockstep — e.g. the boot-params side channel needs
+          # both halves at the same revision; a stale prebuilt agentd would
+          # silently drop every mount. Static musl: agentd runs before the
+          # rootfs is fully set up.
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
+
       - name: cargo build --release -p microsandbox-cli --bin msb
         run: |
+          # --no-default-features drops the `prebuilt` feature, so the
+          # filesystem crate embeds the build/agentd compiled just above
+          # instead of downloading a release prebuilt. net + keyring are the
+          # other CLI defaults and stay on.
           cargo build --release --target ${{ matrix.cargo_target }} \
             --manifest-path vendor/microsandbox/Cargo.toml \
+            --no-default-features --features net,keyring \
             -p microsandbox-cli --bin msb
 
       - name: Upload msb binary
