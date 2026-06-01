@@ -421,10 +421,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # No `registry-url:` on purpose — that input makes setup-node write
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc.
+      # With trusted publishing we have no token, so that line resolves to
+      # an empty authToken and npm errors `ENEEDAUTH` instead of falling
+      # back to OIDC. Without it, npm uses the default registry
+      # (registry.npmjs.org) and the OIDC trusted-publishing flow.
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+
+      # npm trusted publishing (OIDC) needs npm >= 11.5.1; node 22 ships
+      # npm 10.x. With this + `id-token: write` (set at the workflow level)
+      # and a trusted publisher configured on npmjs.com for each package,
+      # `npm publish` exchanges the GitHub OIDC token for short-lived
+      # registry credentials — no long-lived NPM_TOKEN secret — and attaches
+      # provenance automatically.
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # Download each platform artifact into its own subpackage
       # directory explicitly. `actions/download-artifact@v8` with
@@ -482,8 +498,9 @@ jobs:
           done
 
       - name: Publish platform subpackages first
+        # No NODE_AUTH_TOKEN — auth is via OIDC trusted publishing (see the
+        # setup-node note above and the workflow-level `id-token: write`).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
@@ -509,8 +526,8 @@ jobs:
           done
 
       - name: Publish main package
+        # OIDC trusted publishing — no NODE_AUTH_TOKEN (see above).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
