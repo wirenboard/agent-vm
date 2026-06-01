@@ -47,6 +47,16 @@ pub fn host_opencode_auth_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share/opencode/auth.json"))
 }
 
+/// `$HOME/.cache/claude-vm/copilot-token.json` — the GitHub Copilot
+/// token cache the original Bash agent-vm's `copilot_token.py` writes
+/// after its OAuth device flow (JSON `{"access_token": "<gho_…>"}`).
+/// Same not-found convention as the other host credential helpers:
+/// callers treat a missing file as "no cached Copilot token" and fall
+/// back to the captured `gh auth token`.
+pub fn host_copilot_token_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/claude-vm/copilot-token.json"))
+}
+
 /// Write `data` to `path` atomically (write a sibling tmp file, then
 /// `rename`) with the given Unix mode. The tmp file uses a fixed
 /// extension so a crashed run leaves an obvious orphan rather than a
