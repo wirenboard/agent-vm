@@ -681,14 +681,42 @@ fn write_response(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Public entry point for an Anthropic OAuth-refresh interception.
+///
+/// Thin wrapper that injects the real side effects — spawn the host
+/// `claude` CLI to rotate the host credential file, then read that
+/// file back — and hands the rotated JSON to [`rotate_anthropic`],
+/// which holds the actual rotation logic (token-file rewrite +
+/// placeholder response synthesis). Keeping the side effects out of
+/// `rotate_anthropic` is what makes the rotation path deterministically
+/// testable without a live `claude` session or a real expiring token
+/// (PLAN.md A1).
 fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
     trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
 
     let host_path = host_claude_creds_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
         .with_context(|| format!("reading {}", host_path.display()))?;
-    let json: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", host_path.display()))?;
+    // Re-wrap with the concrete path so a parse/extract failure in the pure fn
+    // still names which exact host file was bad (the pure fn uses a fixed label).
+    rotate_anthropic(state_dir, &raw)
+        .with_context(|| format!("rotating Anthropic token from {}", host_path.display()))
+}
+
+/// Pure rotation step for Anthropic: parse the (already-rotated) host
+/// `.credentials.json` text, rewrite the per-project token file with
+/// the fresh real bearer, and synthesize the OAuth refresh response
+/// that carries *placeholders* (never the real bearer) back to the
+/// in-VM agent.
+///
+/// Split out from [`refresh_anthropic`] so tests can drive a simulated
+/// rotation by passing the rotated-file contents directly, with no host
+/// CLI spawn and no `$HOME` credential file. Runtime behavior is
+/// identical: `refresh_anthropic` calls this with the bytes it just
+/// read from the real host file.
+fn rotate_anthropic(state_dir: &Path, host_creds_json: &str) -> Result<Vec<u8>> {
+    let json: Value = serde_json::from_str(host_creds_json)
+        .context("parsing rotated host .credentials.json")?;
     let oauth = json
         .get("claudeAiOauth")
         .context("rotated host .credentials.json missing claudeAiOauth")?;
@@ -719,6 +747,11 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
     Ok(http_200_json(&serde_json::to_vec(&body)?))
 }
 
+/// Public entry point for an OpenAI (Codex/ChatGPT) OAuth-refresh
+/// interception. Thin wrapper mirroring [`refresh_anthropic`]: spawn
+/// the host `codex` CLI to rotate the host auth file, read it back, and
+/// hand the contents to [`rotate_openai`] for the testable rotation
+/// logic.
 fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
     trigger_host_refresh(
         "codex",
@@ -733,8 +766,20 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
     let host_path = host_codex_auth_path().context("HOME not set")?;
     let raw = std::fs::read_to_string(&host_path)
         .with_context(|| format!("reading {}", host_path.display()))?;
-    let json: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", host_path.display()))?;
+    // Re-wrap with the concrete path so a parse/extract failure in the pure fn
+    // still names which exact host file was bad (the pure fn uses a fixed label).
+    rotate_openai(state_dir, &raw)
+        .with_context(|| format!("rotating OpenAI token from {}", host_path.display()))
+}
+
+/// Pure rotation step for OpenAI: parse the (already-rotated) host
+/// `codex auth.json` text, rewrite the per-project token file with the
+/// fresh real access token, and synthesize the placeholder-carrying
+/// OAuth refresh response. Split out from [`refresh_openai`] for the
+/// same deterministic-testability reason as [`rotate_anthropic`].
+fn rotate_openai(state_dir: &Path, host_auth_json: &str) -> Result<Vec<u8>> {
+    let json: Value =
+        serde_json::from_str(host_auth_json).context("parsing rotated host codex auth.json")?;
 
     let new_access = json
         .pointer("/tokens/access_token")
@@ -1831,6 +1876,234 @@ mod tests {
         assert!(
             upstream_str.contains(&expected_b64),
             "for allow-listed repo, real token should reach upstream; got:\n{upstream_str}"
+        );
+    }
+}
+
+// ─── mid-session token-rotation regression tests (PLAN.md A1) ───────────
+//
+// The OAuth-refresh MITM exists but had never been exercised across a
+// real token-expiry boundary — true e2e needs a long live session and a
+// real expiring token, infeasible in CI / the dev sandbox. Instead we
+// drive the rotation logic deterministically: `refresh_{anthropic,openai}`
+// are thin wrappers that spawn the host CLI and read the rotated host
+// credential file, then delegate to the pure `rotate_{anthropic,openai}`
+// step. These tests call the pure step directly with a simulated rotated
+// host file, then assert the two invariants that matter:
+//
+//   (1) the per-project token file is rewritten to the NEW real bearer
+//       (so the proxy substitutes the fresh token on the next request);
+//   (2) the synthesized HTTP refresh response carries only PLACEHOLDERS
+//       in access_token / refresh_token — never the real bearer — and is
+//       a well-formed HTTP/1.1 200 with the expected headers.
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// Minimal stdlib temp dir; avoids a dev-dependency. Unique per call
+    /// via pid + a process-global counter, cleaned up on drop.
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let mut p = std::env::temp_dir();
+            p.push(format!("agentvm-rot-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Split a synthesized HTTP/1.1 response into (status_line, headers,
+    /// body). Asserts a single CRLFCRLF separator exists.
+    fn split_http(resp: &[u8]) -> (String, String, String) {
+        let s = std::str::from_utf8(resp).expect("response is UTF-8");
+        let sep = s.find("\r\n\r\n").expect("response has header/body separator");
+        let head = &s[..sep];
+        let body = &s[sep + 4..];
+        let line_end = head.find("\r\n").unwrap_or(head.len());
+        (
+            head[..line_end].to_string(),
+            head.to_string(),
+            body.to_string(),
+        )
+    }
+
+    // ── Anthropic ─────────────────────────────────────────────────
+
+    const NEW_BEARER_ANTHROPIC: &str =
+        "sk-ant-oat01-ROTATED-NEW-anthropic-bearer-value-do-not-leak";
+
+    fn rotated_anthropic_creds() -> String {
+        json!({
+            "claudeAiOauth": {
+                "accessToken": NEW_BEARER_ANTHROPIC,
+                "refreshToken": "sk-ant-ort01-rotated-refresh",
+                "expiresAt": 9_999_999_999_000i64,
+                "scopes": ["user:inference", "user:profile"],
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn anthropic_rotation_rewrites_token_file_to_new_bearer() {
+        let tmp = TmpDir::new("anthropic-file");
+        let resp = rotate_anthropic(tmp.path(), &rotated_anthropic_creds())
+            .expect("rotate_anthropic should succeed");
+        assert!(!resp.is_empty(), "response must not be empty");
+
+        // (1) Per-project token file rewritten to the NEW real bearer.
+        let token_file = secrets::anthropic_token_path(tmp.path());
+        let written = std::fs::read_to_string(&token_file)
+            .expect("token file should have been written");
+        assert_eq!(
+            written, NEW_BEARER_ANTHROPIC,
+            "anthropic token file must hold the freshly-rotated real bearer"
+        );
+    }
+
+    #[test]
+    fn anthropic_rotation_response_carries_placeholders_not_real_bearer() {
+        let tmp = TmpDir::new("anthropic-resp");
+        let resp = rotate_anthropic(tmp.path(), &rotated_anthropic_creds())
+            .expect("rotate_anthropic should succeed");
+        let (status, headers, body) = split_http(&resp);
+
+        // Well-formed status line + headers.
+        assert_eq!(status, "HTTP/1.1 200 OK", "status line");
+        assert!(
+            headers.contains("Content-Type: application/json"),
+            "Content-Type header present: {headers:?}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Length: {}", body.len())),
+            "Content-Length matches body ({} bytes): {headers:?}",
+            body.len()
+        );
+        assert!(
+            headers.contains("Connection: close"),
+            "Connection: close present: {headers:?}"
+        );
+
+        // (2) The real bearer must NEVER appear anywhere in the response.
+        assert!(
+            !String::from_utf8_lossy(&resp).contains(NEW_BEARER_ANTHROPIC),
+            "real bearer leaked into the refresh response"
+        );
+
+        // Body's token fields are the placeholders, verbatim.
+        let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
+        assert_eq!(
+            parsed["access_token"], secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
+            "access_token must be the placeholder"
+        );
+        assert_eq!(
+            parsed["refresh_token"], secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
+            "refresh_token must be the placeholder"
+        );
+        assert_eq!(parsed["token_type"], "Bearer");
+        // expires_in derived from expiresAt: far-future → positive.
+        assert!(
+            parsed["expires_in"].as_i64().unwrap() > 0,
+            "expires_in should be positive"
+        );
+    }
+
+    // ── OpenAI / Codex ────────────────────────────────────────────
+
+    const NEW_BEARER_OPENAI: &str =
+        "eyJROTATED.openai.access.token.value.do.not.leak";
+
+    fn rotated_openai_auth() -> String {
+        json!({
+            "tokens": {
+                "access_token": NEW_BEARER_OPENAI,
+                "refresh_token": "rotated-openai-refresh",
+                "id_token": "rotated-openai-id",
+            },
+            "OPENAI_API_KEY": null,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn openai_rotation_rewrites_token_file_to_new_bearer() {
+        let tmp = TmpDir::new("openai-file");
+        let resp = rotate_openai(tmp.path(), &rotated_openai_auth())
+            .expect("rotate_openai should succeed");
+        assert!(!resp.is_empty());
+
+        let token_file = secrets::openai_token_path(tmp.path());
+        let written = std::fs::read_to_string(&token_file)
+            .expect("token file should have been written");
+        assert_eq!(
+            written, NEW_BEARER_OPENAI,
+            "openai token file must hold the freshly-rotated real access token"
+        );
+    }
+
+    #[test]
+    fn openai_rotation_response_carries_placeholders_not_real_bearer() {
+        let tmp = TmpDir::new("openai-resp");
+        let resp = rotate_openai(tmp.path(), &rotated_openai_auth())
+            .expect("rotate_openai should succeed");
+        let (status, headers, body) = split_http(&resp);
+
+        assert_eq!(status, "HTTP/1.1 200 OK", "status line");
+        assert!(headers.contains("Content-Type: application/json"));
+        assert!(headers.contains(&format!("Content-Length: {}", body.len())));
+        assert!(headers.contains("Connection: close"));
+
+        assert!(
+            !String::from_utf8_lossy(&resp).contains(NEW_BEARER_OPENAI),
+            "real access token leaked into the refresh response"
+        );
+
+        let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
+        assert_eq!(parsed["access_token"], secrets::OPENAI_ACCESS_PLACEHOLDER);
+        assert_eq!(parsed["refresh_token"], secrets::OPENAI_REFRESH_PLACEHOLDER);
+        assert_eq!(parsed["id_token"], secrets::OPENAI_ID_PLACEHOLDER);
+        assert_eq!(parsed["token_type"], "Bearer");
+    }
+
+    /// The legacy ChatGPT/Codex shape stores the key flat as
+    /// `OPENAI_API_KEY` (no `tokens` object). Rotation must pick it up.
+    #[test]
+    fn openai_rotation_falls_back_to_flat_api_key() {
+        let tmp = TmpDir::new("openai-flat");
+        let auth = json!({ "OPENAI_API_KEY": NEW_BEARER_OPENAI }).to_string();
+        let resp = rotate_openai(tmp.path(), &auth).expect("rotate_openai should succeed");
+
+        let token_file = secrets::openai_token_path(tmp.path());
+        let written = std::fs::read_to_string(&token_file).unwrap();
+        assert_eq!(written, NEW_BEARER_OPENAI);
+        assert!(!String::from_utf8_lossy(&resp).contains(NEW_BEARER_OPENAI));
+    }
+
+    /// Malformed rotated host files surface an error rather than writing
+    /// a garbage token file or a malformed response.
+    #[test]
+    fn rotation_errors_on_malformed_host_file() {
+        let tmp = TmpDir::new("malformed");
+        assert!(rotate_anthropic(tmp.path(), "not json").is_err());
+        assert!(rotate_openai(tmp.path(), "not json").is_err());
+        assert!(
+            rotate_anthropic(tmp.path(), &json!({"claudeAiOauth": {}}).to_string()).is_err(),
+            "missing accessToken must error"
+        );
+        assert!(
+            rotate_openai(tmp.path(), &json!({"tokens": {}}).to_string()).is_err(),
+            "missing access_token must error"
         );
     }
 }
