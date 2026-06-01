@@ -22,7 +22,7 @@ const fs = require("node:fs");
 
 const PLATFORM_PACKAGES = {
   "linux-x64": "@wirenboard/agent-vm-linux-x64",
-  // "linux-arm64": "@wirenboard/agent-vm-linux-arm64",
+  "linux-arm64": "@wirenboard/agent-vm-linux-arm64",
   // "darwin-arm64": "@wirenboard/agent-vm-darwin-arm64",
   // "darwin-x64": "@wirenboard/agent-vm-darwin-x64",
   // "win32-x64": "@wirenboard/agent-vm-win32-x64",
