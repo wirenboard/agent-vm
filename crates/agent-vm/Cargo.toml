@@ -1,6 +1,6 @@
 [package]
 name = "agent-vm"
-description = "Sandboxed VMs for AI coding agents, built on microsandbox."
+description = "Sandboxed microVMs for AI coding agents, built on microsandbox."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -19,9 +19,18 @@ FROM debian:13-slim
 LABEL org.opencontainers.image.title="agent-vm guest template"
 LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
+# LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
+# C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
+# escapes in bash/readline AND makes locale-driven filesystem encodings
+# default to ASCII, so Python/Node/ripgrep mis-handle or error on a non-ASCII
+# path even when it mounted fine. C.UTF-8 is always present in glibc (no
+# locale-gen needed), ASCII-sorting + English-messages but UTF-8-aware.
+# agent-vm's launcher also sets this for every exec; having it in the image
+# makes any other use of the image correct too.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
+    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
+    LANG=C.UTF-8
 
 # Image-API contract version. Bump on BREAKING image changes only
 # (new required mount points, changed env-var contracts, removed
@@ -134,6 +143,21 @@ RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
         '    echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
         '    exit 1' \
         '}' \
+        '# Import the microsandbox MITM CA into the chrome-owned NSS DB so' \
+        '# chromium trusts the intercept proxy. chromium on Linux ignores' \
+        '# the system CA bundle (which curl/node use), honouring only its' \
+        '# built-in roots + this per-user NSS DB. Done here, once, at MCP' \
+        '# startup -- NOT on every agent-vm launch (previously a ~270ms' \
+        '# certutil fork in the launcher prelude) -- and skipped when' \
+        '# chrome is unused (the MCP server is only spawned when enabled).' \
+        '# The DB is chrome-owned (UID 9999), so drop to chrome to write it.' \
+        '# Non-fatal: a failure should warn, not kill the MCP.' \
+        '_ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
+        'if [ -f "$_ca" ]; then' \
+        '    sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \' \
+        '        -t C,, -n microsandbox -i "$_ca" \' \
+        '        || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
+        'fi' \
         'exec sudo -u chrome -H -n \' \
         '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
         '    --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
@@ -218,17 +242,6 @@ RUN apt-get update \
  && mkdir -p /etc/docker \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
         > /etc/docker/daemon.json
-
-# Cache-bust for the three agent installers below. The workflow
-# passes the hourly timestamp tag as the value so each scheduled
-# build invalidates exactly these RUN layers (and the sanity check
-# that follows) while leaving the heavy apt/chromium/docker/node
-# layers cached. Without this the GHA layer cache reuses the
-# `curl … install.sh | bash` layers indefinitely, so hourly cron
-# runs never picked up new claude-code/codex/opencode releases.
-# Local `images/build.sh` builds leave the default empty value and
-# get the normal Docker layer-cache behaviour.
-ARG AGENT_INSTALL_CACHEBUST=
 
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash

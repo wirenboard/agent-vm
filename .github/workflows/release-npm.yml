@@ -231,18 +231,45 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
 
+      - name: Build agentd from source (musl) so msb embeds the matching guest agent
+        run: |
+          # agentd (the guest PID-1 agent) is embedded into msb and injected
+          # at boot. Build it from the pinned source rather than downloading a
+          # release prebuilt, so the producer (msb) and consumer (agentd)
+          # always ship in lockstep — e.g. the boot-params side channel needs
+          # both halves at the same revision; a stale prebuilt agentd would
+          # silently drop every mount. Static musl: agentd runs before the
+          # rootfs is fully set up.
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
+
       - name: cargo build --release -p microsandbox-cli --bin msb
         env:
           CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
           set -euo pipefail
+          # Cross-compiling msb for aarch64 needs pkg-config pointed at the
+          # arm64 sysroot so the C deps (libcap-ng, dbus) resolve.
           if [[ -n "$CROSS" ]]; then
             export PKG_CONFIG_ALLOW_CROSS=1
             export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
             export PKG_CONFIG_SYSROOT_DIR=/
           fi
+          # --no-default-features drops the `prebuilt` feature, so the
+          # filesystem crate embeds the build/agentd compiled just above
+          # instead of downloading a release prebuilt. net + keyring are the
+          # other CLI defaults and stay on.
           cargo build --release --target ${{ matrix.cargo_target }} \
             --manifest-path vendor/microsandbox/Cargo.toml \
+            --no-default-features --features net,keyring \
             -p microsandbox-cli --bin msb
 
       - name: Upload msb binary
@@ -498,10 +525,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # No `registry-url:` on purpose — that input makes setup-node write
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc.
+      # With trusted publishing we have no token, so that line resolves to
+      # an empty authToken and npm errors `ENEEDAUTH` instead of falling
+      # back to OIDC. Without it, npm uses the default registry
+      # (registry.npmjs.org) and the OIDC trusted-publishing flow.
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+
+      # npm trusted publishing (OIDC) needs npm >= 11.5.1; node 22 ships
+      # npm 10.x. With this + `id-token: write` (set at the workflow level)
+      # and a trusted publisher configured on npmjs.com for each package,
+      # `npm publish` exchanges the GitHub OIDC token for short-lived
+      # registry credentials — no long-lived NPM_TOKEN secret — and attaches
+      # provenance automatically.
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # Download each platform artifact into its own subpackage
       # directory explicitly. `actions/download-artifact@v8` with
@@ -565,8 +608,9 @@ jobs:
           done
 
       - name: Publish platform subpackages first
+        # No NODE_AUTH_TOKEN — auth is via OIDC trusted publishing (see the
+        # setup-node note above and the workflow-level `id-token: write`).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
@@ -592,8 +636,8 @@ jobs:
           done
 
       - name: Publish main package
+        # OIDC trusted publishing — no NODE_AUTH_TOKEN (see above).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
