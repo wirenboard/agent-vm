@@ -1,0 +1,3 @@
+[submodule "vendor/microsandbox"]
+	path = vendor/microsandbox
+	url = https://github.com/wirenboard/microsandbox.git

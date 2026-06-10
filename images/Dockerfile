@@ -4,9 +4,10 @@
 # @wirenboard/agent-vm on npm).
 #
 # Contents: Debian 13 slim + the three AI coding agents (Claude
-# Code, OpenCode, Codex) and the minimum dev tooling they need to be
-# useful. Heavier extras (Docker-in-VM, LSPs, additional MCP
-# servers) are deliberately deferred.
+# Code, OpenCode, Codex), minimum dev tooling, and the docker engine
+# (docker.io + containerd + runc + fuse-overlayfs). Other heavy
+# extras (LSPs, additional MCP servers, docker-buildx) are
+# deliberately deferred.
 #
 # Published to ghcr.io/wirenboard/agent-vm-template:latest by the
 # hourly CI workflow (.github/workflows/build-image.yml). Source-
@@ -18,9 +19,18 @@ FROM debian:13-slim
 LABEL org.opencontainers.image.title="agent-vm guest template"
 LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
+# LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
+# C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
+# escapes in bash/readline AND makes locale-driven filesystem encodings
+# default to ASCII, so Python/Node/ripgrep mis-handle or error on a non-ASCII
+# path even when it mounted fine. C.UTF-8 is always present in glibc (no
+# locale-gen needed), ASCII-sorting + English-messages but UTF-8-aware.
+# agent-vm's launcher also sets this for every exec; having it in the image
+# makes any other use of the image correct too.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
+    LANG=C.UTF-8
 
 # Image-API contract version. Bump on BREAKING image changes only
 # (new required mount points, changed env-var contracts, removed
@@ -133,6 +143,21 @@ RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
         '    echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
         '    exit 1' \
         '}' \
+        '# Import the microsandbox MITM CA into the chrome-owned NSS DB so' \
+        '# chromium trusts the intercept proxy. chromium on Linux ignores' \
+        '# the system CA bundle (which curl/node use), honouring only its' \
+        '# built-in roots + this per-user NSS DB. Done here, once, at MCP' \
+        '# startup -- NOT on every agent-vm launch (previously a ~270ms' \
+        '# certutil fork in the launcher prelude) -- and skipped when' \
+        '# chrome is unused (the MCP server is only spawned when enabled).' \
+        '# The DB is chrome-owned (UID 9999), so drop to chrome to write it.' \
+        '# Non-fatal: a failure should warn, not kill the MCP.' \
+        '_ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
+        'if [ -f "$_ca" ]; then' \
+        '    sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \' \
+        '        -t C,, -n microsandbox -i "$_ca" \' \
+        '        || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
+        'fi' \
         'exec sudo -u chrome -H -n \' \
         '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
         '    --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
@@ -179,6 +204,45 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
  || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
+# Docker engine — dockerd + cli + containerd + runc.
+#
+# Why each piece:
+#   - docker.io / docker-cli: the daemon and the CLI a user actually
+#     invokes; no buildx (legacy builder is fine for the small builds
+#     agents do in-VM; +20 MB compressed isn't worth the polish).
+#   - containerd / runc: the OCI runtime stack the daemon delegates to.
+#     Both are kernel-required (runc=container init, containerd=image
+#     management); without them dockerd refuses to start.
+#   - fuse-overlayfs: the storage driver we pin in daemon.json below.
+#     Native overlay2 doesn't work because the VM rootfs is already
+#     overlay (libkrun rootfs design), and overlay-on-overlay returns
+#     EINVAL inside dockerd's snapshotter. fuse-overlayfs sidesteps
+#     that at userspace level.
+#   - iptables: dockerd installs NAT rules on every container start;
+#     missing binary makes the daemon log a warning and disable bridge
+#     networking. The kernel-side iptables/nf_tables support comes
+#     from the libkrunfw-overrides patch (see libkrunfw-overrides/
+#     README.md).
+#
+# Storage-driver choice (daemon.json): see comment above. iptables
+# alternative left at debian's default (iptables-nft) — both nft and
+# legacy backends are functional in the patched kernel.
+#
+# Auto-start: not done in the image. The launcher (or a per-project
+# `.agent-vm.runtime.sh`) is the right place to `dockerd &` if the
+# session needs it — most sessions won't, so paying ~50 MB RSS at
+# every boot would be wasteful.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        docker.io docker-cli \
+        containerd runc \
+        fuse-overlayfs \
+        iptables \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /etc/docker \
+ && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
+        > /etc/docker/daemon.json
+
 # Cache-bust for the three agent installers below. The workflow
 # passes the hourly timestamp tag as the value so each scheduled
 # build invalidates exactly these RUN layers (and the sanity check
@@ -202,7 +266,8 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
 
 # Sanity check at build time so a broken installer surfaces before we push.
-RUN claude --version && opencode --version && codex --version
+RUN claude --version && opencode --version && codex --version \
+ && dockerd --version && docker --version && containerd --version && runc --version
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.
 CMD ["/bin/bash"]

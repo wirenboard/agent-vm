@@ -1,368 +1,198 @@
 # agent-vm
 
-Run AI coding agents inside sandboxed Linux VMs. The agent gets full autonomy while your host system stays safe.
+Run Claude Code / Codex / OpenCode inside a per-project libkrun microVM,
+booting in ~2 seconds, with:
 
-Uses [Lima](https://lima-vm.io/) to create lightweight Debian VMs on macOS and Linux. Ships with dev tools, Docker, and a headless Chrome browser with [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) pre-configured.
+- **Host OAuth tokens never enter the VM.** The TLS-intercept proxy in
+  [microsandbox](https://github.com/wirenboard/microsandbox) substitutes
+  the real bearer for a placeholder on the way out. OAuth refresh is
+  MITM'd so multi-hour sessions survive token rotation.
+- **Per-launch GitHub repo allow-list.** Auto-detected from
+  `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
+  `git push` etc. are filtered at the proxy — off-list calls get a 403
+  before they reach GitHub.
+- **Sandbox is the boundary.** Root inside the VM, project bind-mounted
+  at its host path, `--dangerously-skip-permissions` set by default
+  (the microVM is the only thing actually keeping the agent on rails).
 
-Supports [Claude Code](https://claude.ai/code), [OpenCode](https://opencode.ai/), and [Codex CLI](https://developers.openai.com/codex/cli/).
+This is the Rust rewrite of the original Bash
+[`wirenboard/agent-vm`](https://github.com/wirenboard/agent-vm) on
+top of microsandbox. Living on `rewrite-microsandbox` until v1.
 
-Feedbacks welcome!
+## Requirements
 
-## Prerequisites
+- Linux with `/dev/kvm` (rw) — your user must be in the `kvm`
+  group: `sudo usermod -aG kvm $USER` and re-login.
+- Node.js 18+ (already there if you use Claude Code / Codex CLI /
+  OpenCode — they're all npm-distributed).
 
-- macOS or Linux
-- [Lima](https://lima-vm.io/docs/installation/) (installed automatically via Homebrew if available)
-- A [Claude subscription](https://claude.ai/) (Pro, Max, or Team), an [OpenCode](https://opencode.ai/) compatible provider, and/or an OpenAI Codex-capable account or API key
+`~/.microsandbox/lib/libkrunfw.so.5.x` auto-installs on first
+launch.
 
-## Install
+## Quick start
 
 ```bash
-git clone https://github.com/sylvinus/agent-vm.git
+npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
+
+agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
+
+cd ~/your-project
+agent-vm claude           # or codex / opencode / shell
+```
+
+The npm package bundles a prebuilt `agent-vm` binary, the patched
+`msb`, and libkrunfw. agent-vm finds them via
+`current_exe()`-relative paths, so a user's separate
+`~/.microsandbox/bin/msb` (if any) never shadows the patched build.
+
+## Build from source
+
+```bash
+git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
 cd agent-vm
-
-# Add to your shell config
-echo "source $(pwd)/claude-vm.sh" >> ~/.zshrc   # zsh
-echo "source $(pwd)/claude-vm.sh" >> ~/.bashrc  # or bash
+git submodule update --init vendor/microsandbox
+sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
+cargo build --release -p agent-vm
+cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
+    -p microsandbox-cli --bin msb
+./target/release/agent-vm setup       # uses the locally-built msb sibling
 ```
 
-## Usage
+`agent-vm setup` pulls
+`ghcr.io/wirenboard/agent-vm-template:latest` by default; pass
+`--image localhost:5000/agent-vm-template:latest` to use a local image
+you've built via `images/build.sh`.
 
-### One-time setup
+## Subcommands
 
-```bash
-agent-vm setup
+```
+claude | codex | opencode | shell   launch an agent in a per-project sandbox
+pull                                refresh the cached image
+setup                               pull base image + verify boot
+clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
 
-Creates a VM template with dev tools, Docker, Chromium, Claude Code, OpenCode, and Codex pre-installed. During setup, Claude will launch once for authentication. After it responds, type `/exit` to continue with the rest of the setup. (We haven't found a way to automate this step yet.)
-
-Options:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--minimal` | Only install git, curl, jq, Claude Code, OpenCode, and Codex. Skips Docker, Node.js, Python, Chromium, and the Chrome MCP server. | off |
-| `--disk GB` | VM disk size in GB | 30 |
-| `--memory GB` | VM memory ceiling in GB | 16 (Linux), 4 (macOS) |
-
-```bash
-agent-vm setup --minimal                  # Lightweight VM with only core CLIs
-agent-vm setup --disk 50 --memory 16      # Larger VM for heavy workloads
-```
-
-### Run Claude in a VM
-
-```bash
-cd your-project
-agent-vm claude
-```
-
-Clones the template into a fresh VM, mounts your current directory, and runs `claude --dangerously-skip-permissions` with `IS_SANDBOX=1` to suppress the dangerous mode confirmation prompt (the VM itself is the sandbox). The VM is deleted when Claude exits.
-
-The default model is `opus[1m]` (Opus with 1M context window). You can override it by passing `--model`:
-
-```bash
-agent-vm claude -p "fix all lint errors"        # Run with a prompt
-agent-vm claude --resume                         # Resume previous session
-agent-vm claude -c "explain this codebase"       # Continue conversation
-agent-vm claude --memory 8                       # Start with 8G instead of default 2G
-agent-vm claude --model sonnet                   # Use Sonnet instead of Opus
-```
-
-### Run OpenCode in a VM
-
-```bash
-cd your-project
-agent-vm opencode
-```
-
-Runs [OpenCode](https://opencode.ai/) inside a sandboxed VM instead of Claude Code. Uses the same VM template, proxies, and security model. OpenCode is configured to use the Anthropic provider through the host proxy with all permissions auto-approved (the VM is the sandbox).
-
-When launching OpenCode, `agent-vm` prefers native OpenCode OAuth for OpenAI when host-side Codex ChatGPT auth is available and `OPENAI_API_KEY` is not set:
-
-1. It checks the host's Codex auth state and runs a minimal host `codex exec` to verify the login still works and to refresh tokens if needed.
-2. If that succeeds, it writes a placeholder OpenCode `openai` OAuth credential into `~/.local/share/opencode/auth.json` inside the VM and routes the real bearer token through the host credential proxy.
-3. This keeps the real OpenAI tokens out of the VM, but the OpenCode ChatGPT session only works until that host bearer token expires.
-4. If host-side Codex auth is unavailable or invalid, OpenCode falls back to its other configured providers unless you provide `OPENAI_API_KEY`.
-
-Any arguments are forwarded to the `opencode` command:
-
-```bash
-agent-vm opencode run "fix all lint errors"        # Non-interactive mode
-agent-vm opencode --continue                        # Continue last session
-agent-vm opencode -m anthropic/claude-sonnet-4-5    # Specify a model
-```
-
-### Run Codex in a VM
-
-```bash
-cd your-project
-agent-vm codex
-```
-
-Runs [Codex CLI](https://developers.openai.com/codex/cli/) inside the same sandboxed VM model. `agent-vm` persists `~/.codex/` per project, configures Codex for `danger-full-access` + `approval_policy = "never"` on first use inside the VM, and updates Codex before launch.
-
-When launching Codex, `agent-vm` now prefers host-side Codex ChatGPT auth when available:
-
-1. It checks the host's Codex auth state and runs a minimal host `codex exec` to verify the login still works and to refresh tokens if needed.
-2. If that succeeds, it injects the refreshed bearer token through the host credential proxy and writes a placeholder `~/.codex/auth.json` inside the VM so the VM never sees the real tokens.
-3. If host-side Codex auth is unavailable or invalid, it falls back to the old behavior: the VM keeps its project-local `~/.codex/` state and users can run `codex login` inside the VM.
-
-If you set `OPENAI_API_KEY` on the host, `agent-vm` still uses the API-key-based proxy flow for Codex instead of host ChatGPT auth.
-
-Any arguments are forwarded to the `codex` command:
-
-```bash
-agent-vm codex "fix all lint errors"                  # Interactive TUI with an initial prompt
-agent-vm codex exec "explain this codebase"           # Non-interactive mode
-agent-vm codex resume --last                          # Resume the last Codex session
-agent-vm codex --model gpt-5.1-codex-mini            # Specify a model
-```
-
-### Debug shell
-
-```bash
-agent-vm shell                # Plain shell with API proxy configured
-agent-vm shell claude         # Shell pre-configured for Claude
-agent-vm shell opencode       # Shell pre-configured for OpenCode
-agent-vm shell codex          # Shell pre-configured for Codex
-```
-
-Drops you into a bash shell inside a fresh VM instead of launching an agent. Useful for debugging or manual testing. When an agent is specified, the shell has that agent's configuration (env vars, MCP servers, etc.) pre-applied.
-
-### Dynamic memory (Linux)
-
-On Linux, VMs use a [virtio-balloon](https://www.linux-kvm.org/page/Projects/auto-ballooning) device to dynamically adjust memory. The VM is created with a 16G ceiling but starts with only 2G of usable RAM. As the guest needs more memory, the balloon daemon automatically deflates to give it more, up to the full 16G. When memory pressure drops, unused memory is reclaimed back to the host.
-
-This means you can run multiple VMs without each one reserving its full allocation upfront.
-
-```bash
-agent-vm claude --memory 5 --max-memory 10   # Start with 5G, grow up to 10G
-agent-vm claude --memory 8                   # Start with 8G, ceiling from template (16G)
-agent-vm memory                              # Show current memory of all running VMs
-agent-vm memory 12G                          # Manually set memory to 12G (auto-detect VM)
-agent-vm memory my-vm 8G                     # Set specific VM's memory
-```
-
-On macOS (Apple Silicon with VZ backend), QEMU is not used and balloon is not available. VMs use a fixed 4G memory allocation instead. You can still use `--memory` to set a different fixed size. The `agent-vm memory` subcommand (live adjustment) is Linux-only.
-
-### Common options
-
-| Flag | Applies to | Description |
-|------|-----------|-------------|
-| `--memory GB` | claude, opencode, codex, shell | Initial memory (default: 2G with balloon, 4G without) |
-| `--max-memory GB` | claude, opencode, codex, shell | Memory ceiling for balloon (default: from template) |
-| `--no-git` | claude, opencode, codex, shell | Skip GitHub integration |
-| `--mount DIR` | claude, opencode, codex, shell | Mount extra host directory into VM (repeatable) |
-| `--usb DEVICE` | claude, opencode, codex, shell | Pass USB device to VM (repeatable) |
-
-## Customization
-
-### Per-user: `~/.claude-vm.setup.sh`
-
-Create this file in your home directory to install extra tools into the VM template. It runs once during `agent-vm setup`, as the default VM user (with sudo available):
-
-```bash
-# ~/.claude-vm.setup.sh
-sudo apt-get install -y postgresql-client
-pip install pandas numpy
-```
-
-### Per-project: `.claude-vm.runtime.sh`
-
-Create this file at the root of any project. It runs inside the cloned VM each time you run an agent, just before the agent starts. Use it for project-specific setup like installing dependencies or starting services:
-
-```bash
-# your-project/.claude-vm.runtime.sh
-npm install
-docker compose up -d
-```
-
-## Session persistence
-
-VMs are ephemeral — each invocation creates a fresh clone and deletes it on exit. To make session resume work across VM launches, agent state is persisted outside your project directory.
-
-**How it works:**
-
-1. A per-project state directory is created under `${XDG_STATE_HOME:-~/.local/state}/agent-vm/`
-2. Claude's session-related directories (`projects`, `file-history`, `todos`, `plans`) and `history.jsonl` are symlinked from `~/.claude/` to `<state-dir>/claude-sessions/`
-3. Ephemeral config (`CLAUDE.md`) stays in-VM and is not persisted
-4. `~/.claude.json` is persisted as `<state-dir>/claude-sessions/claude.json` to preserve onboarding/project state
-5. `hasCompletedOnboarding=true` is enforced before launch to prevent first-run greeting loops
-
-Set `AGENT_VM_STATE_DIR` to override the state root location.
-
-```bash
-agent-vm claude -p "remember ZEBRA"        # First session
-agent-vm claude --continue                  # Picks up where the last session left off
-```
-
-`agent-vm claude` now launches Claude directly without a hidden priming request.
-
-### OpenCode sessions and configuration
-
-OpenCode session data is persisted in `<state-dir>/opencode-sessions/` by symlinking `~/.local/share/opencode/` inside the VM.
-
-OpenCode configuration is stored in `<state-dir>/opencode-config/opencode.json` and referenced via the `OPENCODE_CONFIG` env var. It configures:
-- The Anthropic provider pointing to the host proxy
-- All permissions set to `"allow"` (the VM is the sandbox)
-- GitHub MCP server (when available)
-- Autoupdates disabled
-
-OpenCode authentication state is stored in `<state-dir>/opencode-sessions/auth.json`. When host-side Codex ChatGPT auth is available, `agent-vm opencode` writes a placeholder OAuth credential for the `openai` provider there; the real bearer token stays on the host and is injected by the credential proxy.
-
-### Codex sessions and configuration
-
-Codex state is persisted in `<state-dir>/codex-home/` by symlinking `~/.codex/` inside the VM.
-
-On first use, `agent-vm` writes a minimal `config.toml` there with:
-- `sandbox_mode = "danger-full-access"`
-- `approval_policy = "never"`
-
-That matches the existing model for Claude/OpenCode: the VM is the sandbox, so Codex itself should not stop to ask for extra approval inside it. Existing Codex config is preserved on subsequent runs.
-
-## Credential Proxy
-
-A two-layer proxy chain keeps all API credentials out of the VM:
-
-1. **mitmproxy** (inside VM, port 8080) — transparently intercepts HTTPS traffic to configured domains, redirects it to the host-side credential proxy. Requests to non-configured domains pass through unchanged. Requests to blocked domains (e.g. `datadoghq.com`) are rejected with 403.
-
-2. **credential-proxy.py** (on host) — receives redirected requests, injects real auth headers based on domain/path matching rules, and forwards to the real upstream. Supports per-repo GitHub tokens via path-prefix matching.
-
-The VM only ever sees placeholder tokens. Real credentials live in the host process's memory. A per-instance shared secret (via standard `Proxy-Authorization`) prevents cross-VM credential theft.
-
-### Anthropic auth via host Claude credentials
-
-When your host has `~/.claude/.credentials.json` (from a normal Claude Code login), agent-vm uses it as the single source of truth for Anthropic auth:
-
-- A placeholder `~/.claude/.credentials.json` is written inside the VM with the host's real `expiresAt` but fake access/refresh tokens.
-- The credential proxy reads the host file on every `api.anthropic.com` request and swaps in the real Bearer token — but only when the VM presented that placeholder bearer (or no `Authorization` at all). If Claude Code set the header itself with a different value — e.g. the remote-control bridge polling `/v1/environments/.../work/*` with its `environment_secret` (which carries `org:external_poll_sessions`, a scope the user OAuth token lacks) — that value is forwarded untouched.
-- When the VM's Claude Code decides to refresh (POST to `platform.claude.com/v1/oauth/token`), the proxy intercepts it:
-  - If the host token is still valid, it short-circuits and returns placeholders with the real remaining lifetime.
-  - Otherwise, it spawns `claude -p "say hi and exit" --model sonnet` on the host so host Claude performs the rotation and writes the new tokens to its own file. The proxy never writes the credentials file itself — host Claude remains the sole writer.
-
-This means token rotation "just works" across multiple concurrent VMs, and real tokens never enter any VM.
-
-### OpenAI auth via host Codex credentials
-
-Same pattern for Codex (and OpenCode when using host ChatGPT auth). When `OPENAI_API_KEY` is unset and host `~/.codex/auth.json` contains a valid ChatGPT login, the proxy:
-
-- Reads `tokens.access_token` from the host file on every `api.openai.com` / `chatgpt.com` request and injects it as the Bearer.
-- MITMs `auth.openai.com/oauth/token`: decodes the host JWT's `exp` claim; if still valid, synthesizes a response with forged placeholder JWTs whose claims (`chatgpt_account_id`, `chatgpt_plan_type`, `email`, `exp`) mirror the host's. Otherwise spawns `codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "Reply with OK"` on the host — host Codex does the real rotation, the proxy re-reads and forges fresh placeholders.
-
-VM Codex updates its own `auth.json` from the forged response but never sees a real `access_token` / `refresh_token`.
-
-### Configuration
-
-| Env var | Description | Default |
-|---------|-------------|---------|
-| `OPENAI_API_KEY` | OpenAI API token to inject for Codex / `api.openai.com` | — |
-| `AI_HTTPS_PROXY` | Upstream proxy for AI API traffic only (e.g. `http://user:pass@host:8082`) | — |
-| `AI_SSL_CERT_FILE` | Extra CA cert PEM for `AI_HTTPS_PROXY` | — |
-| `CREDENTIAL_PROXY_DEBUG` | Set to `1` for verbose logging | `0` |
-| `CREDENTIAL_PROXY_LOG_DIR` | Directory for log file | `.` |
-
-When `AI_HTTPS_PROXY` is set, only AI API requests (`api.anthropic.com`, `api.openai.com`) are routed through it. GitHub and other traffic goes direct.
-
-## GitHub Integration
-
-When you run `agent-vm claude`, `agent-vm opencode`, or `agent-vm codex` inside a git repo with a GitHub remote, it automatically:
-
-1. Detects the repository (and submodules) from `git remote`
-2. Scans any `--mount` directories for additional GitHub repos and their submodules
-3. Checks push access via `git push --dry-run`
-4. Obtains repo-scoped GitHub tokens via the device flow (browser-based OAuth)
-5. Configures the credential proxy with per-repo path-prefix rules
-6. Rewrites SSH URLs to HTTPS so all git traffic goes through mitmproxy
-7. Writes instructions to `~/.claude/CLAUDE.md` in the VM so the agent knows git is available
-
-This means mounted git repos get full GitHub integration (push, pull, `gh` CLI) just like the main project directory. For example:
-
-```bash
-agent-vm claude --mount ../other-repo --mount ../shared-lib
-```
-
-All three repos (current directory, `other-repo`, and `shared-lib`) will get their own scoped tokens if they have GitHub remotes with push access.
-
-No credentials are ever exposed to the VM. The credential proxy injects tokens on the host side based on the request path (e.g. `/owner/repo` for git, `/repos/owner/repo` for the GitHub API).
-
-### Token generation and scoping
-
-Tokens are generated via a [GitHub App](https://docs.github.com/en/apps) using the [device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow):
-
-1. **One-time setup**: Create a GitHub App with `contents: write` permission and install it on your org/account. The App's Client ID is configured in `claude-vm.sh`.
-2. **Per-session**: The device flow runs for each repo that has push access — you approve in a browser.
-3. **Multi-repo**: Each repo gets its own scoped token. The credential proxy uses path-prefix matching to inject the right token per request.
-4. **Caching**: Tokens are cached in `~/.cache/claude-vm/` and automatically refreshed when expired.
-
-### GitHub Copilot API
-
-Agents get access to the [GitHub Copilot API](https://docs.github.com/en/copilot/using-github-copilot/using-github-copilot-in-the-command-line) (`api.githubcopilot.com`) via a `gho_*` OAuth token injected by the credential proxy.
-
-Token acquisition strategy (in order):
-
-1. **Dedicated Copilot cache** — a previously cached token is loaded from `~/.cache/claude-vm/copilot-token.json`.
-2. **Device flow** — if no cached token is found, an OAuth device flow runs using the OpenCode OAuth App (`Ov23li8tweQw6odWQebz`) with `read:user` scope. This app grants access to the full model list (Claude, Gemini, GPT-5, etc.). The token is cached for future sessions.
-
-Copilot access requires your GitHub account to have an active Copilot subscription.
-
-## How it works
-
-1. **`agent-vm setup`** creates a Debian 13 VM with Lima, installs dev tools + Chrome + Claude Code + OpenCode + Codex, and stops it as a reusable template
-2. **`agent-vm claude [args]`** clones the template, mounts your working directory read-write, starts the balloon daemon (Linux), runs optional `.claude-vm.runtime.sh`, then launches Claude with full permissions (forwarding any arguments to the `claude` command)
-3. **`agent-vm opencode [args]`** same as above but launches OpenCode instead, with its own config and session persistence
-4. **`agent-vm codex [args]`** same as above but launches Codex instead, with its own `~/.codex/` persistence and OpenAI proxy wiring
-5. **`agent-vm shell [agent]`** same VM setup but drops into a bash shell for debugging
-6. On exit, the cloned VM is stopped and deleted. The template persists for reuse
-
-Ports opened inside the VM (e.g. by Docker containers) are automatically forwarded to your host by Lima.
-
-## What's in the VM
-
-| Category | Packages |
-|----------|----------|
-| Core | git, curl, wget, build-essential, jq |
-| Python | python3, pip, venv |
-| Node.js | Node.js 22 (via NodeSource) |
-| Search | ripgrep, fd-find |
-| Browser | Chromium (headless), xvfb |
-| Containers | Docker Engine, Docker Compose |
-| AI | Claude Code, OpenCode, Codex, Chrome DevTools MCP server |
-| Memory | virtio-balloon auto-scaling (Linux only) |
-
-## Why a VM?
-
-Running an AI agent with full permissions is powerful but risky. Here's how the options compare:
-
-| | No sandbox | Docker | VM (agent-vm) |
-|---|---|---|---|
-| Agent can run any command | Yes | Yes | Yes |
-| File system isolation | None | Partial (shared kernel) | Full |
-| Network isolation | None | Partial | Full |
-| Can run Docker inside | Yes | Requires DinD or socket mount | Yes (native) |
-| Kernel-level isolation | None | None (shares host kernel) | Full (separate kernel) |
-| Protection from container escapes | None | None | Yes |
-| Browser / GUI tools | Host only | Complex setup | Built-in (headless Chromium) |
-
-Docker containers share the host kernel, so a motivated agent could exploit kernel vulnerabilities or misconfigurations to escape. A VM runs its own kernel — even if the agent gains root inside the VM, it can't reach the host.
-
-A VM also avoids the practical headaches of Docker sandboxing. Docker runs natively inside the VM without Docker-in-Docker hacks or socket mounts. Headless Chromium works out of the box without fiddling with `--no-sandbox` flags or shared memory settings. Lima automatically forwards ports from the VM to your host, so if the agent starts a server on port 3000, it's immediately accessible at `localhost:3000`. The agent gets a normal Linux environment where everything just works.
-
-Finally, using a VM means you don't need Node.js, npm, Docker, or any other dev tooling installed on your host machine. The only host dependency is Lima. All the tools (and their vulnerabilities) live inside the VM.
-
-For AI agents running with `--dangerously-skip-permissions`, a VM is the only sandbox that provides meaningful security.
-
-## Usage tracking
-
-Since each VM instance stores Claude session data in its own state directory rather than the standard `~/.claude/`, tools like [ccusage](https://github.com/ryoppippi/ccusage) won't find them by default. A wrapper script is included that discovers all agent-vm session directories automatically:
-
-```bash
-bin/ccusage                        # Daily report (default)
-bin/ccusage monthly                # Monthly report
-bin/ccusage --since 20260401       # Filter by date
-bin/ccusage -i                     # Break down by project
-```
-
-The wrapper sets `CLAUDE_CONFIG_DIR` to include `~/.claude`, `~/.config/claude`, and all `claude-sessions/` directories under `~/.local/state/agent-vm/`.
-
-## License
-
-MIT
+## Image release cadence
+
+The base OCI image (`ghcr.io/wirenboard/agent-vm-template:latest`) is
+rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
+and OpenCode releases automatically. Pin a specific build with
+`--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH` (date tags are
+immutable; the last 14 days are retained).
+
+The agent-vm binary and the image are version-locked through an
+**image-API-version** integer
+(`/etc/agent-vm-image-version` inside the image). Mismatch → clean
+error at launch instead of mysterious in-VM failures.
+
+Each launcher accepts:
+
+| flag | what |
+|---|---|
+| `--memory N` | VM memory GiB (default 2) |
+| `--cpus N` | vCPUs (default 2) |
+| `--image REF` | override the OCI image |
+| `--no-update-check` | skip the registry HEAD on launch |
+| `--no-git` | skip gh/git auth injection (still respects `--repo`) |
+| `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
+| `--mount HOST[:GUEST]` | extra bind mount (one virtio-fs each, ~210 mount headroom) |
+
+Trailing args go to the agent: `agent-vm claude -p "say hi"`,
+`agent-vm shell -- -c 'cargo test'`.
+
+Env-var knobs (all opt-in; set to *any* value, empty included):
+
+| var | what |
+|---|---|
+| `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
+| `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
+| `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
+| `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
+| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
+| `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+
+## Chrome DevTools MCP
+
+The image ships chromium and a `chrome-devtools` MCP entry pinned to
+`chrome-devtools-mcp@1.0.1`. To keep chromium's nested user-namespace
+sandbox active (we'd rather not pass `--no-sandbox`) the MCP runs as a
+dedicated `chrome` user via a sudo wrapper at
+`/usr/local/bin/agent-vm-chrome-mcp`. The launcher installs the
+per-boot microsandbox MITM CA into chrome's NSS DB at startup so
+chromium accepts the intercepted TLS chain without
+`--acceptInsecureCerts` (which would trust *any* untrusted cert).
+
+If the CA install fails (e.g. someone broke the in-image sudoers rule)
+the launcher prints a warning naming the symptom — without it, every
+HTTPS navigate would silently return `ERR_CERT_AUTHORITY_INVALID`.
+Set `AGENT_VM_NO_CHROME_MCP=1` to skip the whole setup.
+
+## Credentials
+
+Reads from the host:
+
+- `~/.claude/.credentials.json` (Claude)
+- `~/.codex/auth.json` (Codex, OpenCode)
+- `gh auth token` (git/gh)
+
+The guest gets placeholder strings; the proxy substitutes on the wire.
+Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (0700)
+on the host, **outside** the bind mount the guest sees. A SHA-256
+snapshot of the three credential files is taken at launch and
+re-checked on exit; unexpected mutations print a warning.
+
+For Claude/Codex, when the in-VM agent's bearer expires the
+hook MITMs the OAuth refresh, runs `claude -p`/`codex exec` on the
+host to rotate, and feeds the new placeholder back to the guest — no
+re-attach required.
+
+## Project hook
+
+If the project root contains an executable `.agent-vm.runtime.sh`,
+the launcher sources it inside the guest before exec'ing the agent.
+Use for `npm install`, env exports, dev-server startup. Non-zero
+exit aborts the launch.
+
+## Ports & egress
+
+The default network policy (`public_only`) lets the guest reach
+the public internet plus DNS, and denies everything else
+(loopback, RFC1918 LAN, link-local, cloud-metadata, the host).
+Open holes per-launch with these flags — they compose:
+
+| flag | what it opens | guest-side address |
+|---|---|---|
+| `--publish HOST:GUEST[/proto]` | host port `HOST` → guest port `GUEST` (`tcp` default; `/udp` for UDP) | inbound to the guest |
+| `--auto-publish` | every `0.0.0.0:*` / `127.0.0.1:*` listener inside the guest is mirrored to the host loopback (Lima-style) | host: `127.0.0.1:<guest-port>` |
+| `--allow-egress IP\|CIDR` (repeatable) | one IP or one CIDR through the egress deny | dial directly by IP |
+| `--allow-lan` | the whole `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) | dial any LAN IP |
+| `--allow-host` | the per-sandbox gateway IP, which the smoltcp stack rewrites to host `127.0.0.1` | `host.microsandbox.internal:<port>` (already in guest `/etc/hosts`) |
+
+Loopback (guest's own `127.0.0.1`), link-local, and cloud metadata
+(`169.254.169.254`) stay denied even with `--allow-lan` — they're
+disjoint groups by design. `--allow-host` is the narrowest way to
+reach a dev server bound to host `127.0.0.1`; `--allow-lan` is the
+broadest. A compromised in-guest process gets full access to
+whatever you open, so prefer the narrowest flag that fits.
+
+## Troubleshooting
+
+- **`RegisterNetDevice(IrqsExhausted)` at boot** — the userspace split
+  irqchip raises the cap to ~219 IRQs, so this should only happen with
+  hundreds of `--mount`s or on a host whose KVM lacks
+  `KVM_CAP_SPLIT_IRQCHIP` (pre-Linux 4.7 or some nested-virt /
+  seccomp-restricted setups). Drop a `--mount` to recover.
+- **`handshake read id_offset: timed out`** — `free -h`; the VM needs
+  more memory than is available. Try `--memory 1`.
+- **GitHub 403 from the proxy** — repo isn't in the allow-list.
+  Pass `--repo OWNER/NAME` or run from a project with the right
+  remote.
+
+## See also
+
+- [PLAN.md](PLAN.md) — phased roadmap, what's done, what's deferred.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
+  the way they do.
+- [AGENTS.md](AGENTS.md) — conventions for coding agents (Claude
+  Code, Codex, etc.) working on this repo: post-merge version bump,
+  submodule-merge ordering, what not to do.

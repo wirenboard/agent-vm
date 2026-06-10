@@ -42,33 +42,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # Scheduled (cron) runs only ever fire from the default branch
-      # (GitHub Actions constraint), so the workflow *file* is always
-      # main's. But the active development trunk is `rewrite-microsandbox`,
-      # and `main` lags behind — building from main's source would
-      # publish a stale Dockerfile. Override the checkout ref when
-      # the trigger is the scheduled cron, so the hourly rebuild
-      # actually picks up new agent versions from rewrite-microsandbox.
-      # workflow_dispatch and push events still honour the ref that
-      # triggered them.
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event_name == 'schedule' && 'rewrite-microsandbox' || github.ref }}
 
       - name: Compute timestamp tag (UTC)
         id: ts
         run: |
           echo "tag=$(date -u +%Y-%m-%dT%H)" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve build SHA
-        id: src
-        # On a scheduled run the checkout above pulls from
-        # `rewrite-microsandbox`, but `github.sha` still points at the
-        # commit on `main` that the schedule fired from. The `:sha-…`
-        # tag and revision label must reflect what was actually built,
-        # so resolve HEAD after checkout.
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -129,18 +108,17 @@ jobs:
           tags: |
             ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:latest', env.IMAGE) || '' }}
             ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
-            ${{ env.IMAGE }}:sha-${{ steps.src.outputs.sha }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
           # Tag with the short SHA too so we can trace any image
           # back to the exact Dockerfile commit.
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.src.outputs.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.ts.outputs.tag }}
 
       - name: Show pushed digest
         run: |
-          echo "Pushed ${{ env.IMAGE }}:sha-${{ steps.src.outputs.sha }}"
-          echo "  built from: ${{ github.event_name == 'schedule' && 'rewrite-microsandbox' || github.ref }}"
+          echo "Pushed ${{ env.IMAGE }}:${{ steps.ts.outputs.tag }}"
           echo "  digest: ${{ steps.build.outputs.digest }}"
 
   retain:

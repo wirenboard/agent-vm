@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/agent-vm"]
+# microsandbox declares its own workspace under vendor/; keep it separate
+# so Cargo doesn't try to absorb it into ours.
+exclude = ["vendor/microsandbox"]
+
+[workspace.package]
+version = "0.1.23"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/wirenboard/agent-vm"
+
+# wirenboard's libkrun fork: msb_krun_* 0.1.13 with three fixes on top
+# that are required for the userspace split irqchip to work and for the
+# per-VM virtio-mmio cap to scale past ~11 devices:
+#   - virtio-console pre-activation panic guard (a3d4e3b) — without
+#     this, enabling split_irqchip(true) crashes the VMM during boot
+#     when a spurious epoll event hits the console device before the
+#     guest driver activates it.
+#   - mptable: emit one MP_INTSRC entry per IOAPIC pin (01d8661) — the
+#     pre-fix 16-entry table broke virtio-mmio probes on pin > 15.
+#   - cmdline overflow warning (faf8a58) — surfaces the otherwise
+#     silent x86 COMMAND_LINE_SIZE=2048 truncation in early boot.
+# All sibling msb_krun_* crates are patched from the same git source
+# because they share types across crate boundaries (e.g. msb_krun_vmm
+# holds `dyn Subscriber` impls of msb_krun_devices' Console); mixing
+# registry + git crates from the same cohort gives crate-identity
+# mismatches even when the version numbers agree.
+# Pinned to a specific commit so this Cargo.lock is reproducible;
+# bump when filing the upstream PR is the right time to revisit.
+[patch.crates-io]
+msb_krun = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_arch = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_arch_gen = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_cpuid = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_devices = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_hvf = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_kernel = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_polly = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_smbios = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_utils = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_vmm = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+
+[profile.release]
+codegen-units = 16
+lto = "thin"
+strip = true
+
+# For distribution builds where binary size / runtime perf matter most.
+# Slower to build (single-threaded LTO + 1 codegen unit). Use: `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = "fat"

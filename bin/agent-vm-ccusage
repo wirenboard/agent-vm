@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Phase 7: ccusage wrapper that unions the user's host ~/.claude
+# session dir plus every per-project agent-vm session dir on this host,
+# so `ccusage` reports tokens/cost across host AND sandbox sessions in
+# one summary.
+#
+# Mirrors the original Bash agent-vm's `bin/ccusage` 1:1 but resolves
+# the state root from the same precedence the Rust launcher uses.
+
+set -euo pipefail
+
+state_root="${AGENT_VM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm}"
+
+# Each per-project state dir has the Claude session history under
+# <hash>/claude (which is symlinked into the guest as ~/.claude).
+# Use NUL-delimited find→read so paths containing legal characters
+# like `,` (which CLAUDE_CONFIG_DIR uses as a separator) aren't
+# mis-split (review finding #15).
+paths="$HOME/.claude,$HOME/.config/claude"
+if [ -d "$state_root" ]; then
+  while IFS= read -r -d '' dir; do
+    # Refuse to add a path that contains a comma — CLAUDE_CONFIG_DIR
+    # has no escape mechanism and silently mis-tokenizes; better to
+    # skip than to merge directories the user didn't ask for.
+    case "$dir" in
+      *,*) echo "agent-vm-ccusage: skipping $dir (contains ',', breaks CLAUDE_CONFIG_DIR)" >&2;;
+      *)   paths="$paths,$dir";;
+    esac
+  done < <(find "$state_root" -maxdepth 2 -type d -name claude -print0 2>/dev/null)
+fi
+
+export CLAUDE_CONFIG_DIR="$paths"
+exec npx -y ccusage@latest "$@"

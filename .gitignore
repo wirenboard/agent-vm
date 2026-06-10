@@ -1,3 +1,13 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
 .DS_Store
+
+# Project-local agent hook (carries over from the original agent-vm layout).
 .claude-vm.runtime.sh
-github-git-proxy.log
+.agent-vm.runtime.sh
+
+# Per-user Claude Code permissions / settings (may carry secrets;
+# never commit). Use .claude/settings.json for shared, reviewed
+# settings instead.
+.claude/settings.local.json

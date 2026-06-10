@@ -91,6 +91,23 @@ jobs:
           # Unique suffix so this job doesn't fight build-msb for
           # the same key (different effective Cargo.lock content).
           key: agent-vm-${{ matrix.platform }}
+          # rust-cache@v2 defaults to "save only on the default
+          # branch (main)". This workflow fires on `v*.*.*` tags and
+          # workflow_dispatch from `rewrite-microsandbox`; neither
+          # matches main, so the cache was never being saved and
+          # every release re-paid a cold build (~5 min). Force-save
+          # so subsequent runs (re-dispatch, redo-after-publish-fail
+          # etc.) restore from the previous build's target/.
+          save-if: ${{ true }}
+          # Cache the *full* target/ including path-dep crates.
+          # Default cache-workspace-crates=false strips
+          # vendor/microsandbox/crates/* artefacts before save, so
+          # a warm-cache run still recompiled ~9 microsandbox-*
+          # workspace crates (28s) + the agent-vm crate itself
+          # (~70s of LTO link). Caching the full target/ trades
+          # ~600 MB extra GH cache space for skipping that work.
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
 
       - name: cargo build --release -p agent-vm
         run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
@@ -145,11 +162,43 @@ jobs:
           # build's stale artefacts.
           env-vars: "CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
           key: msb-${{ matrix.platform }}
+          # See build-agent-vm; release runs are off main so default
+          # save-if would skip every release. Force-save.
+          save-if: ${{ true }}
+          # Keep path-dep artefacts (microsandbox workspace internals)
+          # cached too — default strips them and forces re-link.
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - name: Build agentd from source (musl) so msb embeds the matching guest agent
+        run: |
+          # agentd (the guest PID-1 agent) is embedded into msb and injected
+          # at boot. Build it from the pinned source rather than downloading a
+          # release prebuilt, so the producer (msb) and consumer (agentd)
+          # always ship in lockstep — e.g. the boot-params side channel needs
+          # both halves at the same revision; a stale prebuilt agentd would
+          # silently drop every mount. Static musl: agentd runs before the
+          # rootfs is fully set up.
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
 
       - name: cargo build --release -p microsandbox-cli --bin msb
         run: |
+          # --no-default-features drops the `prebuilt` feature, so the
+          # filesystem crate embeds the build/agentd compiled just above
+          # instead of downloading a release prebuilt. net + keyring are the
+          # other CLI defaults and stay on.
           cargo build --release --target ${{ matrix.cargo_target }} \
             --manifest-path vendor/microsandbox/Cargo.toml \
+            --no-default-features --features net,keyring \
             -p microsandbox-cli --bin msb
 
       - name: Upload msb binary
@@ -160,13 +209,118 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # Assemble per-platform npm subpackage: pull in the two binaries
-  # from the parallel build jobs, fetch libkrunfw inline (the curl
-  # is ~10s so not worth a separate job), upload the populated
-  # subpackage tree as the per-platform artifact the publish job
-  # downloads.
+  # Build libkrunfw from source with the KVM-hypervisor config patch
+  # from libkrunfw-overrides/. Stock libkrunfw ships only the
+  # paravirt-guest helpers (CONFIG_KVM_GUEST=y) — agent-vm needs the
+  # in-kernel hypervisor (CONFIG_KVM=y + Intel/AMD backends) so the
+  # guest can host nested KVM (Docker-in-Docker, qemu, etc.). See
+  # libkrunfw-overrides/README.md for details.
+  build-libkrunfw:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        # Need the patch file + LIBKRUNFW_VERSION constant. Submodules
+        # via the vendor path; recursive not required for libkrunfw
+        # itself (cloned separately below).
+        with:
+          submodules: true
+
+      - name: Resolve libkrunfw version from vendor/microsandbox
+        id: lkv
+        shell: bash
+        run: |
+          set -euo pipefail
+          libkrunfw_version=$(awk -F\" \
+            '/^pub const LIBKRUNFW_VERSION *: *&str *= *"/{print $2; exit}' \
+            vendor/microsandbox/crates/utils/lib/lib.rs)
+          test -n "$libkrunfw_version" || { echo "::error::could not extract libkrunfw version"; exit 1; }
+          echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libkrunfw build output
+        id: lk-cache
+        uses: actions/cache@v4
+        with:
+          # Key on version + arch + sha256 of the patches that affect
+          # this arch + workflow file. Hash only `*_${arch}.patch` so an
+          # aarch64 patch edit doesn't invalidate the x86_64 cache.
+          key: libkrunfw-${{ steps.lkv.outputs.libkrunfw_version }}-${{ matrix.arch }}-${{ hashFiles(format('libkrunfw-overrides/*_{0}.patch', matrix.arch), '.github/workflows/release-npm.yml') }}
+          path: libkrunfw-out/
+
+      - name: Install kernel build deps
+        if: steps.lk-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc flex bison libelf-dev libssl-dev \
+            kmod cpio bzip2 xz-utils python3 python3-pyelftools \
+            curl ca-certificates patch
+
+      - name: Clone + patch + build libkrunfw
+        if: steps.lk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          LK_V: ${{ steps.lkv.outputs.libkrunfw_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          git clone --branch "v${LK_V}" --depth 1 \
+            https://github.com/containers/libkrunfw.git libkrunfw-src
+          cd libkrunfw-src
+          # 1) kbuild .config seed (CONFIG_KVM=y + Intel/AMD backends).
+          patch -p1 < ../libkrunfw-overrides/config-libkrunfw_${ARCH}.patch
+          # 2) Kernel source patches: libkrunfw's Makefile runs
+          # `patch -p1 -d $(KERNEL_SOURCES) < $patch` for every file
+          # matching `patches/0*.patch` after extracting the tarball.
+          # Drop arch-matching source patches from libkrunfw-overrides/
+          # there so they ride the same pipeline. File-naming convention:
+          # `<topic>_${ARCH}.patch` (arch-specific). The `0999-overrides-`
+          # prefix sorts them strictly after libkrunfw's own numbered
+          # patches (which currently top out in the 0010-range).
+          #
+          # `config-libkrunfw*` files are kbuild .config seeds, not
+          # kernel source patches — exclude them here. The skip pattern
+          # uses a bare `config-libkrunfw*` (no trailing underscore) so
+          # future variants like `config-libkrunfw-tdx_${ARCH}.patch`
+          # (hyphen) are also caught.
+          shopt -s nullglob
+          for p in ../libkrunfw-overrides/*_${ARCH}.patch; do
+            case "$(basename "$p")" in
+              config-libkrunfw*) continue;;
+            esac
+            cp "$p" "patches/0999-overrides-$(basename "$p")"
+          done
+          # olddefconfig (run by make rule on first invocation) resolves
+          # support symbols (KVM_X86, KVM_SMM, KVM_HYPERV, KVM_VFIO, …).
+          make -j"$(nproc)"
+          # Sanity: hypervisor symbols must be in the rebuilt vmlinux,
+          # otherwise the .so would silently ship the wrong kernel.
+          nm linux-*/vmlinux | grep -qE " kvm_dev_ioctl$" \
+            || { echo "::error::kvm_dev_ioctl missing — patch did not take"; exit 1; }
+          mkdir -p ../libkrunfw-out
+          cp libkrunfw.so."${LK_V}" ../libkrunfw-out/
+
+      - name: Upload libkrunfw artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: libkrunfw-${{ matrix.platform }}
+          path: libkrunfw-out/libkrunfw.so.*
+          retention-days: 7
+          if-no-files-found: error
+
+  # Assemble per-platform npm subpackage: pull in the three artefacts
+  # (agent-vm + msb + libkrunfw with KVM=y) from the parallel build
+  # jobs, create soname symlinks, upload the populated subpackage tree
+  # as the per-platform artifact the publish job downloads.
   package:
-    needs: [resolve-version, build-agent-vm, build-msb]
+    needs: [resolve-version, build-agent-vm, build-msb, build-libkrunfw]
     strategy:
       fail-fast: false
       matrix:
@@ -217,46 +371,27 @@ jobs:
           echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
           echo "libkrunfw_abi=$libkrunfw_abi"         >> "$GITHUB_OUTPUT"
 
-      - name: Fetch libkrunfw from upstream microsandbox release
+      - name: Download patched libkrunfw artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: libkrunfw-${{ matrix.platform }}
+          path: npm-dist/agent-vm-${{ matrix.platform }}/lib/
+
+      - name: Create libkrunfw soname symlinks
         shell: bash
         env:
-          MSB_V:    ${{ steps.lkv.outputs.msb_version }}
-          LK_V:     ${{ steps.lkv.outputs.libkrunfw_version }}
-          LK_ABI:   ${{ steps.lkv.outputs.libkrunfw_abi }}
-          LK_ARCH:  ${{ matrix.libkrunfw_arch }}
+          LK_V:   ${{ steps.lkv.outputs.libkrunfw_version }}
+          LK_ABI: ${{ steps.lkv.outputs.libkrunfw_abi }}
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
-            os_tag=darwin
-          else
-            os_tag=linux
-          fi
-          url="https://github.com/superradcompany/microsandbox/releases/download/v${MSB_V}/microsandbox-${os_tag}-${LK_ARCH}.tar.gz"
-          echo "Downloading $url"
           dst=npm-dist/agent-vm-${{ matrix.platform }}/lib
-          mkdir -p "$dst"
-          tmp=$(mktemp -d)
-          curl -fsSL -o "$tmp/bundle.tar.gz" "$url"
-          tar -xzf "$tmp/bundle.tar.gz" -C "$tmp"
-          shopt -s globstar nullglob
-          found=0
-          for f in "$tmp"/**/libkrunfw*; do
-            cp -a "$f" "$dst/"
-            found=$((found+1))
-          done
-          if [[ $found -eq 0 ]]; then
-            echo "::error::no libkrunfw* in $url"; ls -R "$tmp"; exit 1
-          fi
-          rm -rf "$tmp"
-          if [[ "$os_tag" == darwin ]]; then
+          if [[ "${{ matrix.platform }}" == darwin-* ]]; then
             full="libkrunfw.${LK_ABI}.dylib"
-            if [[ ! -e "$dst/$full" ]]; then
-              ln -s "libkrunfw.${LK_V}.dylib" "$dst/$full"
-            fi
+            test -f "$dst/$full" || { echo "::error::$dst/$full missing"; exit 1; }
           else
             full="libkrunfw.so.${LK_V}"
             soname="libkrunfw.so.${LK_ABI}"
-            test -f "$dst/$full" || { echo "::error::$dst/$full missing after extraction"; exit 1; }
+            test -f "$dst/$full" || { echo "::error::$dst/$full missing"; exit 1; }
             ln -sf "$full"   "$dst/$soname"
             ln -sf "$soname" "$dst/libkrunfw.so"
           fi
@@ -286,10 +421,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # No `registry-url:` on purpose — that input makes setup-node write
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc.
+      # With trusted publishing we have no token, so that line resolves to
+      # an empty authToken and npm errors `ENEEDAUTH` instead of falling
+      # back to OIDC. Without it, npm uses the default registry
+      # (registry.npmjs.org) and the OIDC trusted-publishing flow.
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+
+      # npm trusted publishing (OIDC) needs npm >= 11.5.1; node 22 ships
+      # npm 10.x. With this + `id-token: write` (set at the workflow level)
+      # and a trusted publisher configured on npmjs.com for each package,
+      # `npm publish` exchanges the GitHub OIDC token for short-lived
+      # registry credentials — no long-lived NPM_TOKEN secret — and attaches
+      # provenance automatically.
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # Download each platform artifact into its own subpackage
       # directory explicitly. `actions/download-artifact@v8` with
@@ -347,8 +498,9 @@ jobs:
           done
 
       - name: Publish platform subpackages first
+        # No NODE_AUTH_TOKEN — auth is via OIDC trusted publishing (see the
+        # setup-node note above and the workflow-level `id-token: write`).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
@@ -374,8 +526,8 @@ jobs:
           done
 
       - name: Publish main package
+        # OIDC trusted publishing — no NODE_AUTH_TOKEN (see above).
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
