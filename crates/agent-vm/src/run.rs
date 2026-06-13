@@ -1745,6 +1745,37 @@ fn shell_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── update_banner ────────────────────────────────────────────
+
+    #[test]
+    fn update_banner_uses_crlf_on_tty_so_second_line_doesnt_staircase() {
+        let b = update_banner("273bc18ea563", "75fd20fd31c2", true);
+        // Every line ends in CRLF (the trailing newline included), so a
+        // raw-mode terminal returns the carriage on each line break.
+        assert!(b.ends_with("\r\n"), "banner must end with CRLF: {b:?}");
+        // The crux of the bug: the second line must be immediately preceded
+        // by a carriage return so it renders at column 0 instead of trailing
+        // off the end of the first line.
+        assert!(
+            b.contains("\r\n==> Run `agent-vm pull`"),
+            "second line not preceded by CR: {b:?}"
+        );
+        // Both digests are interpolated into the first line.
+        assert!(b.contains("cached 273bc18ea563, registry 75fd20fd31c2"));
+        // No bare LF survives: stripping the CRLF pairs leaves no '\n'.
+        assert!(!b.replace("\r\n", "").contains('\n'), "found a bare LF: {b:?}");
+    }
+
+    #[test]
+    fn update_banner_uses_plain_lf_off_tty() {
+        let b = update_banner("aaaa", "bbbb", false);
+        // Redirected stderr must not pick up carriage returns.
+        assert!(!b.contains('\r'), "redirected stderr must not get CRs: {b:?}");
+        // Exactly two lines, each terminated by a single LF.
+        assert_eq!(b.matches('\n').count(), 2);
+        assert!(b.contains("cached aaaa, registry bbbb"));
+    }
+
     #[test]
     fn shell_escape_handles_simple_and_quoted() {
         assert_eq!(shell_escape("foo"), "'foo'");
@@ -2248,20 +2279,33 @@ async fn notify_if_update_available(image: &str) {
     // request's worth of wait. The banner is best-effort — on timeout we
     // simply stay quiet and continue with the cached image.
     let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
-    match probe.await {
-        Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) => {
-            eprintln!(
-                "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-            );
-            eprintln!(
-                "==> Run `agent-vm pull` to fetch it. Continuing with the cached image."
-            );
-        }
-        // UpToDate / NotCached: nothing to say.
-        // Ok(Err)/None: registry unreachable etc. — stay quiet.
-        // Err(Elapsed): probe exceeded the budget — stay quiet.
-        _ => {}
+    // Only UpdateAvailable prints. Everything else stays quiet:
+    //   UpToDate / NotCached  — nothing worth saying.
+    //   Ok(Err) / Ok(None)    — registry unreachable etc.
+    //   Err(Elapsed)          — probe exceeded the budget.
+    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
+        eprint!("{}", update_banner(&cached, &remote, std::io::stderr().is_terminal()));
     }
+}
+
+/// Render the two-line "update available" banner with a line terminator
+/// chosen for where it's being written.
+///
+/// This banner runs in a background task (see the spawn on the launch path)
+/// and can land *after* the interactive session has switched the terminal
+/// to raw mode (crossterm::enable_raw_mode in the exec path). In raw mode
+/// the terminal's ONLCR output post-processing is off, so a bare `\n` is a
+/// line feed with no carriage return: the cursor drops a row but holds its
+/// column, staircasing the second line off the end of the first. Emitting an
+/// explicit CRLF on a TTY keeps both lines flush-left whether or not raw mode
+/// is active. For redirected stderr (`is_tty == false`) we stay with a plain
+/// `\n` so logs and pipes don't pick up stray carriage returns.
+fn update_banner(cached: &str, remote: &str, is_tty: bool) -> String {
+    let nl = if is_tty { "\r\n" } else { "\n" };
+    format!(
+        "==> A newer image is available in the registry (cached {cached}, registry {remote}){nl}\
+         ==> Run `agent-vm pull` to fetch it. Continuing with the cached image.{nl}"
+    )
 }
 
 /// Wall-clock budget for the launch-path update probe. Bounds the worst
