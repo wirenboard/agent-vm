@@ -981,11 +981,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // whether auto-publish is enabled — when disabled the runtime
     // never emits events, so the subscriber just idles. Cheap.
     if args.auto_publish {
-        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
+        // These print from a background task during the live (raw-mode)
+        // session, so terminate each line raw-mode-safely; see
+        // `status_line_ending`. is_terminal() is stable for the process, so
+        // the per-event task samples it once before its loop.
+        let nl = status_line_ending(std::io::stderr().is_terminal());
+        eprint!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}{nl}");
         let sb_for_events = sandbox.clone();
         tokio::spawn(async move {
             let mut events = sb_for_events.port_events().await;
             use microsandbox::protocol::network::PortEvent;
+            let nl = status_line_ending(std::io::stderr().is_terminal());
             while let Some(event) = events.recv().await {
                 match event {
                     PortEvent::Added {
@@ -993,8 +999,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         host_port,
                         guest_port,
                     } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}"
+                        eprint!(
+                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}{nl}"
                         );
                     }
                     PortEvent::Removed {
@@ -1002,8 +1008,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         host_port,
                         guest_port,
                     } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port})"
+                        eprint!(
+                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port}){nl}"
                         );
                     }
                 }
@@ -1745,7 +1751,13 @@ fn shell_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // ── update_banner ────────────────────────────────────────────
+    // ── status_line_ending / update_banner ───────────────────────
+
+    #[test]
+    fn status_line_ending_is_crlf_on_tty_and_lf_otherwise() {
+        assert_eq!(status_line_ending(true), "\r\n");
+        assert_eq!(status_line_ending(false), "\n");
+    }
 
     #[test]
     fn update_banner_uses_crlf_on_tty_so_second_line_doesnt_staircase() {
@@ -2288,20 +2300,28 @@ async fn notify_if_update_available(image: &str) {
     }
 }
 
-/// Render the two-line "update available" banner with a line terminator
-/// chosen for where it's being written.
+/// Line terminator for a status line written to stderr from the launch path,
+/// given whether stderr is a TTY.
 ///
-/// This banner runs in a background task (see the spawn on the launch path)
-/// and can land *after* the interactive session has switched the terminal
-/// to raw mode (crossterm::enable_raw_mode in the exec path). In raw mode
-/// the terminal's ONLCR output post-processing is off, so a bare `\n` is a
-/// line feed with no carriage return: the cursor drops a row but holds its
-/// column, staircasing the second line off the end of the first. Emitting an
-/// explicit CRLF on a TTY keeps both lines flush-left whether or not raw mode
-/// is active. For redirected stderr (`is_tty == false`) we stay with a plain
-/// `\n` so logs and pipes don't pick up stray carriage returns.
+/// Several launch-path messages are emitted from background tasks — the
+/// update-available banner and the `--auto-publish` port events — that can run
+/// *after* the interactive session has switched the terminal to raw mode
+/// (`crossterm::enable_raw_mode` in the exec path). In raw mode the terminal's
+/// ONLCR output post-processing is off, so a bare `\n` is a line feed with no
+/// carriage return: the cursor drops a row but holds its column, staircasing
+/// the next line off the end of the previous one. A CRLF on a TTY renders
+/// flush-left whether or not raw mode is active. For redirected stderr
+/// (`is_tty == false`) we keep a plain `\n` so logs and pipes don't pick up
+/// stray carriage returns. (Raw mode doesn't change a fd's TTY-ness, so the
+/// choice is stable for the life of the process.)
+fn status_line_ending(is_tty: bool) -> &'static str {
+    if is_tty { "\r\n" } else { "\n" }
+}
+
+/// Render the two-line "update available" banner, each line terminated by
+/// [`status_line_ending`] so both render flush-left even under raw mode.
 fn update_banner(cached: &str, remote: &str, is_tty: bool) -> String {
-    let nl = if is_tty { "\r\n" } else { "\n" };
+    let nl = status_line_ending(is_tty);
     format!(
         "==> A newer image is available in the registry (cached {cached}, registry {remote}){nl}\
          ==> Run `agent-vm pull` to fetch it. Continuing with the cached image.{nl}"
