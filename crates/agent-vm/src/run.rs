@@ -721,6 +721,30 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         );
     }
 
+    // Surface the host HTTP proxy when one is set. Host-side image pulls
+    // already honour it (reqwest auto-detects the env), and guest egress now
+    // tunnels through it via HTTP CONNECT — the microsandbox network stack
+    // reads the same `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` at boot.
+    // Be loud about it so the operator knows all traffic is routed there.
+    if let Some(proxy) = microsandbox::microsandbox_network::http_proxy::ProxyConfig::from_env() {
+        match (proxy.https_display(), proxy.http_display()) {
+            (Some(s), Some(h)) if s == h => {
+                eprintln!("==> Proxy: routing guest egress + image pulls through {s} (HTTP CONNECT)");
+            }
+            (https, http) => {
+                if let Some(s) = https {
+                    eprintln!("==> Proxy: HTTPS/TLS egress + image pulls via {s} (HTTP CONNECT)");
+                }
+                if let Some(h) = http {
+                    eprintln!("==> Proxy: plain-HTTP egress via {h} (HTTP CONNECT)");
+                }
+            }
+        }
+        if let Some(no_proxy) = proxy.no_proxy_display() {
+            eprintln!("==> Proxy: bypassing (no_proxy) {no_proxy}");
+        }
+    }
+
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
     // guest will send, then register the OAuth refresh endpoint as a
