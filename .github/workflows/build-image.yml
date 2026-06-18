@@ -59,6 +59,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve agent versions
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Each agent's installer fetches "latest" at build time. We
+          # resolve that same "latest" version here and feed it to the
+          # Dockerfile as a per-agent cache key (AGENT_VERSION_*), so an
+          # installer layer is rebuilt only when its agent actually
+          # released — not on every hourly cron run. Sources match what
+          # each installer pulls:
+          #   - codex:    github.com/openai/codex releases/latest
+          #               (install.sh is .../releases/latest/download/)
+          #   - opencode: github.com/sst/opencode releases/latest
+          #               (opencode.ai/install installs that release)
+          #   - claude:   npm @anthropic-ai/claude-code `latest`
+          #               (claude.ai/install.sh installs that version)
+          # Fail the build if any lookup fails rather than silently
+          # shipping a stale key (which would skip a real agent update).
+          codex=$(gh api repos/openai/codex/releases/latest --jq .tag_name)
+          opencode=$(gh api repos/sst/opencode/releases/latest --jq .tag_name)
+          claude=$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r .version)
+          for v in "$codex" "$opencode" "$claude"; do
+            [ -n "$v" ] && [ "$v" != "null" ] || { echo "::error::failed to resolve an agent version (codex=$codex opencode=$opencode claude=$claude)"; exit 1; }
+          done
+          {
+            echo "codex=$codex"
+            echo "opencode=$opencode"
+            echo "claude=$claude"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved agent versions: codex=$codex opencode=$opencode claude=$claude"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -79,17 +112,20 @@ jobs:
           # microsandbox's `tar_ingest.rs:427` already accepts the
           # `application/vnd.oci.image.layer.v1.tar+zstd` media type.
           outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true
-          # Cache-bust the three agent-installer RUN layers each run
-          # by passing the per-build timestamp as a build-arg the
-          # Dockerfile references right before those RUNs. Without
-          # this, `cache-from: type=gha` matches the invariant
-          # `RUN curl … install.sh | bash` instruction strings and
-          # the hourly cron silently reused the same baked-in
-          # agent binaries instead of fetching new releases (the
-          # whole point of the schedule). The heavy apt/chromium/
-          # docker/node layers above the ARG stay cached.
+          # Per-agent version cache keys. `Resolve agent versions`
+          # above looks up each agent's current upstream version; the
+          # Dockerfile references these in the matching installer RUN,
+          # so a layer is rebuilt ONLY when that agent actually
+          # released — not on every hourly cron run. This keeps an
+          # unchanged hourly build a pure cache hit (identical
+          # agent-layer digests → `:latest` consumers re-pull nothing)
+          # instead of re-emitting ~200 MiB of fresh-but-identical
+          # agent layers every hour. The heavy apt/chromium/docker/
+          # node layers below the args stay cached regardless.
           build-args: |
-            AGENT_INSTALL_CACHEBUST=${{ steps.ts.outputs.tag }}
+            AGENT_VERSION_CODEX=${{ steps.ver.outputs.codex }}
+            AGENT_VERSION_OPENCODE=${{ steps.ver.outputs.opencode }}
+            AGENT_VERSION_CLAUDE=${{ steps.ver.outputs.claude }}
           # `cache-from`/`cache-to` keep layer rebuilds fast when only
           # the agent-version layers at the top of the Dockerfile
           # change (the common hourly case).
