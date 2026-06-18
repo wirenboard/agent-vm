@@ -65,26 +65,40 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Each agent's installer fetches "latest" at build time. We
-          # resolve that same "latest" version here and feed it to the
-          # Dockerfile as a per-agent cache key (AGENT_VERSION_*), so an
-          # installer layer is rebuilt only when its agent actually
-          # released — not on every hourly cron run. Sources match what
-          # each installer pulls:
-          #   - codex:    github.com/openai/codex releases/latest
-          #               (install.sh is .../releases/latest/download/)
-          #   - opencode: github.com/sst/opencode releases/latest
-          #               (opencode.ai/install installs that release)
-          #   - claude:   npm @anthropic-ai/claude-code `latest`
-          #               (claude.ai/install.sh installs that version)
-          # Fail the build if any lookup fails rather than silently
-          # shipping a stale key (which would skip a real agent update).
-          codex=$(gh api repos/openai/codex/releases/latest --jq .tag_name)
-          opencode=$(gh api repos/sst/opencode/releases/latest --jq .tag_name)
-          claude=$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r .version)
-          for v in "$codex" "$opencode" "$claude"; do
-            [ -n "$v" ] && [ "$v" != "null" ] || { echo "::error::failed to resolve an agent version (codex=$codex opencode=$opencode claude=$claude)"; exit 1; }
-          done
+          fail() { echo "::error::$1"; exit 1; }
+          # Resolve each agent's current upstream version and feed it to
+          # the Dockerfile as a per-agent cache key (AGENT_VERSION_*), so
+          # an installer layer is rebuilt only when its agent actually
+          # released — not on every hourly cron run. Each source is the
+          # EXACT one the matching installer reads, so the key tracks
+          # what actually gets installed:
+          #   - codex:    openai/codex releases/latest tag — install.sh's
+          #               own resolver hits the same endpoint.
+          #   - opencode: anomalyco/opencode releases/latest tag — the
+          #               repo opencode.ai/install downloads from (it was
+          #               renamed from sst/opencode; sst/* only resolves
+          #               today via GitHub's rename redirect, so pin the
+          #               real repo).
+          #   - claude:   downloads.claude.ai native channel `/latest`
+          #               (a plain version string) — what claude.ai/
+          #               install.sh installs. NOT npm: the npm dist-tags
+          #               (@anthropic-ai/claude-code) move on a separate
+          #               cadence (e.g. stable != latest), so keying on
+          #               npm would miss native releases / rebuild for
+          #               npm-only bumps.
+          # Any lookup failure fails the build (vs shipping a stale key
+          # that would skip a real agent update).
+          codex=$(gh api repos/openai/codex/releases/latest --jq .tag_name) \
+            || fail "codex version lookup failed (openai/codex releases/latest)"
+          opencode=$(gh api repos/anomalyco/opencode/releases/latest --jq .tag_name) \
+            || fail "opencode version lookup failed (anomalyco/opencode releases/latest)"
+          claude=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) \
+            || fail "claude version lookup failed (downloads.claude.ai/claude-code-releases/latest)"
+          # Guard against an HTTP-200-but-garbage response (empty body,
+          # jq 'null', or an HTML error page) silently becoming a key.
+          [ -n "$codex" ]    && [ "$codex" != null ]    || fail "codex version empty/null"
+          [ -n "$opencode" ] && [ "$opencode" != null ] || fail "opencode version empty/null"
+          case "$claude" in [0-9]*.[0-9]*.[0-9]*) : ;; *) fail "claude version implausible: '$claude'" ;; esac
           {
             echo "codex=$codex"
             echo "opencode=$opencode"
