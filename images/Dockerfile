@@ -15,13 +15,15 @@
 # deliberately deferred too.
 #
 # Layer policy: the file is ordered so the LAST RUN steps are the
-# smallest and the most frequently invalidated. The hourly cron
-# bumps the three agent installers (and the sanity check), and the
-# `AGENT_INSTALL_CACHEBUST` ARG ensures Docker rebuilds those
-# layers. Everything earlier — Debian base, chromium, docker
-# engine, Python lint pins, codestyle clone — stays cached across
-# hourly rebuilds, so users pulling `:latest` after a cron run
-# only re-download ~tens of MB instead of the full image.
+# agent installers (the most frequently updated content). Each is
+# keyed on its agent's upstream version via a per-agent
+# `AGENT_VERSION_*` ARG (see below), so the hourly cron rebuilds an
+# installer layer ONLY when that agent actually released — an
+# unchanged build is a pure cache hit. Everything earlier — Debian
+# base, chromium, docker engine, Python lint pins, codestyle clone —
+# stays cached across rebuilds, so users pulling `:latest` re-download
+# only the layer(s) for whichever agent actually changed (and nothing
+# at all when none did).
 #
 # Published to ghcr.io/wirenboard/agent-vm-template:latest by the
 # hourly CI workflow (.github/workflows/build-image.yml). Source-
@@ -487,18 +489,23 @@ RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
  || { msg="==> wirenboard/codestyle clone FAILED (ref=${CODESTYLE_REF}) — re-clone in-VM with: git clone https://github.com/wirenboard/codestyle.git /opt/wirenboard/codestyle"; \
       if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "$msg (soft-fail mode)"; else echo "$msg" >&2; exit 1; fi; }
 
-# Cache-bust for the three agent installers below. The workflow
-# passes the hourly timestamp tag as the value so each scheduled
-# build invalidates exactly these RUN layers (and the sanity check
-# that follows) while leaving every earlier layer — Debian base,
-# chromium, docker engine, WB build deps, cross toolchains, Python
-# lint pins, codestyle clone — cached. Without this the GHA layer
-# cache reuses the `curl … install.sh | bash` layers indefinitely,
-# so hourly cron runs never picked up new claude-code/codex/
-# opencode releases. Local `images/build.sh` builds leave the
-# default empty value and get the normal Docker layer-cache
-# behaviour.
-ARG AGENT_INSTALL_CACHEBUST=
+# Per-agent cache keys (the three `ARG AGENT_VERSION_*` below, one
+# per installer RUN). The workflow resolves each agent's current
+# UPSTREAM version and passes it in, so an installer layer is rebuilt
+# only when that agent actually released — not on every hourly cron
+# run.
+#
+# This replaces the old single `AGENT_INSTALL_CACHEBUST=<timestamp>`
+# arg, which changed every hour and re-emitted all three
+# `curl … install.sh | bash` layers (plus the sanity check) on every
+# build. Because those installs aren't reproducible, each rebuild
+# produced fresh layer blobs → a brand-new ~200 MiB-of-agent-layers
+# image every hour even when no agent version had changed, so
+# `:latest` consumers re-downloaded those layers hourly for nothing.
+# Keying on the real version makes an unchanged hourly build a pure
+# cache hit (identical layer digests → nothing to re-pull). Local
+# `images/build.sh` builds leave the defaults empty and get normal
+# Docker layer-cache behaviour.
 
 # Shared helper for the three agent installer RUNs below. Downloads
 # the upstream `install.sh`, runs it under the requested shell, and
@@ -546,11 +553,25 @@ RUN printf '%s\n' \
  && chmod 0755 /usr/local/bin/agent-vm-install \
  && test -s /usr/local/bin/agent-vm-install
 
-# The three agents each get their own RUN so a single agent
-# release only invalidates one layer (~30 MB per agent). Order is
-# rough size order (smallest first) so the steady-state worst-
-# case download — a fresh release for Claude Code (the biggest)
-# — only re-pulls the topmost layer.
+# The three agents each get their own RUN + their own version arg so
+# a single agent's release rebuilds only that layer (and, by Docker's
+# layer cascade, the layers stacked ABOVE it).
+#
+# Layer order is deliberate and is NOT by size. A change to any layer
+# forces every layer above it to rebuild, so the TOPMOST agent layer
+# is re-emitted on essentially every build that changes anything,
+# while the BOTTOM agent layer is re-emitted only when it itself
+# bumps. The agent that is both largest and most frequently released
+# therefore belongs at the BOTTOM, not the top:
+#   - codex    ~95 MiB, multiple stable cuts/day → bottom (first)
+#   - opencode ~50 MiB, several per week         → middle
+#   - claude   ~68 MiB, ~daily                   → top (last)
+# This minimizes expected re-pushed bytes per changed build across
+# the plausible release-frequency range; putting the big codex layer
+# on top (so it re-pushes on every change) is the worst case. Each
+# RUN references its version arg (`: "${AGENT_VERSION_*}"`) so
+# BuildKit ties the layer's cache key to the version string and
+# rebuilds it ONLY when that string changes.
 #
 # Agent installers HARD-FAIL by default — if an upstream installer
 # is broken or removed, the hourly cron should NOT silently ship an
@@ -559,20 +580,26 @@ RUN printf '%s\n' \
 # sets it) turns the three RUNs into warnings instead.
 
 # Codex CLI official installer.
-RUN agent-vm-install codex sh \
+ARG AGENT_VERSION_CODEX=
+RUN : "codex ${AGENT_VERSION_CODEX}" \
+ && agent-vm-install codex sh \
         https://github.com/openai/codex/releases/latest/download/install.sh
 
 # OpenCode official installer. Installs into ~/.opencode/bin; PATH already
 # includes it. Symlink into /usr/local/bin so non-login shells find it too.
 # The symlink is best-effort — under soft-fail mode the install may have
 # been skipped, in which case there's nothing to link.
-RUN agent-vm-install opencode bash https://opencode.ai/install \
+ARG AGENT_VERSION_OPENCODE=
+RUN : "opencode ${AGENT_VERSION_OPENCODE}" \
+ && agent-vm-install opencode bash https://opencode.ai/install \
  && { [ -x /root/.opencode/bin/opencode ] \
         && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode \
         || true; }
 
 # Claude Code official installer.
-RUN agent-vm-install claude bash https://claude.ai/install.sh
+ARG AGENT_VERSION_CLAUDE=
+RUN : "claude ${AGENT_VERSION_CLAUDE}" \
+ && agent-vm-install claude bash https://claude.ai/install.sh
 
 # Sanity check at build time. Every command is invoked directly
 # (`tool --version >/dev/null`) so a present-but-broken binary —
