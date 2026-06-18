@@ -125,8 +125,53 @@ build_and_push() {
     # win. `registry.insecure=true` lets us push to the loopback HTTP
     # registry. We use `compression-level=3` (zstd's default) — the
     # bench shows diminishing returns past that for binary-heavy layers.
+
+    # If the host is itself behind a TLS-intercept proxy (agent-vm-
+    # inside-agent-vm during local dev, or a corporate egress MITM),
+    # the buildkit container's outbound HTTPS sees the proxy's CA and
+    # curl/apt fail with "unable to verify the legitimacy of the
+    # server". Detect the host CA and:
+    #   - pass it as a buildx secret (the Dockerfile imports it
+    #     conditionally; no-op when the secret is absent),
+    #   - key the RUN-cache invalidation off its mtime (CA_SHIM_
+    #     CACHEBUST — see Dockerfile comment for why secret content
+    #     alone doesn't invalidate the cache),
+    #   - run the RUN steps in the host network namespace, because
+    #     buildkit's default bridge stack drops some HTTPS connec-
+    #     tions (curl 56 `SSL_read: unexpected eof`) mid-redirect
+    #     through the MITM proxy.
+    # Production CI has no such host CA and skips all of this.
+    local extra=()
+    local host_ca="${AGENT_VM_BUILD_HOST_CA:-/usr/local/share/ca-certificates/microsandbox-ca.crt}"
+    local mitm_detected=
+    if [ -f "${host_ca}" ]; then
+        echo "==> Including host CA ${host_ca} as buildx secret (TLS-intercept proxy detected)"
+        extra+=(--secret "id=hostca,src=${host_ca}")
+        extra+=(--build-arg "CA_SHIM_CACHEBUST=$(stat -c %Y "${host_ca}")")
+        extra+=(--allow "network.host")
+        extra+=(--network "host")
+        mitm_detected=1
+    fi
+
+    # AGENT_INSTALL_SOFT_FAIL — independent toggle (not tied to CA
+    # detection) so a clean-network developer rebuilding during an
+    # upstream installer outage can opt in, and someone debugging
+    # installer changes on a MITM host can force hard-fail with
+    # `AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0`.
+    #
+    # Default policy: MITM-detected hosts → soft-fail (the same TLS
+    # interception that triggers the CA shim also hits curl 56 on
+    # some GitHub release-asset URLs); clean hosts → hard-fail
+    # (matching production CI).
+    local soft_fail="${AGENT_VM_BUILD_SOFT_FAIL_AGENTS:-${mitm_detected}}"
+    if [ -n "${soft_fail}" ] && [ "${soft_fail}" != "0" ]; then
+        echo "==> Soft-fail mode enabled for agent installers + codestyle clone (AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0 to disable)"
+        extra+=(--build-arg "AGENT_INSTALL_SOFT_FAIL=1")
+    fi
+
     docker buildx build \
         -t "${IMAGE_TAG}" \
+        "${extra[@]}" \
         --output "type=registry,push=true,registry.insecure=true,compression=zstd,compression-level=3,force-compression=true" \
         -f "${SCRIPT_DIR}/Dockerfile" \
         "${SCRIPT_DIR}"
