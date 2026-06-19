@@ -148,7 +148,19 @@ jobs:
           # past that for binary-heavy content.
           # microsandbox's `tar_ingest.rs:427` already accepts the
           # `application/vnd.oci.image.layer.v1.tar+zstd` media type.
-          outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true
+          #
+          # `rewrite-timestamp=true` clamps the mtime of every file
+          # INSIDE each layer tar to SOURCE_DATE_EPOCH (the commit time).
+          # SOURCE_DATE_EPOCH alone only fixes the image config; layer
+          # file mtimes default to build wall-clock, so a `cache-from`
+          # MISS (gha eviction / size cap / a base-layer invalidation)
+          # would re-run the apt/curl RUN steps and emit layers with
+          # fresh mtimes → new diff_ids → new manifest digest for an
+          # unchanged commit, re-introducing the ~700 MiB consumer
+          # re-pull. Clamping mtimes makes the layer digests — and thus
+          # the manifest digest — reproducible independent of cache
+          # state, so the digest only moves on a real content change.
+          outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           # Per-agent version cache keys. `Resolve agent versions`
           # above looks up each agent's current upstream version; the
           # Dockerfile references these in the matching installer RUN,
@@ -168,13 +180,19 @@ jobs:
           # change (the common hourly case).
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # No provenance/SBOM attestation. The attestation manifest
-          # embeds the build time, so it changes the multi-arch index
-          # digest on every build even when the image content is
+          # No provenance/SBOM attestation. Either one makes buildx wrap
+          # even a single-platform build in an OCI index whose extra
+          # attestation manifest embeds the build time, so the index
+          # digest changes every build even when the image content is
           # identical — which would keep `:latest`'s digest churning
           # hourly (and nag the update banner) despite a stable
-          # linux/amd64 manifest. We don't consume provenance anywhere.
+          # linux/amd64 manifest. We don't consume either anywhere.
+          # Both are pinned off (provenance defaults to mode=min on push;
+          # sbom defaults off but is pinned so a future default flip
+          # can't silently re-introduce the index). The "Show pushed
+          # digest" step asserts the push stayed a single manifest.
           provenance: false
+          sbom: false
           # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to
           # the integration branches (`main`, `rewrite-microsandbox`)
           # so workflow_dispatch on a feature branch can verify the
@@ -203,10 +221,28 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Show pushed digest
+      - name: Show pushed digest + assert single manifest
         run: |
           echo "Pushed ${{ env.IMAGE }}:${{ steps.ts.outputs.tag }}"
           echo "  digest: ${{ steps.build.outputs.digest }}"
+          # Guard the digest-stability invariant: the push must be a
+          # single image manifest, NOT a multi-arch index. An index
+          # (from a re-enabled provenance/sbom attestation, or a buildx
+          # default flip) carries a build-time-varying attestation digest
+          # and would silently restore the hourly `:latest` churn this
+          # workflow exists to prevent. The immutable `:sha-…` tag is
+          # always pushed (on every branch), so inspect that.
+          ref="${IMAGE}:sha-${{ github.sha }}"
+          if mt=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null | jq -r '.mediaType'); then
+            echo "  pushed mediaType: $mt"
+            case "$mt" in
+              *manifest.list*|*image.index*)
+                echo "::error::pushed an index ($mt) — an attestation leaked back in; :latest digest will churn hourly. Ensure provenance:false + sbom:false."
+                exit 1 ;;
+            esac
+          else
+            echo "::warning::could not inspect $ref to assert single-manifest; skipping the check"
+          fi
 
   retain:
     # Delete date-tagged image versions older than 14 days so the
