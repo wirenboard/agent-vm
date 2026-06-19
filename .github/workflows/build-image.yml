@@ -44,10 +44,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Compute timestamp tag (UTC)
+      - name: Compute timestamp tag + source epoch
         id: ts
         run: |
+          # Immutable hourly pin (:YYYY-MM-DDTHH).
           echo "tag=$(date -u +%Y-%m-%dT%H)" >> "$GITHUB_OUTPUT"
+          # SOURCE_DATE_EPOCH = HEAD commit time. Fed to buildkit (see
+          # the build step), it clamps the image config's `created`
+          # field and every history timestamp to a value that is
+          # CONSTANT across the hourly cron builds of a given commit.
+          # So two builds with the same commit + same agent versions +
+          # same layers produce a byte-identical config → an identical
+          # linux/amd64 manifest digest. microsandbox keys its
+          # fsmeta/VMDK materialization on THAT digest, so an unchanged
+          # `:latest` becomes a true no-op pull (0 bytes) instead of
+          # re-downloading the whole image. A new commit, or any changed
+          # agent layer, moves the digest as it should. Without this the
+          # config carried a fresh build timestamp every hour, so every
+          # cron `:latest` had a new manifest digest and consumers
+          # re-pulled ~700 MiB of byte-identical layers hourly.
+          echo "epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -108,6 +124,13 @@ jobs:
 
       - name: Build and push
         id: build
+        env:
+          # Clamps buildkit's image-config `created` + history
+          # timestamps to the commit time (see "Compute timestamp tag +
+          # source epoch") so an unchanged build yields an identical
+          # manifest digest. docker/build-push-action forwards
+          # SOURCE_DATE_EPOCH from the environment to buildkit.
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
         uses: docker/build-push-action@v7
         with:
           context: images
@@ -145,6 +168,13 @@ jobs:
           # change (the common hourly case).
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # No provenance/SBOM attestation. The attestation manifest
+          # embeds the build time, so it changes the multi-arch index
+          # digest on every build even when the image content is
+          # identical — which would keep `:latest`'s digest churning
+          # hourly (and nag the update banner) despite a stable
+          # linux/amd64 manifest. We don't consume provenance anywhere.
+          provenance: false
           # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to
           # the integration branches (`main`, `rewrite-microsandbox`)
           # so workflow_dispatch on a feature branch can verify the
@@ -161,10 +191,17 @@ jobs:
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           # Tag with the short SHA too so we can trace any image
           # back to the exact Dockerfile commit.
+          # NOTE: no `org.opencontainers.image.created` label. It was
+          # set to the per-hour timestamp and lived in the image config,
+          # so it changed the manifest digest every cron build even with
+          # identical content (the root cause of the hourly re-pull). The
+          # config still carries a `created` field, but clamped to the
+          # commit time via SOURCE_DATE_EPOCH, so it's stable per commit.
+          # `revision` (the commit sha) is stable across a commit's
+          # hourly builds, so it doesn't reintroduce churn.
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ steps.ts.outputs.tag }}
 
       - name: Show pushed digest
         run: |
