@@ -11,7 +11,7 @@ name = "agent-vm"
 path = "src/main.rs"
 
 [dependencies]
-microsandbox = { path = "../../vendor/microsandbox/crates/microsandbox" }
+microsandbox = { path = "../../vendor/microsandbox/sdk/rust" }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as

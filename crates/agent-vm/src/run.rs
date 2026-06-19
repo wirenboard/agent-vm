@@ -2228,7 +2228,13 @@ async fn seed_pulled_marker_if_absent(image: &str) {
     // Not cached yet (genuine first run) → Image::get errors → nothing to
     // seed, and there's correctly nothing newer to flag: the imminent
     // IfMissing pull lands the current image.
-    if let Ok(handle) = microsandbox::Image::get(image).await
+    //
+    // Upstream's SDK now routes image lookups through a LocalBackend handle;
+    // open the default one (best-effort — a failure here just skips seeding).
+    let Ok(local) = microsandbox::LocalBackend::new().await else {
+        return;
+    };
+    if let Ok(handle) = microsandbox::Image::get(&local, image).await
         && let Some(digest) = handle.manifest_digest()
     {
         match crate::pulled_marker::write(image, digest) {
