@@ -20,7 +20,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::host_paths::{
-    atomic_write, host_claude_creds_path, host_codex_auth_path, host_opencode_auth_path,
+    atomic_write, host_claude_creds_path, host_codex_auth_path, host_copilot_token_path,
+    host_opencode_auth_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,17 @@ pub const OPENCODE_OPENAI_REFRESH_PLACEHOLDER: &str = "msb-opencode-placeholder-
 /// git credential helper sees this string; the proxy substitutes the
 /// real bearer on outbound traffic to GitHub.
 pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
+/// Placeholder for the host's GitHub Copilot token. The in-guest
+/// Copilot CLI sees this string (exported as `COPILOT_GITHUB_TOKEN`
+/// via `/etc/profile.d` and stored in `~/.copilot/config.json`); the
+/// proxy substitutes the real GitHub OAuth token on outbound traffic
+/// to the Copilot API. Kept distinct from `GH_TOKEN_PLACEHOLDER` so
+/// substituting one can't accidentally rewrite the other in unrelated
+/// request bytes — even though both happen to resolve to the same
+/// host gh token, they're registered against different allow-host
+/// sets (GitHub API vs Copilot API). Mirrors the original Bash
+/// agent-vm's `placeholder-copilot-token-injected-by-proxy`.
+pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -105,6 +117,15 @@ pub const GITHUB_CODELOAD_HOST: &str = "codeload.github.com";
 pub const GITHUB_RAW_HOST: &str = "raw.githubusercontent.com";
 pub const GITHUB_OBJECTS_HOST: &str = "objects.githubusercontent.com";
 
+/// GitHub Copilot API endpoints. The Copilot CLI sends
+/// `Authorization: Bearer <token>` to these; the proxy substitutes
+/// [`COPILOT_TOKEN_PLACEHOLDER`] for the real GitHub OAuth token.
+/// Both are needed: `api.githubcopilot.com` for business/enterprise
+/// seats and `api.individual.githubcopilot.com` for individual ones.
+/// Mirrors the original Bash agent-vm's credential-proxy domains.
+pub const COPILOT_API_HOST: &str = "api.githubcopilot.com";
+pub const COPILOT_API_INDIVIDUAL_HOST: &str = "api.individual.githubcopilot.com";
+
 pub const ANTHROPIC_OAUTH_TOKEN_PATH: &str = "/v1/oauth/token";
 pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 
@@ -125,6 +146,30 @@ pub struct CredsState {
     /// on outbound traffic to GitHub. Only `Some` when the user has
     /// `gh` logged in *and* `--no-git` was not passed.
     pub gh_token_file: Option<PathBuf>,
+    /// File holding the host's GitHub Copilot token (a GitHub OAuth
+    /// token with Copilot access). The proxy substitutes
+    /// `COPILOT_TOKEN_PLACEHOLDER` for this on outbound traffic to the
+    /// Copilot API hosts. Sourced from the original Bash agent-vm's
+    /// device-flow cache (`~/.cache/claude-vm/copilot-token.json`) if
+    /// present, else falls back to the captured `gh auth token` (a gh
+    /// login with the Copilot scope works against the Copilot API).
+    ///
+    /// `Some` whenever a usable token was found and either the Copilot
+    /// agent is being launched (`want_copilot`) or GitHub egress is
+    /// already enabled for another agent (`use_github`). Crucially this
+    /// is NOT gated on `--no-git` for a Copilot launch: the Copilot API
+    /// is not repo-scoped, so `agent-vm copilot` must work even in a
+    /// non-GitHub project.
+    ///
+    /// **Known limitation (no in-session refresh):** unlike the
+    /// Anthropic/OpenAI access tokens, the Copilot token is not
+    /// round-tripped through `intercept_hook`'s OAuth-refresh path. If
+    /// the captured token expires mid-session, the proxy keeps
+    /// substituting the stale value and Copilot requests start failing
+    /// with 401 until the next `agent-vm` launch re-captures from the
+    /// host. gh user tokens are typically long-lived, so the practical
+    /// impact is low; re-launch to recover.
+    pub copilot_token_file: Option<PathBuf>,
     pub snapshot: Option<HostCredsSnapshot>,
 }
 
@@ -174,6 +219,71 @@ pub fn gh_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir(state_dir).join("gh")
 }
 
+/// Per-provider advisory lock file serializing host-side OAuth refreshes
+/// for one provider within a single project. The in-VM agent's
+/// `_intercept-hook` acquires an exclusive `flock` on this path before
+/// spawning a host `claude -p` / `codex exec` to drive a token rotation,
+/// so two racing in-guest refreshes of the *same* provider don't each
+/// launch their own host CLI.
+///
+/// Keyed per provider (`name` is e.g. [`REFRESH_LOCK_ANTHROPIC`]) so a
+/// concurrent Anthropic and OpenAI in-guest refresh don't serialize
+/// against each other — they rotate independent host credential files
+/// and write distinct token files, so there is no shared state to guard
+/// across providers. Lives in the host-only [`host_secret_dir`] (never
+/// bind-mounted into the guest), alongside the token files the refresh
+/// rewrites.
+///
+/// Note: the launcher's [`refresh`] uses a *different*, single shared
+/// lock ([`ProjectRefreshLock`]) because it does read-modify-write on
+/// per-project state files shared across all providers (`claude.json`,
+/// `claude/settings.json`, `opencode-config/opencode.json`), so its
+/// critical section genuinely spans every provider.
+pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
+    host_secret_dir(state_dir).join(name)
+}
+
+/// Lock basename for the Anthropic in-guest refresh single-flight.
+pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
+/// Lock basename for the OpenAI in-guest refresh single-flight.
+pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+
+#[cfg(test)]
+mod refresh_lock_tests {
+    use super::*;
+
+    #[test]
+    fn per_provider_lock_paths_are_distinct_and_in_secret_dir() {
+        let state = Path::new("/home/u/.cache/agent-vm/abc123");
+        let anthropic = refresh_lock_path_for(state, REFRESH_LOCK_ANTHROPIC);
+        let openai = refresh_lock_path_for(state, REFRESH_LOCK_OPENAI);
+        // Two providers must not share a lock file.
+        assert_ne!(anthropic, openai);
+        // Expected concrete paths in the sibling `<name>.secrets/` dir.
+        assert_eq!(
+            anthropic,
+            Path::new("/home/u/.cache/agent-vm/abc123.secrets/.refresh.anthropic.lock")
+        );
+        assert_eq!(
+            openai,
+            Path::new("/home/u/.cache/agent-vm/abc123.secrets/.refresh.openai.lock")
+        );
+        // Both live in the host-only secrets dir, never under state_dir
+        // (which is bind-mounted into the guest).
+        assert_eq!(anthropic.parent(), anthropic_token_path(state).parent());
+        assert_eq!(openai.parent(), anthropic_token_path(state).parent());
+        assert!(!anthropic.starts_with(state));
+        assert!(!openai.starts_with(state));
+    }
+}
+
+/// Per-project location of the Copilot token file the proxy re-reads.
+/// Lives in the host-only [`host_secret_dir`], never inside the guest
+/// mount (it holds the real GitHub OAuth token).
+pub fn copilot_token_path(state_dir: &Path) -> PathBuf {
+    host_secret_dir(state_dir).join("copilot")
+}
+
 /// OpenCode reuses the same OpenAI access token file: both Codex and
 /// OpenCode hit api.openai.com / chatgpt.com and the proxy substitutes
 /// each provider's distinct placeholder string for the same real
@@ -201,6 +311,7 @@ pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
     use_github: bool,
+    want_copilot: bool,
 ) -> Result<CredsState> {
     let _lock = ProjectRefreshLock::acquire(state_dir)
         .context("acquiring per-project refresh lock")?;
@@ -224,7 +335,7 @@ pub fn refresh(
     // First-run bypasses, run regardless of whether the user has host
     // credentials for the provider. Without these the in-VM agent
     // blocks on a terminal-style wizard at first launch.
-    write_agent_config_defaults(state_dir, project_guest_path)?;
+    write_agent_config_defaults(state_dir, project_guest_path, want_copilot)?;
 
     let anthropic_token_file = refresh_anthropic(state_dir).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
@@ -270,6 +381,34 @@ pub fn refresh(
         None
     };
 
+    // D1: capture the host's GitHub Copilot token. Prefer the
+    // device-flow cache the original Bash agent-vm wrote
+    // (`~/.cache/claude-vm/copilot-token.json`); fall back to the
+    // `gh auth token` we just captured (a gh login carries the
+    // Copilot scope for users with a Copilot seat).
+    //
+    // Unlike the gh capture, this is NOT gated on `use_github`. The
+    // Copilot API is reached with a GitHub OAuth token, but it is not
+    // repo-scoped the way `api.github.com` push is — so the reason to
+    // run `agent-vm copilot` (GitHub-backed AI) must not be switched off
+    // just because the project has no detected GitHub remote or the user
+    // passed `--no-git`. We capture the token whenever the Copilot agent
+    // is the one being launched (`want_copilot`), or when GitHub egress
+    // is already enabled for another agent (`use_github`) so an existing
+    // gh login still flows through. When `want_copilot && !use_github`
+    // there is no gh fallback token, so capture succeeds only via the
+    // device-flow cache; the caller surfaces a clear error if nothing
+    // was obtained rather than letting the guest send an unsubstituted
+    // placeholder bearer.
+    let copilot_token_file = if use_github || want_copilot {
+        refresh_copilot(state_dir, gh_token_file.as_deref()).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "copilot credential capture failed; skipping");
+            None
+        })
+    } else {
+        None
+    };
+
     // SHA-256 snapshot of host credential files for post-run mutation
     // detection. Phase 4's refresh hook *legitimately* rewrites these;
     // anything else doing so is a bug to investigate. See
@@ -281,6 +420,7 @@ pub fn refresh(
         openai_token_file,
         opencode_openai_access_token_file,
         gh_token_file,
+        copilot_token_file,
         snapshot,
     })
 }
@@ -589,6 +729,71 @@ fn refresh_gh(state_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(token_file))
 }
 
+/// Parse the original Bash agent-vm's Copilot token cache file. The
+/// cache is JSON `{"access_token": "<gho_…>"}` (see
+/// `copilot_token.py`); return the non-empty `access_token` string.
+/// Split out so it can be unit-tested without touching `$HOME`.
+fn extract_copilot_token(raw: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(raw).ok()?;
+    let tok = json.get("access_token").and_then(|v| v.as_str())?.trim();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+/// Capture the host's GitHub Copilot token into a 0600 file under
+/// `<state>.secrets/copilot`. The proxy substitutes
+/// [`COPILOT_TOKEN_PLACEHOLDER`] for this file's content on outbound
+/// traffic to the Copilot API.
+///
+/// Two sources, in priority order:
+///  1. The device-flow cache the original Bash agent-vm wrote at
+///     `~/.cache/claude-vm/copilot-token.json` (JSON
+///     `{"access_token": …}`). Reusing it means an existing host
+///     Copilot login is honoured without re-running the OAuth device
+///     flow inside this Rust launcher.
+///  2. The `gh auth token` we already captured this launch
+///     (`gh_token_file`). A gh user OAuth token carries the Copilot
+///     scope for accounts with a Copilot seat, so it works against
+///     `api.githubcopilot.com`.
+///
+/// Returns `None` (non-fatal) when neither source yields a token —
+/// Copilot is then simply unavailable in the guest, same as the
+/// original's "could not obtain Copilot token" warning.
+fn refresh_copilot(state_dir: &Path, gh_token_file: Option<&Path>) -> Result<Option<PathBuf>> {
+    // 1. Device-flow cache from the original Bash agent-vm.
+    if let Some(cache) = host_copilot_token_path() {
+        match std::fs::read_to_string(&cache) {
+            Ok(raw) => {
+                if let Some(token) = extract_copilot_token(&raw) {
+                    let token_file = copilot_token_path(state_dir);
+                    atomic_write(&token_file, token.as_bytes(), 0o600)?;
+                    return Ok(Some(token_file));
+                }
+                // Present but unparseable/empty → fall through to gh.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", cache.display())),
+        }
+    }
+
+    // 2. Fall back to the gh token captured this launch.
+    if let Some(gh_file) = gh_token_file {
+        let token = std::fs::read_to_string(gh_file)
+            .with_context(|| format!("reading {}", gh_file.display()))?;
+        let token = token.trim();
+        if !token.is_empty() {
+            let token_file = copilot_token_path(state_dir);
+            atomic_write(&token_file, token.as_bytes(), 0o600)?;
+            return Ok(Some(token_file));
+        }
+    }
+
+    Ok(None)
+}
+
 /// SHA-256 the three host credential files. Files that don't exist or
 /// can't be read are recorded as `None` — only files that successfully
 /// hash become anchors for [`verify_snapshot`].
@@ -641,7 +846,11 @@ fn hash_file(path: &Path) -> Option<String> {
 /// trust/approval settings) into the per-project state dir. Idempotent
 /// across launches; merges instead of overwrites so user tweaks
 /// survive.
-fn write_agent_config_defaults(state_dir: &Path, project_guest_path: &str) -> Result<()> {
+fn write_agent_config_defaults(
+    state_dir: &Path,
+    project_guest_path: &str,
+    want_copilot: bool,
+) -> Result<()> {
     let claude_dir = state_dir.join("claude");
     std::fs::create_dir_all(&claude_dir)?;
     write_default_claude_settings(&claude_dir.join("settings.json"))?;
@@ -670,6 +879,24 @@ fn write_agent_config_defaults(state_dir: &Path, project_guest_path: &str) -> Re
     let opencode_config_dir = state_dir.join("opencode-config");
     std::fs::create_dir_all(&opencode_config_dir)?;
     write_default_opencode_config(&opencode_config_dir.join("opencode.json"))?;
+
+    // D1: GitHub Copilot CLI reads ~/.copilot/config.json. The
+    // launcher symlinks /root/.copilot → /agent-vm-state/copilot so
+    // this file lands at the right path inside the guest. The token
+    // field is a placeholder; the proxy substitutes the real one
+    // outbound (see write_default_copilot_config).
+    //
+    // Only written when the Copilot agent is actually selected
+    // (`want_copilot`). Writing the placeholder `github_token` for a
+    // claude/codex/opencode/shell session would be dead config at best;
+    // worse, paired with the matching `COPILOT_GITHUB_TOKEN` env it would
+    // have the guest emit an unsubstituted bearer if anything in the
+    // session ever hit the Copilot API without a registered secret.
+    if want_copilot {
+        let copilot_dir = state_dir.join("copilot");
+        std::fs::create_dir_all(&copilot_dir)?;
+        write_default_copilot_config(&copilot_dir.join("config.json"))?;
+    }
 
     // Persistent per-project bash history. The launcher symlinks
     // /root/.bash_history → /agent-vm-state/bash_history; touching
@@ -1183,6 +1410,43 @@ fn write_default_opencode_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write the GitHub Copilot CLI's `~/.copilot/config.json`. Two
+/// purposes, both mirroring the original Bash agent-vm's
+/// `_copilot_vm_setup_home`:
+///
+///  - `trusted_folders = ["/"]` so the CLI never prompts "do you
+///    trust this folder?" — the microVM is the sandbox, so trusting
+///    every path inside it is correct.
+///  - the token field carries [`COPILOT_TOKEN_PLACEHOLDER`], which
+///    the proxy substitutes for the real token on outbound traffic.
+///    The CLI also honours the `COPILOT_GITHUB_TOKEN` env var (set by
+///    the launcher); writing it here too covers config-first reads.
+///
+/// Merge-on-existing so a user's own settings survive across launches;
+/// only the fields we manage are force-set.
+fn write_default_copilot_config(path: &Path) -> Result<()> {
+    let mut config: Value = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = config
+        .as_object_mut()
+        .context("copilot config.json is not an object")?;
+    // Trust everything — the VM itself is the security boundary.
+    obj.insert(
+        "trusted_folders".into(),
+        Value::Array(vec![Value::String("/".into())]),
+    );
+    // Placeholder token; the proxy swaps it for the real one outbound.
+    obj.insert(
+        "github_token".into(),
+        Value::String(COPILOT_TOKEN_PLACEHOLDER.into()),
+    );
+    atomic_write(path, serde_json::to_vec(&config)?.as_slice(), 0o600)?;
+    Ok(())
+}
+
 /// Advisory exclusive flock on `<state_dir>/.refresh.lock`. Held for
 /// the duration of [`refresh`] so two concurrent `agent-vm` launchers
 /// in the same project don't interleave reads/writes of the shared
@@ -1340,6 +1604,36 @@ mod tests {
                 sdp.display(),
             );
         }
+    }
+
+    /// D1 regression guard for the per-agent Copilot gating (review
+    /// finding #5). With neither GitHub egress (`use_github=false`) nor
+    /// the Copilot agent selected (`want_copilot=false`), `refresh` must
+    /// not capture a Copilot token — both capture conditions are off, so
+    /// `copilot_token_file` is `None` by construction, independent of any
+    /// host/`$HOME`/gh state (this combination skips both `refresh_gh`
+    /// and `refresh_copilot`). Also re-asserts the security-critical
+    /// property that the copilot token *path* lives *outside* the
+    /// guest-bind-mounted state dir, same as the other token files.
+    #[test]
+    fn copilot_token_not_captured_without_use_github_or_want_copilot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        let creds = super::refresh(sd, "/workspace/p", false, false).unwrap();
+        assert!(
+            creds.copilot_token_file.is_none(),
+            "copilot token captured despite use_github=false and want_copilot=false"
+        );
+        // Independent of capture: the path the proxy would re-read must
+        // never be under the guest mount (threat-model invariant).
+        let cp = copilot_token_path(sd);
+        assert!(
+            !cp.starts_with(sd),
+            "copilot token path {} must not be inside the bind-mounted state dir {}",
+            cp.display(),
+            sd.display(),
+        );
+        assert_eq!(cp.parent().unwrap().parent(), sd.parent());
     }
 
     /// **Placeholder distinctness**. If one placeholder were a

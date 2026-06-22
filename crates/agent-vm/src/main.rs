@@ -23,9 +23,9 @@ const TOP_AFTER_HELP: &str = "\
 Getting started:
   agent-vm setup       fetch and verify the base image (run once first)
   cd ~/your-project
-  agent-vm claude      launch in this project — or codex / opencode / shell
+  agent-vm claude      launch in this project — or codex / opencode / copilot / shell
 
-claude, codex, opencode and shell share the same options;
+claude, codex, opencode, copilot and shell share the same options;
 see `agent-vm claude --help` for mounts, ports, networking and credentials.";
 
 #[derive(Parser)]
@@ -56,6 +56,9 @@ enum Cmd {
 
     /// Launch OpenCode in a per-project sandbox.
     Opencode(run::Args),
+
+    /// Launch GitHub Copilot CLI in a per-project sandbox.
+    Copilot(run::Args),
 
     /// Open a bash shell in a per-project sandbox.
     Shell(run::Args),
@@ -104,6 +107,7 @@ fn main() -> Result<()> {
             Cmd::Claude(args) => exit_with(run::launch(run::Agent::Claude, args).await?),
             Cmd::Codex(args) => exit_with(run::launch(run::Agent::Codex, args).await?),
             Cmd::Opencode(args) => exit_with(run::launch(run::Agent::Opencode, args).await?),
+            Cmd::Copilot(args) => exit_with(run::launch(run::Agent::Copilot, args).await?),
             Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
             Cmd::Clipboard(args) => clipboard::run(args),
             Cmd::InterceptHook(args) => intercept_hook::run(args).await,

@@ -3,8 +3,8 @@
 # tool itself (that's the Rust binary published as
 # @wirenboard/agent-vm on npm).
 #
-# Contents: Debian 13 slim + the three AI coding agents (Claude
-# Code, OpenCode, Codex), minimum dev tooling, and the docker engine
+# Contents: Debian 13 slim + the four AI coding agents (Claude
+# Code, OpenCode, Codex, GitHub Copilot), minimum dev tooling, and the docker engine
 # (docker.io + containerd + runc + fuse-overlayfs). Other heavy
 # extras (LSPs, additional MCP servers, docker-buildx) are
 # deliberately deferred.
@@ -17,7 +17,7 @@
 FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="agent-vm guest template"
-LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
+LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 # LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
 # C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
@@ -257,6 +257,52 @@ ARG AGENT_INSTALL_CACHEBUST=
 # Claude Code official installer.
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
+# Claude Code LSP plugins (C/C++, Python, TypeScript, Go) baked in so
+# in-VM Claude has code intelligence on first launch. Ports the four
+# language servers the original `setup` installed (claude-vm.sh:348-362):
+# clangd-lsp / pyright-lsp / typescript-lsp / gopls-lsp from the
+# claude-plugins-official marketplace.
+#
+# Marketplace registration first: `claude plugin marketplace add` clones
+# https://github.com/anthropics/claude-plugins-official.git into Claude's
+# plugin state, then each `claude plugin install <name>@<marketplace>`
+# resolves against it. The bare repo URL is what the original git-cloned
+# by hand; `marketplace add` lets the CLI manage the clone + index for us.
+#
+# Best-effort per the chrome-mcp pre-warm style above: a transient
+# registry/clone blip during the hourly build must not fail the whole
+# image. Each step is guarded with `|| echo skipped`; a missing plugin
+# costs in-VM code intelligence for that language, not a broken image —
+# Claude still boots and the user can re-run `claude plugin install`.
+#
+# Must come AFTER the Claude install above — `claude` didn't exist before
+# it. node/npm (from the nodejs RUN) and git (from the base apt RUN) are
+# both already present, which the marketplace clone + plugin resolution
+# need.
+#
+# Invoke claude by ABSOLUTE PATH (/root/.local/bin/claude): the installer
+# drops the binary there but the only ENV PATH in this file is
+# /usr/local/cargo/bin:$PATH, and Docker RUN uses a non-login /bin/sh that
+# never sources the shell profile the installer edits. A bare `claude`
+# would hit command-not-found (rc 127), every `|| echo skipped` guard would
+# fire, and the RUN would still exit 0 — baking a GREEN image with ZERO LSP
+# plugins. The absolute path matches the `--version` sanity check below and
+# the OpenCode block's /root/.opencode/bin/opencode.
+#
+# A `claude plugin list` runs after the loop so the build log shows which
+# plugins actually landed — without it the best-effort guards would hide a
+# total no-op behind a clean build. If `marketplace add` ever rejects the
+# `owner/repo` shorthand, swap in the explicit URL
+# https://github.com/anthropics/claude-plugins-official.git.
+RUN { /root/.local/bin/claude plugin marketplace add anthropics/claude-plugins-official \
+        || echo "==> LSP marketplace add skipped (will lazy-add at first plugin use)"; } \
+ && for lsp in clangd-lsp pyright-lsp typescript-lsp gopls-lsp; do \
+        /root/.local/bin/claude plugin install "${lsp}@claude-plugins-official" \
+        || echo "==> LSP plugin ${lsp} skipped (install at runtime if needed)"; \
+    done \
+ && echo "==> LSP plugins installed at build time:" \
+ && { /root/.local/bin/claude plugin list || true; }
+
 # OpenCode official installer. Installs into ~/.opencode/bin; PATH already
 # includes it. Symlink into /usr/local/bin so non-login shells find it too.
 RUN curl -fsSL https://opencode.ai/install | bash \
@@ -265,8 +311,15 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 # Codex CLI official installer.
 RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
 
+# D1: GitHub Copilot CLI. Its own RUN layer so the AGENT_INSTALL_CACHEBUST
+# arg above invalidates it on the hourly build like the other agents, and
+# so a wrong package/binary name fails the image build loudly (via the
+# `copilot --version` smoke check) instead of surfacing as a
+# command-not-found inside the guest at `agent-vm copilot` time.
+RUN npm install -g @github/copilot && copilot --version
+
 # Sanity check at build time so a broken installer surfaces before we push.
-RUN claude --version && opencode --version && codex --version \
+RUN claude --version && opencode --version && codex --version && copilot --version \
  && dockerd --version && docker --version && containerd --version && runc --version
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.

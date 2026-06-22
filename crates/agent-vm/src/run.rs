@@ -141,6 +141,7 @@ pub enum Agent {
     Claude,
     Codex,
     Opencode,
+    Copilot,
     Shell,
 }
 
@@ -150,6 +151,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Opencode => "opencode",
+            Agent::Copilot => "copilot",
             Agent::Shell => "bash",
         }
     }
@@ -169,6 +171,14 @@ impl Agent {
         match self {
             Agent::Claude => &["--dangerously-skip-permissions"],
             Agent::Shell => &["-O", "histappend"],
+            // Copilot CLI's `--allow-all-tools` disables its in-VM
+            // "may I run this?" confirmations. The microVM is the
+            // security boundary, so the extra prompts add no
+            // protection and break non-interactive / agent-mode
+            // flows — same reasoning as `--dangerously-skip-permissions`
+            // for Claude. Drop it (`-> &[]`) if the user already
+            // passed it; the filter in `launch` handles that.
+            Agent::Copilot => &["--allow-all-tools"],
             Agent::Codex | Agent::Opencode => &[],
         }
     }
@@ -176,9 +186,9 @@ impl Agent {
 
 // Footer shown under `-h` (the short summary). A few high-value
 // examples plus a pointer to `--help`. Printed verbatim by clap, so
-// this is exactly what the user sees. One `Args` backs all four launch
-// verbs (claude/codex/opencode/shell), so this footer can't vary per
-// verb — the examples use `claude` and the header says so.
+// this is exactly what the user sees. One `Args` backs all five launch
+// verbs (claude/codex/opencode/copilot/shell), so this footer can't vary
+// per verb — the examples use `claude` and the header says so.
 const LAUNCH_AFTER_HELP: &str = "\
 Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude                  launch Claude Code in the current project
@@ -188,7 +198,8 @@ Examples (claude shown; codex/opencode/shell take the same options):
 
 Trailing args go to the agent. Run with --help for networking, security, and env details.";
 
-// Fuller footer shown under `--help`. Same single-`Args` constraint.
+// Fuller footer shown under `--help`. Same single-`Args` constraint:
+// claude/codex/opencode/copilot/shell all share this.
 const LAUNCH_AFTER_LONG_HELP: &str = "\
 Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude                             launch in the current project
@@ -519,8 +530,33 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("==> GitHub repo scope: <none> (no api.github.com access)");
     }
 
-    let creds = crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github)
-        .context("snapshotting host credentials")?;
+    // D1: the Copilot API is reached with a GitHub OAuth token, but
+    // unlike the gh CLI / repo-push path it is not repo-scoped — so
+    // Copilot's token capture and egress must follow the *selected
+    // agent*, not `use_github`. A user running `agent-vm copilot` in a
+    // non-GitHub project (or with `--no-git`) still expects Copilot to
+    // work; conversely a claude/codex/opencode/shell session in a
+    // GitHub repo should NOT get Copilot egress opened or a duplicate
+    // gh token written to a copilot secret file it never uses.
+    let want_copilot = matches!(agent, Agent::Copilot);
+
+    let creds =
+        crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github, want_copilot)
+            .context("snapshotting host credentials")?;
+
+    // D1: when Copilot is the selected agent but no usable token could
+    // be captured, fail loudly here. Otherwise the guest would send
+    // `Authorization: Bearer msb-copilot-placeholder-v2` to the Copilot
+    // API with no registered substitution entry — the proxy drops the
+    // connection (violation scan) or GitHub returns a confusing 401.
+    if want_copilot && creds.copilot_token_file.is_none() {
+        anyhow::bail!(
+            "no GitHub Copilot token found on the host. Sign in on the host \
+             (e.g. `gh auth login` with a Copilot seat, or run the Copilot \
+             device-flow login that writes ~/.cache/claude-vm/copilot-token.json) \
+             and retry, or pick another agent."
+        );
+    }
 
     // RAII guard so the Phase-5 host-cred mutation check runs on
     // *every* exit path from launch() — including `?` propagation
@@ -663,6 +699,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     "/root/.config/opencode",
                     true,
                 )
+                // D1: GitHub Copilot CLI reads/writes ~/.copilot/
+                // (config.json with trusted_folders + the placeholder
+                // token, plus its session state). secrets::refresh
+                // writes the config under <state>/copilot; this exposes
+                // it at the standard path inside the guest.
+                .symlink("/agent-vm-state/copilot", "/root/.copilot", true)
                 // Phase 6: gh/git config sits at /root/.gitconfig and
                 // /root/.config/gh. write_guest_gh_config writes both
                 // into state_dir; these symlinks expose them at the
@@ -734,7 +776,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the body's refresh_token is a placeholder, not a header.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
-        || creds.gh_token_file.is_some();
+        || creds.gh_token_file.is_some()
+        || creds.copilot_token_file.is_some();
     let auto_publish = args.auto_publish;
     let allow_lan = args.allow_lan;
     let allow_host = args.allow_host;
@@ -746,6 +789,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let opencode = creds.opencode_openai_access_token_file.clone();
         let gh = creds.gh_token_file.clone();
         let has_gh = gh.is_some();
+        // D1 least-privilege: only wire the Copilot secret (and thus
+        // open Copilot-API egress) when Copilot is the selected agent.
+        // `creds.copilot_token_file` can be `Some` for a claude/codex
+        // session too (gh-fallback capture when `use_github`), but a
+        // non-Copilot launch must not carry a Copilot egress allow-host
+        // or a duplicated gh token in a secret it never uses.
+        let copilot = if want_copilot {
+            creds.copilot_token_file.clone()
+        } else {
+            None
+        };
         let allowed_repos_for_hook = allowed_repos.clone();
         let self_path = std::env::current_exe().context("std::env::current_exe")?;
         let state_dir = session.state_dir.clone();
@@ -843,6 +897,23 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .allow_host(GITHUB_OBJECTS_HOST)
                 });
             }
+            // D1: GitHub Copilot CLI sends `Authorization: Bearer
+            // <COPILOT_TOKEN_PLACEHOLDER>` to the Copilot API; the
+            // proxy swaps the placeholder for the real GitHub OAuth
+            // token. Copilot streams responses, so disable basic_auth
+            // to keep the per-chunk fast path (same reasoning as the
+            // Anthropic/OpenAI secrets above — only the bearer header
+            // ever needs substitution here).
+            if let Some(file) = copilot {
+                n = n.secret(|s| {
+                    s.env("MSB_AGENT_VM_COPILOT_UNUSED")
+                        .value(file)
+                        .placeholder(COPILOT_TOKEN_PLACEHOLDER)
+                        .inject_basic_auth(false)
+                        .allow_host(COPILOT_API_HOST)
+                        .allow_host(COPILOT_API_INDIVIDUAL_HOST)
+                });
+            }
             n.intercept(|i| {
                 let mut hook_argv: Vec<String> = vec![
                     self_path.to_string_lossy().to_string(),
@@ -918,6 +989,28 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // `guest_always_env_pins_utf8_locale_and_sandbox_flag`).
     for (key, value) in GUEST_ALWAYS_ENV {
         builder = builder.env(*key, *value);
+    }
+
+    // D1: GitHub Copilot CLI reads its token from COPILOT_GITHUB_TOKEN.
+    // Hand it the placeholder; the credential proxy substitutes the real
+    // GitHub OAuth token for it on the wire to the Copilot API. We set
+    // it via env (not just ~/.copilot/config.json) because attach()'s
+    // execve never sources /etc/profile.d, unlike the original Bash
+    // agent-vm.
+    //
+    // Only set when Copilot is the selected agent. Exporting the
+    // placeholder for a claude/codex/opencode/shell session would have
+    // the guest emit `Authorization: Bearer msb-copilot-placeholder-v2`
+    // to the Copilot API with no registered substitution entry (the
+    // copilot secret is gated on the same condition above), which the
+    // proxy drops as a violation or GitHub rejects with a 401. By here,
+    // a Copilot launch is guaranteed to have a captured token (we bailed
+    // earlier otherwise), so the placeholder always resolves.
+    if want_copilot {
+        builder = builder.env(
+            "COPILOT_GITHUB_TOKEN",
+            crate::secrets::COPILOT_TOKEN_PLACEHOLDER,
+        );
     }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
@@ -1072,7 +1165,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // docker compose up, env-var exports). Runs once per launch with
     // PWD set to the project dir; non-zero exit aborts the launch
     // with the same exit code.
-    // (Importing the microsandbox MITM CA into the `chrome` user's NSS
+    // Importing the microsandbox MITM CA into the `chrome` user's NSS
     // DB — needed because chromium on Linux ignores the system CA bundle
     // and honours only its per-user NSS DB, so the chrome-devtools MCP
     // would otherwise fail every HTTPS page with ERR_CERT_AUTHORITY_INVALID
@@ -1081,26 +1174,18 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // wrapper, so it runs once when the chrome MCP actually starts: off
     // the launch path, and skipped entirely when chrome is unused. The CA
     // is per-install (not bakeable into the shared image); see
-    // images/Dockerfile.)
-    let project_guest_path_escaped = shell_escape(&project_guest_path);
-    let prelude = format!(
-        "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true\n\
-         [ -t 0 ] || exec < /dev/null\n\
-         _hook={path}/.agent-vm.runtime.sh\n\
-         if [ -f \"$_hook\" ]; then\n\
-         \techo \"==> sourcing $_hook\" >&2\n\
-         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
-         fi",
-        path = project_guest_path_escaped,
+    // images/Dockerfile. So no chrome prelude is injected here anymore —
+    // we pass an empty string for it.
+    //
+    // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
+    // which is unit-tested directly. The IPv6-nameserver strip is the
+    // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
+    let shell_line = build_agent_shell_line(
+        &project_guest_path,
+        "",
+        inner_cmd,
+        &inner_args,
     );
-    let prelude = prelude.as_str();
-    let mut shell_line = String::from(prelude);
-    shell_line.push_str("; exec ");
-    shell_line.push_str(&shell_escape(inner_cmd));
-    for a in &inner_args {
-        shell_line.push(' ');
-        shell_line.push_str(&shell_escape(a));
-    }
     let cmd = "bash";
     let agent_args: Vec<String> = vec!["-c".into(), shell_line];
 
@@ -1723,6 +1808,66 @@ fn parse_github_slug(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// Bash snippet (one logical line) that removes **only** IPv6 `nameserver`
+/// entries from the guest's `/etc/resolv.conf`.
+///
+/// microsandbox's agentd writes both an IPv4 and an IPv6 gateway-DNS
+/// `nameserver` line at boot. The IPv6 entry is unresponsive in at least
+/// one nested-libkrun config (the gateway times out on v6 DNS queries —
+/// PLAN.md item B3 / upstream microsandbox issue #5). glibc's
+/// `getaddrinfo` quietly falls through to the working v4 server, but a
+/// strict async resolver (codex's hickory) returns `EAI_AGAIN`
+/// ("Try again") and hangs at startup with "failed to lookup address
+/// information", even though `getent hosts <host>` resolves instantly.
+///
+/// The sed address `/^nameserver .*:/` deletes a line iff it starts with
+/// `nameserver ` *and* its value contains a colon. Every IPv6 literal
+/// contains a colon; no IPv4 dotted-quad does — so v4 `nameserver` lines,
+/// `# comments` (the `^nameserver` anchor won't match a leading `#`),
+/// `search` and `options` lines are all left intact. `2>/dev/null
+/// || true` keeps a read-only or absent resolv.conf from aborting the
+/// prelude.
+///
+/// This is the cheaper of the two B3 options: a microsandbox-side
+/// `network.dns(disable_ipv6)` knob would mean a submodule change to
+/// agentd's resolv.conf writer; stripping one line in the launcher
+/// prelude is self-contained and has no upstream-merge dependency.
+const STRIP_IPV6_NAMESERVERS: &str =
+    "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
+
+/// Build the `bash -c` line that runs inside the guest: the prelude
+/// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
+/// optional project runtime hook) followed by `exec`'ing the chosen
+/// agent with its args. Pure and string-only so it can be unit-tested
+/// without booting a sandbox — the launch path calls exactly this, so
+/// the tested behavior and the live behavior cannot drift.
+fn build_agent_shell_line(
+    project_guest_path: &str,
+    chrome_mcp_prelude: &str,
+    inner_cmd: &str,
+    inner_args: &[String],
+) -> String {
+    let path = shell_escape(project_guest_path);
+    let prelude = format!(
+        "{STRIP_IPV6_NAMESERVERS}\n\
+         [ -t 0 ] || exec < /dev/null\n\
+         {chrome_mcp_prelude}\
+         _hook={path}/.agent-vm.runtime.sh\n\
+         if [ -f \"$_hook\" ]; then\n\
+         \techo \"==> sourcing $_hook\" >&2\n\
+         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
+         fi",
+    );
+    let mut shell_line = prelude;
+    shell_line.push_str("; exec ");
+    shell_line.push_str(&shell_escape(inner_cmd));
+    for a in inner_args {
+        shell_line.push(' ');
+        shell_line.push_str(&shell_escape(a));
+    }
+    shell_line
+}
+
 /// Single-quote `s` for use as a single argv element in a `bash -c`
 /// line. Embedded single quotes are split out with the standard
 /// `'\''` trick. Adequate for forwarding arbitrary user-supplied agent
@@ -1751,6 +1896,92 @@ mod tests {
         assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
         assert_eq!(shell_escape("don't"), "'don'\\''t'");
         assert_eq!(shell_escape(""), "''");
+    }
+
+    // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
+
+    #[test]
+    fn build_agent_shell_line_starts_with_v6_strip_and_execs() {
+        let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
+        // The prelude opens with the IPv6-nameserver strip, sourced from
+        // the single `STRIP_IPV6_NAMESERVERS` const so the live launch
+        // path and this test can't drift.
+        assert!(line.starts_with(STRIP_IPV6_NAMESERVERS), "got: {line}");
+        assert!(line.starts_with("sed -i '/^nameserver .*:/d' /etc/resolv.conf"));
+        assert!(line.contains("exec 'claude'"));
+    }
+
+    #[test]
+    fn build_agent_shell_line_includes_chrome_prelude_and_args() {
+        let line =
+            build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
+        assert!(line.contains("CHROME_CA_STUFF"));
+        assert!(line.contains("exec 'codex' 'exec'"));
+    }
+
+    /// Guard the exact `sed` program in `STRIP_IPV6_NAMESERVERS`. The
+    /// regex is load-bearing (see the const's doc comment): an accidental
+    /// edit that dropped the `^` anchor or the `:` class would silently
+    /// start eating IPv4 nameservers or comment lines, leaving the guest
+    /// with no DNS at all.
+    #[test]
+    fn strip_ipv6_nameservers_snippet_is_the_expected_sed() {
+        assert_eq!(
+            STRIP_IPV6_NAMESERVERS,
+            "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true",
+        );
+    }
+
+    /// Reimplement the `sed '/^nameserver .*:/d'` predicate in Rust and
+    /// assert it removes **only** IPv6 `nameserver` lines: IPv4
+    /// nameservers, comments, `search` and `options` must survive. This
+    /// exercises the regex *intent* without needing a live VM (the real
+    /// strip runs inside the guest, which we can't boot here).
+    #[test]
+    fn sed_predicate_removes_only_ipv6_nameservers() {
+        // Mirror `sed` address `/^nameserver .*:/`: delete iff the line
+        // begins exactly with "nameserver " (so a leading '#' comment is
+        // NOT matched — the `^` anchors before `nameserver`) AND a colon
+        // appears somewhere after that prefix (i.e. in the value).
+        fn deleted_by_sed(line: &str) -> bool {
+            match line.strip_prefix("nameserver ") {
+                Some(value) => value.contains(':'),
+                None => false,
+            }
+        }
+
+        let resolv = "\
+# generated by agentd
+nameserver 10.0.2.3
+nameserver 192.168.1.1
+nameserver fec0::3
+nameserver fe80::1%eth0
+nameserver 2001:4860:4860::8888
+# nameserver 2001:db8::1
+search lan example.com
+options ndots:2 timeout:1";
+
+        let kept: Vec<&str> = resolv.lines().filter(|l| !deleted_by_sed(l)).collect();
+
+        // IPv4 nameservers survive.
+        assert!(kept.contains(&"nameserver 10.0.2.3"));
+        assert!(kept.contains(&"nameserver 192.168.1.1"));
+        // Comments survive, including a commented-out IPv6 nameserver.
+        assert!(kept.contains(&"# generated by agentd"));
+        assert!(kept.contains(&"# nameserver 2001:db8::1"));
+        // `search` / `options` survive even though `options` contains a
+        // colon (the `^nameserver` anchor protects them).
+        assert!(kept.contains(&"search lan example.com"));
+        assert!(kept.contains(&"options ndots:2 timeout:1"));
+
+        // Every IPv6 nameserver line is gone (global, link-local with a
+        // zone id, and ULA forms all carry a colon).
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver fec0::3")));
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver fe80::1")));
+        assert!(!kept.iter().any(|l| l.starts_with("nameserver 2001:")));
+
+        // No surviving line is an (uncommented) IPv6 nameserver.
+        assert!(!kept.iter().any(|l| deleted_by_sed(l)));
     }
 
     // ── parse_github_slug ────────────────────────────────────────

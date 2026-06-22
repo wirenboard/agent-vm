@@ -62,6 +62,16 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-latest
             cargo_target: x86_64-unknown-linux-gnu
+          # linux-arm64 is cross-compiled on the x64 runner (GitHub's
+          # hosted arm64 Linux runners aren't on the free tier).
+          # `gcc-aarch64-linux-gnu` provides the cross linker (wired
+          # up by the repo .cargo/config.toml); the arm64 dev libs the
+          # final link needs come in via `dpkg --add-architecture
+          # arm64` (see the install step).
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            cargo_target: aarch64-unknown-linux-gnu
+            cross: true
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -75,12 +85,28 @@ jobs:
           submodules: 'recursive'
 
       - name: Install Rust toolchain + linux deps
+        env:
+          CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
+          set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+          if [[ -n "$CROSS" ]]; then
+            # Enable the arm64 multiarch repo, then pull the cross
+            # linker + arm64 builds of the C libs agent-vm /
+            # microsandbox link (libcap-ng, libdbus, libsqlite3).
+            # Without the `:arm64` dev libs the final link can't
+            # resolve -lcap-ng / -ldbus-1 / -lsqlite3 for the target.
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu pkg-config \
+              libcap-ng-dev:arm64 libdbus-1-dev:arm64 libsqlite3-dev:arm64
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+          fi
 
       - name: Cargo cache (rust-cache)
         uses: Swatinem/rust-cache@v2
@@ -110,7 +136,20 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: cargo build --release -p agent-vm
-        run: cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
+        env:
+          # Cross pkg-config: point at the arm64 .pc files and let
+          # pkg-config run host→target (the `pkg-config` crate refuses
+          # cross queries unless PKG_CONFIG_ALLOW_CROSS=1). No-ops on
+          # the native x64 leg (CROSS unset).
+          CROSS: ${{ matrix.cross && '1' || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$CROSS" ]]; then
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+            export PKG_CONFIG_SYSROOT_DIR=/
+          fi
+          cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
 
       - name: Upload agent-vm binary
         uses: actions/upload-artifact@v7
@@ -129,6 +168,12 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-latest
             cargo_target: x86_64-unknown-linux-gnu
+          # linux-arm64 cross-build — see build-agent-vm for the
+          # rationale (no free hosted arm64 Linux runner).
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            cargo_target: aarch64-unknown-linux-gnu
+            cross: true
     runs-on: ${{ matrix.runner }}
     env:
       # Override vendor/microsandbox's `lto=true, codegen-units=1`
@@ -138,18 +183,34 @@ jobs:
       # runtime cost on a TLS-proxy workload.
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      # The superproject's .cargo/config.toml sets the aarch64 linker,
+      # but it is NOT on the config search path when building from
+      # vendor/microsandbox (a separate workspace), so set the linker
+      # via env here too. No-op on the native x64 leg.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: 'recursive'
 
       - name: Install Rust toolchain + linux deps
+        env:
+          CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
+          set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+          if [[ -n "$CROSS" ]]; then
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu pkg-config \
+              libcap-ng-dev:arm64 libdbus-1-dev:arm64 libsqlite3-dev:arm64
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
+          fi
 
       - name: Cargo cache (rust-cache)
         uses: Swatinem/rust-cache@v2
@@ -191,7 +252,17 @@ jobs:
           touch vendor/microsandbox/build/agentd
 
       - name: cargo build --release -p microsandbox-cli --bin msb
+        env:
+          CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
+          set -euo pipefail
+          # Cross-compiling msb for aarch64 needs pkg-config pointed at the
+          # arm64 sysroot so the C deps (libcap-ng, dbus) resolve.
+          if [[ -n "$CROSS" ]]; then
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+            export PKG_CONFIG_SYSROOT_DIR=/
+          fi
           # --no-default-features drops the `prebuilt` feature, so the
           # filesystem crate embeds the build/agentd compiled just above
           # instead of downloading a release prebuilt. net + keyring are the
@@ -224,6 +295,15 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-latest
             arch: x86_64
+          # linux-arm64: cross-build the kernel with ARCH=arm64 +
+          # CROSS_COMPILE=aarch64-linux-gnu-. Needs the arm64 kbuild
+          # .config seed patch (libkrunfw-overrides/
+          # config-libkrunfw_aarch64.patch); the build step fails fast
+          # with a clear message if that seed hasn't been ported yet.
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            arch: aarch64
+            cross: true
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -256,12 +336,20 @@ jobs:
 
       - name: Install kernel build deps
         if: steps.lk-cache.outputs.cache-hit != 'true'
+        env:
+          CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc flex bison libelf-dev libssl-dev \
             kmod cpio bzip2 xz-utils python3 python3-pyelftools \
             curl ca-certificates patch
+          if [[ -n "$CROSS" ]]; then
+            # Cross toolchain for the arm64 kernel build.
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu
+          fi
 
       - name: Clone + patch + build libkrunfw
         if: steps.lk-cache.outputs.cache-hit != 'true'
@@ -269,11 +357,24 @@ jobs:
         env:
           LK_V: ${{ steps.lkv.outputs.libkrunfw_version }}
           ARCH: ${{ matrix.arch }}
+          CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
           set -euo pipefail
+          # The arm64 leg cross-compiles the kernel. It needs an arm64
+          # kbuild .config seed; bail early with a clear message rather
+          # than silently emit a kernel built with the wrong config.
+          if [[ -n "$CROSS" && ! -f "libkrunfw-overrides/config-libkrunfw_${ARCH}.patch" ]]; then
+            echo "::error::libkrunfw-overrides/config-libkrunfw_${ARCH}.patch is missing — the arm64 libkrunfw kernel config seed has not been ported yet (see B2 notes)."
+            exit 1
+          fi
           git clone --branch "v${LK_V}" --depth 1 \
             https://github.com/containers/libkrunfw.git libkrunfw-src
           cd libkrunfw-src
+          # Cross build env for arm64: make picks up ARCH/CROSS_COMPILE.
+          if [[ -n "$CROSS" ]]; then
+            export ARCH=arm64
+            export CROSS_COMPILE=aarch64-linux-gnu-
+          fi
           # 1) kbuild .config seed (CONFIG_KVM=y + Intel/AMD backends).
           patch -p1 < ../libkrunfw-overrides/config-libkrunfw_${ARCH}.patch
           # 2) Kernel source patches: libkrunfw's Makefile runs
@@ -328,6 +429,9 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-latest
             libkrunfw_arch: x86_64
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            libkrunfw_arch: aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -459,6 +563,12 @@ jobs:
         with:
           name: agent-vm-linux-x64
           path: npm-dist/agent-vm-linux-x64/
+
+      - name: Download linux-arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-vm-linux-arm64
+          path: npm-dist/agent-vm-linux-arm64/
 
       - name: Verify artifact layout + restore executable bits
         # `actions/upload-artifact@v7` packs files into a zip that
