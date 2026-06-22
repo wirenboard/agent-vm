@@ -1612,6 +1612,7 @@ mod tests {
                     query_params: false,
                     body: false,
                 },
+                on_violation: None,
                 require_tls_identity: true,
             }],
             on_violation: Default::default(),
