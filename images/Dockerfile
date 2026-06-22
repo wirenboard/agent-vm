@@ -303,6 +303,17 @@ RUN { /root/.local/bin/claude plugin marketplace add anthropics/claude-plugins-o
  && echo "==> LSP plugins installed at build time:" \
  && { /root/.local/bin/claude plugin list || true; }
 
+# D2 fix: the running guest symlinks /root/.claude -> /agent-vm-state/claude
+# (persistence, run.rs), which shadows the plugin tree baked just above so the
+# booted guest's `claude plugin list` shows nothing. Stash the plugins +
+# settings to a NON-shadowed path and ship a first-boot seed script; the
+# launcher prelude calls it before exec'ing the agent.
+RUN mkdir -p /opt/agent-vm/claude-seed \
+ && cp -a /root/.claude/plugins /opt/agent-vm/claude-seed/plugins \
+ && cp -a /root/.claude/settings.json /opt/agent-vm/claude-seed/settings.json
+COPY seed-claude-plugins.sh /opt/agent-vm/seed-claude-plugins.sh
+RUN chmod +x /opt/agent-vm/seed-claude-plugins.sh
+
 # OpenCode official installer. Installs into ~/.opencode/bin; PATH already
 # includes it. Symlink into /usr/local/bin so non-login shells find it too.
 RUN curl -fsSL https://opencode.ai/install | bash \

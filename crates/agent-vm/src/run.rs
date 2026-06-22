@@ -1835,6 +1835,16 @@ fn parse_github_slug(url: &str) -> Option<String> {
 const STRIP_IPV6_NAMESERVERS: &str =
     "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
 
+/// Seed the image's baked Claude LSP plugins into the persistent state dir on
+/// first boot (PLAN.md D2). The image installs them under `/root/.claude`, but
+/// the persistence symlink (`/root/.claude -> /agent-vm-state/claude`) shadows
+/// that tree so the booted guest's `claude plugin list` is empty. The image
+/// ships `/opt/agent-vm/seed-claude-plugins.sh`, which copies the stash into
+/// the state dir once. Guarded on the script's presence so older images (no
+/// stash) are an inert no-op, and idempotent so it only does work on first boot.
+const SEED_CLAUDE_PLUGINS: &str =
+    "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh || true";
+
 /// Build the `bash -c` line that runs inside the guest: the prelude
 /// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
 /// optional project runtime hook) followed by `exec`'ing the chosen
@@ -1850,6 +1860,7 @@ fn build_agent_shell_line(
     let path = shell_escape(project_guest_path);
     let prelude = format!(
         "{STRIP_IPV6_NAMESERVERS}\n\
+         {SEED_CLAUDE_PLUGINS}\n\
          [ -t 0 ] || exec < /dev/null\n\
          {chrome_mcp_prelude}\
          _hook={path}/.agent-vm.runtime.sh\n\
@@ -1917,6 +1928,16 @@ mod tests {
             build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
         assert!(line.contains("CHROME_CA_STUFF"));
         assert!(line.contains("exec 'codex' 'exec'"));
+    }
+
+    #[test]
+    fn build_agent_shell_line_seeds_claude_plugins_before_exec() {
+        // D2: the prelude seeds the baked LSP plugins into the persistent
+        // state dir, and must do so before the agent execs.
+        let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
+        let seed = line.find(SEED_CLAUDE_PLUGINS).expect("seed step present");
+        let exec = line.find("exec 'claude'").expect("exec present");
+        assert!(seed < exec, "seed must run before exec; got: {line}");
     }
 
     /// Guard the exact `sed` program in `STRIP_IPV6_NAMESERVERS`. The
