@@ -27,7 +27,23 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev musl-tools
+
+      # The microsandbox SDK embeds the guest agentd binary. agent-vm builds it
+      # from the pinned source (we dropped the upstream prebuilt download), so
+      # the static musl agentd must exist at vendor/microsandbox/build/agentd
+      # before any `cargo build -p agent-vm`. Mirrors the release-npm workflow.
+      - name: Build guest agentd
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
 
       - name: Build
         run: cargo build --release -p agent-vm
