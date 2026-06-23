@@ -11,7 +11,10 @@ name = "agent-vm"
 path = "src/main.rs"
 
 [dependencies]
-microsandbox = { path = "../../vendor/microsandbox/sdk/rust" }
+# default-features = false drops the SDK's `prebuilt` feature, so building
+# agent-vm never downloads the upstream msb+libkrunfw bundle — we ship our own
+# from-source msb. Keep net + keyring (the SDK's other defaults).
+microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features = false, features = ["net", "keyring"] }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
