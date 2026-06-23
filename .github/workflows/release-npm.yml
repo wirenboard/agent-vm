@@ -73,6 +73,11 @@ jobs:
             cargo_target: aarch64-unknown-linux-gnu
             cross: true
     runs-on: ${{ matrix.runner }}
+    # The arm64 (cross) leg is not yet shippable — its libkrunfw kernel
+    # config seed hasn't been ported (see build-libkrunfw) and the arm64
+    # multiarch dev-lib install is still flaky. Let cross legs fail without
+    # blocking the x64 release; they re-enable automatically once green.
+    continue-on-error: ${{ matrix.cross || false }}
     steps:
       - uses: actions/checkout@v5
         # No submodules — the agent-vm crate doesn't need
@@ -135,6 +140,25 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
 
+      - name: Build agentd from source (musl) so the SDK embeds the matching guest agent
+        run: |
+          # agent-vm depends on the microsandbox SDK with the `prebuilt`
+          # feature off, so the filesystem crate embeds build/agentd at
+          # compile time instead of downloading a release prebuilt. Build
+          # the static-musl guest agent from the pinned source first, or
+          # filesystem's build.rs panics ("agentd binary not found ... Run
+          # `just build-deps`"). Mirrors build-msb's identical step.
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
+
       - name: cargo build --release -p agent-vm
         env:
           # Cross pkg-config: point at the arm64 .pc files and let
@@ -175,6 +199,9 @@ jobs:
             cargo_target: aarch64-unknown-linux-gnu
             cross: true
     runs-on: ${{ matrix.runner }}
+    # Cross (arm64) leg is best-effort until arm64 is shippable — see
+    # build-agent-vm. Fail-tolerated so it never blocks the x64 release.
+    continue-on-error: ${{ matrix.cross || false }}
     env:
       # Override vendor/microsandbox's `lto=true, codegen-units=1`
       # release profile for CI. Keeps `panic=abort` (changes
@@ -305,6 +332,9 @@ jobs:
             arch: aarch64
             cross: true
     runs-on: ${{ matrix.runner }}
+    # Cross (arm64) leg fails fast until config-libkrunfw_aarch64.patch is
+    # ported (see the build step). Fail-tolerated so it never blocks x64.
+    continue-on-error: ${{ matrix.cross || false }}
     steps:
       - uses: actions/checkout@v5
         # Need the patch file + LIBKRUNFW_VERSION constant. Submodules
@@ -432,7 +462,12 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-latest
             libkrunfw_arch: aarch64
+            cross: true
     runs-on: ${{ matrix.runner }}
+    # arm64 has no build artifacts until that leg is shippable; its
+    # download steps fail. Fail-tolerated so it never blocks the x64
+    # subpackage (see build-agent-vm).
+    continue-on-error: ${{ matrix.cross || false }}
     steps:
       - uses: actions/checkout@v5
         # We need vendor/microsandbox source to read LIBKRUNFW_VERSION
@@ -565,6 +600,10 @@ jobs:
           path: npm-dist/agent-vm-linux-x64/
 
       - name: Download linux-arm64 artifact
+        # arm64 may not have been built this release (cross legs are
+        # best-effort until shippable). Tolerate a missing artifact; the
+        # publish loop below skips any platform without a built binary.
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: agent-vm-linux-arm64
@@ -623,6 +662,15 @@ jobs:
           # — avoiding a split-state where subpackages exist at v but
           # the main package never makes it.
           for d in npm-dist/agent-vm-*-*; do
+            # Skip platforms not built this release (e.g. arm64 while its
+            # libkrunfw config is unported). The subpackage dir exists from
+            # the checkout but carries no binary; publishing it would ship a
+            # broken, binary-less package. The main package lists it as a
+            # cpu-gated optionalDependency, so its absence is harmless.
+            if [[ ! -f "$d/bin/agent-vm" ]]; then
+              echo "::notice::$d has no built binary; skipping (platform not built this release)"
+              continue
+            fi
             # Node's `require` only resolves bare-relative paths
             # with a leading `./` — without it the loader treats the
             # argument as a node_modules / built-in spec and bails.
