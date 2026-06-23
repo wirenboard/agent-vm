@@ -4,10 +4,27 @@
 # @wirenboard/agent-vm on npm).
 #
 # Contents: Debian 13 slim + the four AI coding agents (Claude
-# Code, OpenCode, Codex, GitHub Copilot), minimum dev tooling, and the docker engine
-# (docker.io + containerd + runc + fuse-overlayfs). Other heavy
+# Code, OpenCode, Codex, GitHub Copilot), the docker engine
+# (docker.io + containerd + runc + fuse-overlayfs), network/diagnostic
+# CLIs, codestyle-pinned Python linters (black/isort/pylint matching
+# `wirenboard/codestyle`), and a clone of `wirenboard/codestyle`
+# at /opt/wirenboard/codestyle. Two heavier blocks (WB
+# build-essentials family + armhf/arm64 cross toolchains) are
+# present in the Dockerfile but COMMENTED OUT for the initial
+# roll-out — see the "DEFERRED" RUN blocks below. Other heavy
 # extras (LSPs, additional MCP servers, docker-buildx) are
-# deliberately deferred.
+# deliberately deferred too.
+#
+# Layer policy: the file is ordered so the LAST RUN steps are the
+# agent installers (the most frequently updated content). Each is
+# keyed on its agent's upstream version via a per-agent
+# `AGENT_VERSION_*` ARG (see below), so the hourly cron rebuilds an
+# installer layer ONLY when that agent actually released — an
+# unchanged build is a pure cache hit. Everything earlier — Debian
+# base, chromium, docker engine, Python lint pins, codestyle clone —
+# stays cached across rebuilds, so users pulling `:latest` re-download
+# only the layer(s) for whichever agent actually changed (and nothing
+# at all when none did).
 #
 # Published to ghcr.io/wirenboard/agent-vm-template:latest by the
 # hourly CI workflow (.github/workflows/build-image.yml). Source-
@@ -17,7 +34,7 @@
 FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="agent-vm guest template"
-LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + minimal dev tooling. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
+LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + diag tooling (ssh/ping/etc.) + codestyle-pinned Python linters + /opt/wirenboard/codestyle. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 # LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
 # C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
@@ -35,10 +52,78 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Image-API contract version. Bump on BREAKING image changes only
 # (new required mount points, changed env-var contracts, removed
 # binaries, renamed in-VM paths). Routine agent-version refreshes
-# do NOT change this. See `crates/agent-vm/src/defaults.rs` for the
-# matching range in the binary.
+# and tooling additions (build-essential, ssh, etc.) do NOT change
+# this — they're additive. See `crates/agent-vm/src/defaults.rs`
+# for the matching range in the binary.
 RUN echo 1 > /etc/agent-vm-image-version
 
+# Conditionally trust a host-supplied CA bundle. Only fires when
+# `images/build.sh` is invoked on a host that sits behind a TLS-
+# intercept proxy (e.g. agent-vm-inside-agent-vm during local dev,
+# or a corporate egress MITM). The build script passes the host CA
+# via `--secret id=hostca` IF it exists at
+# `/usr/local/share/ca-certificates/microsandbox-ca.crt`. In CI
+# (no such file → no secret → empty mount), the `-s` test fails
+# and this is a no-op — the production image is unchanged.
+#
+# `--mount=type=secret` keeps the CA file in the buildkit secret
+# store, not in the layer; what IS persisted is the merged
+# /etc/ssl/certs/ca-certificates.crt. That's fine: the launcher
+# re-imports its per-boot CA at /usr/local/share/ca-certificates/
+# at runtime anyway, so a stale build-time CA in the bundle is
+# inert (and removed if a user runs update-ca-certificates).
+#
+# `CA_SHIM_CACHEBUST`: buildkit does NOT include secret content in
+# the RUN cache key (by design — secrets shouldn't bake into
+# images). So toggling secret presence across builds doesn't
+# invalidate this layer on its own. `images/build.sh` passes the
+# CA file's mtime (`stat -c %Y …`) when the secret is included, so
+# any change to the CA file (or going from "secret absent" → "secret
+# present") shifts the ARG and rebuilds. In CI (no secret, empty
+# arg) the layer also no-ops and stays cached.
+ARG CA_SHIM_CACHEBUST=
+RUN --mount=type=secret,id=hostca,target=/tmp/hostca.crt,required=false \
+    : "${CA_SHIM_CACHEBUST}" \
+ && if [ -s /tmp/hostca.crt ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends ca-certificates \
+        && install -d /usr/local/share/ca-certificates \
+        && install -m 0644 /tmp/hostca.crt /usr/local/share/ca-certificates/agent-vm-build.crt \
+        && update-ca-certificates \
+        && rm -rf /var/lib/apt/lists/* \
+        && echo "==> host CA trusted for this build"; \
+    fi
+
+# Base apt — interpreters, fetchers, search/text utilities, AND
+# network/diagnostic CLIs. Bundling these into the existing base
+# layer (instead of spinning up a new layer for "ssh + ping") keeps
+# the layer count down: every additional layer costs a small
+# per-layer materialize overhead in microsandbox even when nothing
+# changes, so we only earn a new layer when we can articulate why
+# it'd be invalidated independently.
+#
+# Network/diag tools rationale (engineers debug WB devices over
+# SSH and serial; the in-VM agent often needs to confirm a host is
+# reachable before chasing logs):
+#   - iputils-ping, iputils-tracepath, traceroute, mtr-tiny:
+#     reachability + per-hop latency.
+#   - net-tools: legacy `ifconfig`, `netstat`, `route` — still
+#     muscle-memory for most embedded engineers, and many WB docs
+#     reference them by name.
+#   - iproute2: modern `ip`, `ss`. Usually preinstalled, listed
+#     explicitly so an upstream slimming doesn't silently drop it.
+#   - openssh-client: `ssh`, `scp`, `sftp`, `ssh-keygen`. No server
+#     — the agent should never accept inbound connections.
+#   - sshpass: scripted password-auth SSH (lab fixtures, factory
+#     test rigs); also used by some WB CI scripts.
+#   - dnsutils: `dig`, `nslookup`, `host`.
+#   - netcat-openbsd: `nc` for ad-hoc TCP/UDP poking.
+#   - tcpdump: rare but invaluable when an HTTP MITM looks wrong.
+#   - gnupg: needed below to add the GitHub CLI apt key (and any
+#     user-side apt sources `.agent-vm.runtime.sh` adds).
+#   - less, vim-tiny, file, unzip, zip, rsync, htop, lsof, strace,
+#     tmux: standard "I'm in a shell, I need a tool" muscle-memory
+#     set. Each is <5 MB; the bundle is well under 30 MB.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -48,6 +133,13 @@ RUN apt-get update \
         bash \
         python3 python3-pip \
         ripgrep fd-find \
+        gnupg \
+        iputils-ping iputils-tracepath traceroute mtr-tiny \
+        net-tools iproute2 \
+        openssh-client sshpass \
+        dnsutils netcat-openbsd tcpdump \
+        less vim-tiny file unzip zip rsync \
+        htop lsof strace tmux \
  && rm -rf /var/lib/apt/lists/*
 
 # Chromium for the chrome-devtools MCP server (Phase 7). The MCP
@@ -183,27 +275,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
-# Pre-warm chrome-devtools-mcp's npm cache as the chrome user so the
-# first browser tool call in any sandbox doesn't pay the multi-second
-# `npx -y` fetch cost. `--help` exits cleanly after install/version-
-# check; it's the cheapest exercise of the full install path.
-#
-# Pinned to a known-good version. The runtime MCP config in
-# `crates/agent-vm/src/secrets.rs::write_default_claude_root_state`
-# pins the SAME version — bump both together. Without the pin the
-# cache stops being useful the first time upstream cuts a release:
-# `npx -y` re-resolves `@latest` against the registry and re-
-# downloads under the writable upper layer.
-#
-# Best-effort: `|| true` because npm-registry transient failure or a
-# bad `--help` exit code shouldn't fail the whole `agent-vm setup`.
-# A missing cache costs a multi-second fetch on first browser tool
-# call; failing the image build is much worse.
-#
-# Must come AFTER the nodejs RUN above — npx didn't exist before it.
-RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
- || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
-
 # Docker engine — dockerd + cli + containerd + runc.
 #
 # Why each piece:
@@ -243,19 +314,294 @@ RUN apt-get update \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
         > /etc/docker/daemon.json
 
-# Cache-bust for the three agent installers below. The workflow
-# passes the hourly timestamp tag as the value so each scheduled
-# build invalidates exactly these RUN layers (and the sanity check
-# that follows) while leaving the heavy apt/chromium/docker/node
-# layers cached. Without this the GHA layer cache reuses the
-# `curl … install.sh | bash` layers indefinitely, so hourly cron
-# runs never picked up new claude-code/codex/opencode releases.
-# Local `images/build.sh` builds leave the default empty value and
-# get the normal Docker layer-cache behaviour.
-ARG AGENT_INSTALL_CACHEBUST=
+# Pre-warm chrome-devtools-mcp's npm cache as the chrome user so the
+# first browser tool call in any sandbox doesn't pay the multi-second
+# `npx -y` fetch cost. `--help` exits cleanly after install/version-
+# check; it's the cheapest exercise of the full install path.
+#
+# Pinned to a known-good version. The runtime MCP config in
+# `crates/agent-vm/src/secrets.rs::write_default_claude_root_state`
+# pins the SAME version — bump both together. Without the pin the
+# cache stops being useful the first time upstream cuts a release:
+# `npx -y` re-resolves `@latest` against the registry and re-
+# downloads under the writable upper layer.
+#
+# Best-effort: `|| true` because npm-registry transient failure or a
+# bad `--help` exit code shouldn't fail the whole `agent-vm setup`.
+# A missing cache costs a multi-second fetch on first browser tool
+# call; failing the image build is much worse.
+#
+# Must come AFTER the nodejs RUN above — npx didn't exist before it.
+RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
+ || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
-# Claude Code official installer.
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# Wiren Board C/C++ build essentials — DEFERRED.
+#
+# These two RUN blocks (build-essential family + armhf/arm64 cross
+# toolchains) are commented out for the initial roll-out. They
+# account for ~466 MiB compressed (~1.6 GB uncompressed) of the
+# original image size estimate; deferring them keeps the first
+# tooling-image bump lean while the layer ordering / cron-cache
+# wins land. Uncomment to re-enable when WB engineers actually
+# need the cross-compile path in-VM (the existing host
+# `schroot -c bullseye-amd64-sbuild …` workflow still works).
+#
+# Sourced from the union of debian/control Build-Depends across
+# wb-mqtt-serial, wb-mqtt-mbgate, wb-rules, wb-mqtt-confed and the
+# `cpp/local/linux-devenv.sh` / `cpp/ci/clang-*-subdirs.sh` scripts
+# in `wirenboard/codestyle`. When uncommenting, also re-add the
+# corresponding sanity-check probes for clang-format,
+# arm-linux-gnueabihf-gcc, aarch64-linux-gnu-gcc, and
+# qemu-arm-static at the bottom of the Dockerfile.
+#
+#   - build-essential: gcc/g++/make/dpkg-dev metapackage.
+#   - debhelper, devscripts, equivs, dpkg-cross: Debian packaging
+#     primitives. `debhelper (>= 10)` is mandated by every WB
+#     debian/control; `equivs` is required for `mk-build-deps -ir`
+#     (the recommended `linux-devenv.sh` install path).
+#   - pkg-config: standard build-time discovery.
+#   - clang-format, clang-tidy: the only formatters/linters WB
+#     codestyle ships configs for (`cpp/config/.clang-format`,
+#     `.clang-tidy`). `cpp/ci/clang-format-subdirs.sh` and
+#     `clang-tidy-subdirs.sh` call them directly.
+#   - libcurl4-openssl-dev, libgtest-dev, libgmock-dev,
+#     libmodbus-dev, libsystemd-dev: most-frequent C/C++ deps
+#     across the WB services (modbus serial gateway, MQTT bridge,
+#     etc).
+#   - gcovr: pinned in `python/vscode/.devcontainer/devcontainer.json`
+#     via the `coverage-gutters` extension; wb-mqtt-serial's
+#     Build-Depends lists it explicitly.
+#   - gdb-multiarch: install-listed by `cpp/local/linux-devenv.sh`;
+#     debugging cross-built armhf/arm64 binaries.
+#   - cmake, ninja-build: not in every WB repo but common enough
+#     (firmware repo uses cmake) that excluding them would catch
+#     people off guard.
+#   - python3-cups, python3-libgpiod, python3-pycurl: per the
+#     allowed-c-extensions list in `python/config/pyproject.toml`,
+#     so pylint can resolve imports in WB Python projects without
+#     spurious E0401.
+# RUN apt-get update \
+#  && apt-get install -y --no-install-recommends \
+#         build-essential \
+#         debhelper devscripts equivs dpkg-cross \
+#         pkg-config \
+#         clang-format clang-tidy \
+#         libcurl4-openssl-dev \
+#         libgtest-dev libgmock-dev \
+#         libmodbus-dev \
+#         libsystemd-dev \
+#         gcovr \
+#         gdb-multiarch \
+#         cmake ninja-build \
+#         python3-cups python3-libgpiod python3-pycurl \
+#  && rm -rf /var/lib/apt/lists/*
+
+# Wiren Board cross-build toolchains — armhf + arm64 — DEFERRED.
+#
+# See the deferment note on the build-essentials block above.
+#
+# Every flagship WB binary ships for one of these two architectures
+# (controllers are armhf, newer hardware is arm64); the canonical
+# build command in `codestyle/cpp/vscode/.vscode/tasks.json` is
+# `schroot -c bullseye-amd64-sbuild -- DEB_HOST_MULTIARCH=arm-…
+# make -j12`, and qemu-user-static is what makes the resulting
+# binary runnable on x86_64 for tests.
+#
+# Kept in a SEPARATE layer from the C/C++ essentials above because
+# it's the single biggest discretionary addition (~300 MB
+# uncompressed / ~258 MiB compressed). A future Dockerfile.slim
+# can keep this commented while uncommenting the build-essentials
+# block above.
+#
+#   - crossbuild-essential-armhf, crossbuild-essential-arm64:
+#     gcc-arm-linux-gnueabihf / gcc-aarch64-linux-gnu meta-packages.
+#   - qemu-user-static: registers binfmt handlers so an `armhf` or
+#     `arm64` ELF executes under qemu transparently. Required by
+#     the `[armhf]/[arm64] Run tests for debug` tasks in codestyle.
+#   - debootstrap, schroot, sbuild: the canonical WB build path is
+#     `sbuild` inside a `schroot` named `bullseye-amd64-sbuild`.
+#     The chroot itself is NOT created here (it's per-host, lives
+#     at /srv/chroot, and requires the schroot config; the user
+#     creates it on first need with `sbuild-createchroot`).
+# RUN apt-get update \
+#  && apt-get install -y --no-install-recommends \
+#         crossbuild-essential-armhf \
+#         crossbuild-essential-arm64 \
+#         qemu-user-static \
+#         debootstrap schroot sbuild \
+#  && rm -rf /var/lib/apt/lists/*
+
+# Python lint/format toolchain — pinned to the versions in
+# `wirenboard/codestyle/python/config/requirements.txt`. Pinning
+# matters: codestyle ships a `pyproject.toml` that engineers copy
+# into projects, and a black/isort/pylint version skew between
+# image and project re-formats files differently → noisy diffs.
+#
+# `--break-system-packages` because Debian 13 enforces PEP 668 and
+# we WANT these system-wide so any in-VM tool finds them. The
+# microVM rootfs is throwaway, so there's no system Python we can
+# accidentally damage. `--no-cache-dir` shaves ~40 MB off the
+# layer (the pip download cache is dead weight in an image).
+#
+# Versions sourced from
+# `codestyle/python/config/requirements.txt` (master). `attrs==23.1.0`
+# is per the workaround in `codestyle/python/local/linux-devenv.sh`
+# (newer attrs breaks the pinned pylint). `j2cli` is in
+# wb-mqtt-serial's Build-Depends and is a one-line install here.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        black==24.2.0 \
+        isort==5.13.2 \
+        pylint==3.3.9 \
+        pytest-cov==2.10.1 \
+        attrs==23.1.0 \
+        j2cli
+
+# Shallow-clone `wirenboard/codestyle` so the per-project
+# devenv scripts work without each project re-cloning it.
+#
+# The script `cpp/local/linux-devenv.sh` and its Python sibling
+# both expect to be invoked from inside a project as
+# `bash ../codestyle/{cpp,python}/local/linux-devenv.sh`, i.e.
+# with codestyle as a sibling directory. Having it at a known
+# path inside the image lets a project hook (`.agent-vm.runtime.sh`)
+# symlink/copy it into place at launch instead of cloning over
+# the proxy on every cold start.
+#
+# `CODESTYLE_REF` build-arg (default `master`) lets a reproducible
+# build pin to a specific ref — `git clone --branch` accepts a
+# branch or tag name. The hourly CI cron just builds from master,
+# matching the previous behavior.
+#
+# Hard-fails by default: if GitHub is unreachable the resulting
+# image is missing the devenv path that several WB workflows rely
+# on, and we'd rather not silently ship that. Source-checkout dev
+# builds that set `AGENT_INSTALL_SOFT_FAIL=1` (see images/build.sh,
+# auto-set on TLS-intercept hosts) downgrade to a warning.
+#
+# `AGENT_INSTALL_SOFT_FAIL` is also consumed by the three agent
+# installers + the sanity check below; declared here at first use
+# so a single toggle covers everything that might legitimately fail
+# in a dev sandbox but must succeed in CI.
+ARG CODESTYLE_REF=master
+ARG AGENT_INSTALL_SOFT_FAIL=
+RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
+        https://github.com/wirenboard/codestyle.git \
+        /opt/wirenboard/codestyle \
+ || { msg="==> wirenboard/codestyle clone FAILED (ref=${CODESTYLE_REF}) — re-clone in-VM with: git clone https://github.com/wirenboard/codestyle.git /opt/wirenboard/codestyle"; \
+      if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "$msg (soft-fail mode)"; else echo "$msg" >&2; exit 1; fi; }
+
+# Per-agent cache keys (the three `ARG AGENT_VERSION_*` below, one
+# per installer RUN). The workflow resolves each agent's current
+# UPSTREAM version and passes it in, so an installer layer is rebuilt
+# only when that agent actually released — not on every hourly cron
+# run.
+#
+# This replaces the old single `AGENT_INSTALL_CACHEBUST=<timestamp>`
+# arg, which changed every hour and re-emitted all three
+# `curl … install.sh | bash` layers (plus the sanity check) on every
+# build. Because those installs aren't reproducible, each rebuild
+# produced fresh layer blobs → a brand-new ~200 MiB-of-agent-layers
+# image every hour even when no agent version had changed, so
+# `:latest` consumers re-downloaded those layers hourly for nothing.
+# Keying on the real version makes an unchanged hourly build a pure
+# cache hit (identical layer digests → nothing to re-pull). Local
+# `images/build.sh` builds leave the defaults empty and get normal
+# Docker layer-cache behaviour.
+
+# Shared helper for the three agent installer RUNs below. Downloads
+# the upstream `install.sh`, runs it under the requested shell, and
+# emits a uniform soft-fail or hard-fail diagnostic depending on
+# `AGENT_INSTALL_SOFT_FAIL`. Keeping the policy in one place means
+# any future tweak (extra retries, log format, soft-fail discrimina-
+# tion) lives in exactly one spot — the three RUNs that call it are
+# trivial one-liners.
+#
+# Why curl-only (no python3-urllib fallback): both curl and python3's
+# `ssl` module link against the same system OpenSSL, so a real TLS-
+# layer failure (the curl 56 "SSL_read: unexpected eof" we see from
+# inside MITM-proxied dev sandboxes) hits the fallback identically.
+# `--retry 5 --retry-all-errors --http1.1` covers the transient cases
+# that ARE recoverable. The MITM-sandbox case is what
+# `AGENT_INSTALL_SOFT_FAIL=1` exists for.
+#
+# Written via `printf '%s\n'` because debian-slim's `/bin/sh` is
+# POSIX dash, no heredoc niceties. The script is small enough that
+# adding a layer for it is essentially free (well under 1 KB).
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        '# agent-vm-install <name> <shell> <url>' \
+        '#   <name>  - agent identifier (codex, opencode, claude)' \
+        '#   <shell> - sh|bash; the interpreter used to run the installer' \
+        '#   <url>   - upstream installer URL' \
+        '# Honors $AGENT_INSTALL_SOFT_FAIL: when non-empty, a download or' \
+        '# install failure becomes a warning + exit 0 instead of exit 1.' \
+        'set -eu' \
+        'name=$1; shell=$2; url=$3' \
+        'tmp=$(mktemp)' \
+        'trap "rm -f \"$tmp\"" EXIT INT TERM' \
+        'if curl -fsSL --retry 5 --retry-all-errors --http1.1 "$url" -o "$tmp" \' \
+        '        && "$shell" "$tmp"; then' \
+        '    exit 0' \
+        'fi' \
+        'msg="==> $name installer FAILED — install in-VM with: curl -fsSL $url | $shell"' \
+        'if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then' \
+        '    echo "$msg (soft-fail mode; image will ship without $name)"' \
+        '    exit 0' \
+        'fi' \
+        'echo "$msg" >&2' \
+        'exit 1' \
+        > /usr/local/bin/agent-vm-install \
+ && chmod 0755 /usr/local/bin/agent-vm-install \
+ && test -s /usr/local/bin/agent-vm-install
+
+# The three agents each get their own RUN + their own version arg so
+# a single agent's release rebuilds only that layer (and, by Docker's
+# layer cascade, the layers stacked ABOVE it).
+#
+# Layer order is deliberate and is NOT by size. A change to any layer
+# forces every layer above it to rebuild, so the TOPMOST agent layer
+# is re-emitted on essentially every build that changes anything,
+# while the BOTTOM agent layer is re-emitted only when it itself
+# bumps. The agent that is both largest and most frequently released
+# therefore belongs at the BOTTOM, not the top:
+#   - codex    ~95 MiB, multiple stable cuts/day → bottom (first)
+#   - opencode ~50 MiB, several per week         → middle
+#   - claude   ~68 MiB, ~daily                   → top (last)
+# This minimizes expected re-pushed bytes per changed build across
+# the plausible release-frequency range; putting the big codex layer
+# on top (so it re-pushes on every change) is the worst case. Each
+# RUN references its version arg (`: "${AGENT_VERSION_*}"`) so
+# BuildKit ties the layer's cache key to the version string and
+# rebuilds it ONLY when that string changes.
+#
+# Agent installers HARD-FAIL by default — if an upstream installer
+# is broken or removed, the hourly cron should NOT silently ship an
+# image missing an agent. `AGENT_INSTALL_SOFT_FAIL=1` (build-arg,
+# auto-set by images/build.sh on TLS-intercept dev hosts; CI never
+# sets it) turns the three RUNs into warnings instead.
+
+# Codex CLI official installer.
+ARG AGENT_VERSION_CODEX=
+RUN : "codex ${AGENT_VERSION_CODEX}" \
+ && agent-vm-install codex sh \
+        https://github.com/openai/codex/releases/latest/download/install.sh
+
+# OpenCode official installer. Installs into ~/.opencode/bin; PATH already
+# includes it. Symlink into /usr/local/bin so non-login shells find it too.
+# The symlink is best-effort — under soft-fail mode the install may have
+# been skipped, in which case there's nothing to link.
+ARG AGENT_VERSION_OPENCODE=
+RUN : "opencode ${AGENT_VERSION_OPENCODE}" \
+ && agent-vm-install opencode bash https://opencode.ai/install \
+ && { [ -x /root/.opencode/bin/opencode ] \
+        && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode \
+        || true; }
+
+# Claude Code official installer. MUST precede the LSP-plugin install below,
+# which invokes /root/.local/bin/claude.
+ARG AGENT_VERSION_CLAUDE=
+RUN : "claude ${AGENT_VERSION_CLAUDE}" \
+ && agent-vm-install claude bash https://claude.ai/install.sh
 
 # Claude Code LSP plugins (C/C++, Python, TypeScript, Go) baked in so
 # in-VM Claude has code intelligence on first launch. Ports the four
@@ -308,19 +654,20 @@ RUN { /root/.local/bin/claude plugin marketplace add anthropics/claude-plugins-o
 # booted guest's `claude plugin list` shows nothing. Stash the plugins +
 # settings to a NON-shadowed path and ship a first-boot seed script; the
 # launcher prelude calls it before exec'ing the agent.
+# Best-effort like the LSP install above: if a transient blip skipped the
+# plugins, stash nothing rather than hard-failing the image — the first-boot
+# seed then becomes a no-op and plugins lazy-install at runtime.
 RUN mkdir -p /opt/agent-vm/claude-seed \
- && cp -a /root/.claude/plugins /opt/agent-vm/claude-seed/plugins \
- && cp -a /root/.claude/settings.json /opt/agent-vm/claude-seed/settings.json
+ && if [ -d /root/.claude/plugins ]; then \
+        cp -a /root/.claude/plugins /opt/agent-vm/claude-seed/plugins; \
+        [ -f /root/.claude/settings.json ] \
+            && cp -a /root/.claude/settings.json /opt/agent-vm/claude-seed/settings.json; \
+        echo "==> stashed claude LSP plugins for first-boot seeding"; \
+    else \
+        echo "==> no /root/.claude/plugins to stash (LSP install skipped); D2 seed is a no-op"; \
+    fi
 COPY seed-claude-plugins.sh /opt/agent-vm/seed-claude-plugins.sh
 RUN chmod +x /opt/agent-vm/seed-claude-plugins.sh
-
-# OpenCode official installer. Installs into ~/.opencode/bin; PATH already
-# includes it. Symlink into /usr/local/bin so non-login shells find it too.
-RUN curl -fsSL https://opencode.ai/install | bash \
- && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode
-
-# Codex CLI official installer.
-RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh
 
 # D1: GitHub Copilot CLI. Its own RUN layer so the AGENT_INSTALL_CACHEBUST
 # arg above invalidates it on the hourly build like the other agents, and
@@ -329,9 +676,49 @@ RUN curl -fsSL https://github.com/openai/codex/releases/latest/download/install.
 # command-not-found inside the guest at `agent-vm copilot` time.
 RUN npm install -g @github/copilot && copilot --version
 
-# Sanity check at build time so a broken installer surfaces before we push.
-RUN claude --version && opencode --version && codex --version && copilot --version \
- && dockerd --version && docker --version && containerd --version && runc --version
+# Sanity check at build time. Every command is invoked directly
+# (`tool --version >/dev/null`) so a present-but-broken binary —
+# corrupt download, broken symlink target, missing libc symbol —
+# fails the build instead of slipping through a `command -v` exists-
+# check. `set -e` propagates the first failure.
+#
+# Agent CLIs (claude/opencode/codex) are HARD-required unless
+# `AGENT_INSTALL_SOFT_FAIL` is set, in which case they're SOFT
+# (missing → warning, not failure) — matches the policy on the
+# installer RUNs above. /opt/wirenboard/codestyle follows the same
+# policy (its clone RUN above also honors AGENT_INSTALL_SOFT_FAIL).
+RUN set -e \
+ && echo "== HARD requirements ==" \
+ && dockerd --version >/dev/null \
+ && docker --version >/dev/null \
+ && containerd --version >/dev/null \
+ && runc --version >/dev/null \
+ && black --version >/dev/null \
+ && isort --version >/dev/null \
+ && pylint --version >/dev/null \
+ && ssh -V >/dev/null 2>&1 \
+ && sshpass -V >/dev/null 2>&1 \
+ && ping -V >/dev/null 2>&1 \
+ && { if [ -d /opt/wirenboard/codestyle ]; then \
+          echo "  codestyle clone: OK"; \
+      elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
+          echo "  codestyle clone: MISSING (soft-fail mode)"; \
+      else \
+          echo "  codestyle clone: MISSING — hard sanity failure" >&2; exit 1; \
+      fi; } \
+ && echo "== agent CLIs ==" \
+ && for bin in claude opencode codex copilot; do \
+        if "$bin" --version >/dev/null 2>&1; then \
+            ver=$("$bin" --version 2>&1 | head -1); \
+            echo "  $bin: $ver"; \
+        elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
+            echo "  $bin: MISSING (soft-fail mode)"; \
+        else \
+            echo "  $bin: MISSING — hard sanity failure" >&2; \
+            exit 1; \
+        fi; \
+    done \
+ && echo "== sanity OK =="
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.
 CMD ["/bin/bash"]
