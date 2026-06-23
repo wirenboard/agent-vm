@@ -468,26 +468,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // this folder?" wizard on first launch in each project.
     // Phase 7 (moved up): parse `--mount HOST[:GUEST]` so the
     // GitHub repo scan below can also walk each mount's remote +
-    // submodules — matches main-branch claude-vm.sh behavior. The
-    // libkrun IRQ pool is *tight* — empirically the project bind +
-    // state bind + network + agentd + OCI overlay already saturate
-    // it on this build, so any extra mount tends to trip a
-    // confusing `RegisterNetDevice(IrqsExhausted)` at boot. We let
-    // the user try and surface a friendly suggestion if libkrun
-    // rejects the config; we don't pre-cap because libkrun
-    // configurations vary. See discovered upstream issue #3.
+    // submodules — matches main-branch claude-vm.sh behavior.
     let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
     for em in &extra_mounts {
         if !em.host.exists() {
             anyhow::bail!("--mount host path {:?} does not exist", em.host);
         }
-    }
-    if !extra_mounts.is_empty() {
-        eprintln!(
-            "==> Note: {} --mount arg(s) — libkrun's virtio IRQ pool is tight; if you see \
-             RegisterNetDevice(IrqsExhausted) at boot, drop a mount or pass --no-git to free a slot.",
-            extra_mounts.len()
-        );
     }
 
     // Phase 6: build the per-launch GitHub repo allow-list from the
