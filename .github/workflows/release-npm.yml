@@ -620,7 +620,14 @@ jobs:
         run: |
           set -e
           for d in npm-dist/agent-vm-*-*/bin; do
-            test -f "$d/agent-vm" || { echo "missing $d/agent-vm"; exit 1; }
+            # Skip platforms not built this release (e.g. arm64 while its
+            # libkrunfw config is unported). The bin/ dir exists from the
+            # checkout (a .gitkeep placeholder) but carries no binary; the
+            # publish loop below skips these dirs too.
+            if [[ ! -f "$d/agent-vm" ]]; then
+              echo "::notice::$d has no built binary; skipping (platform not built this release)"
+              continue
+            fi
             test -f "$d/msb" || { echo "missing $d/msb"; exit 1; }
             chmod +x "$d/agent-vm" "$d/msb"
           done
