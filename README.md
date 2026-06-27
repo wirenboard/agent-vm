@@ -32,6 +32,14 @@ launch.
 ## Quick start
 
 ```bash
+docker build -t agent-vm-image .
+mkdir -p ~/agent-vm/{claude-work-dir,agent-vm-cache}
+docker run --device /dev/kvm -v ~/agent-vm/agent-vm-cache:/root/.local -v ~/agent-vm/claude-work-dir:/claude-work-dir -ti agent-vm-image
+
+```
+
+
+```bash
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
 
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
