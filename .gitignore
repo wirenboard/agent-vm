@@ -13,5 +13,4 @@ Cargo.lock.bak
 .claude/settings.local.json
 
 Dockerfile
-start.sh
 .dockerignore
