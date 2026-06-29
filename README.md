@@ -31,18 +31,21 @@ launch.
 
 ## Quick start
 
+**In Docker.**
 ```bash
 docker build -t agent-vm-image . # build docker images
 
-mkdir -p ~/agent-vm/{claude-work-dir,agent-vm-cache}  # create catalog for persistent data and credential, into user home dir
+mkdir -p ~/agent-vm/{agent-vm-work-dir,agent-vm-cache}  # create catalog for persistent data and credential, into user home dir
 
-docker run --device /dev/kvm -v ~/agent-vm/agent-vm-cache:/root/.local -v ~/agent-vm/claude-work-dir:/claude-work-dir -ti agent-vm-image # run docker container
+docker run --device /dev/kvm --hostname agent-vm -v ~/agent-vm/agent-vm-cache:/root/.local -v ~/agent-vm/agent-vm-work-dir:/agent-vm-work-dir -ti agent-vm-image # run docker container
 
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm
 
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 mkdir your-project-dir-name        # create catalog for project
+
+cd your-project-dir-name            
 
 agent-vm claude           # or codex / opencode / shell
 ```
