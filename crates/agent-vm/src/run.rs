@@ -1084,11 +1084,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // whether auto-publish is enabled — when disabled the runtime
     // never emits events, so the subscriber just idles. Cheap.
     if args.auto_publish {
-        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
+        // These print from a background task during the live (raw-mode)
+        // session, so terminate each line raw-mode-safely; see
+        // `status_line_ending`. is_terminal() is stable for the process, so
+        // the per-event task samples it once before its loop.
+        let nl = status_line_ending(std::io::stderr().is_terminal());
+        eprint!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}{nl}");
         let sb_for_events = sandbox.clone();
         tokio::spawn(async move {
             let mut events = sb_for_events.port_events().await;
             use microsandbox::protocol::network::PortEvent;
+            let nl = status_line_ending(std::io::stderr().is_terminal());
             while let Some(event) = events.recv().await {
                 match event {
                     PortEvent::Added {
@@ -1096,8 +1102,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         host_port,
                         guest_port,
                     } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}"
+                        eprint!(
+                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}{nl}"
                         );
                     }
                     PortEvent::Removed {
@@ -1105,8 +1111,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         host_port,
                         guest_port,
                     } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port})"
+                        eprint!(
+                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port}){nl}"
                         );
                     }
                 }
@@ -1911,6 +1917,43 @@ fn shell_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── status_line_ending / update_banner ───────────────────────
+
+    #[test]
+    fn status_line_ending_is_crlf_on_tty_and_lf_otherwise() {
+        assert_eq!(status_line_ending(true), "\r\n");
+        assert_eq!(status_line_ending(false), "\n");
+    }
+
+    #[test]
+    fn update_banner_uses_crlf_on_tty_so_second_line_doesnt_staircase() {
+        let b = update_banner("273bc18ea563", "75fd20fd31c2", true);
+        // Every line ends in CRLF (the trailing newline included), so a
+        // raw-mode terminal returns the carriage on each line break.
+        assert!(b.ends_with("\r\n"), "banner must end with CRLF: {b:?}");
+        // The crux of the bug: the second line must be immediately preceded
+        // by a carriage return so it renders at column 0 instead of trailing
+        // off the end of the first line.
+        assert!(
+            b.contains("\r\n==> Run `agent-vm pull`"),
+            "second line not preceded by CR: {b:?}"
+        );
+        // Both digests are interpolated into the first line.
+        assert!(b.contains("cached 273bc18ea563, registry 75fd20fd31c2"));
+        // No bare LF survives: stripping the CRLF pairs leaves no '\n'.
+        assert!(!b.replace("\r\n", "").contains('\n'), "found a bare LF: {b:?}");
+    }
+
+    #[test]
+    fn update_banner_uses_plain_lf_off_tty() {
+        let b = update_banner("aaaa", "bbbb", false);
+        // Redirected stderr must not pick up carriage returns.
+        assert!(!b.contains('\r'), "redirected stderr must not get CRs: {b:?}");
+        // Exactly two lines, each terminated by a single LF.
+        assert_eq!(b.matches('\n').count(), 2);
+        assert!(b.contains("cached aaaa, registry bbbb"));
+    }
+
     #[test]
     fn shell_escape_handles_simple_and_quoted() {
         assert_eq!(shell_escape("foo"), "'foo'");
@@ -2516,20 +2559,41 @@ async fn notify_if_update_available(image: &str) {
     // request's worth of wait. The banner is best-effort — on timeout we
     // simply stay quiet and continue with the cached image.
     let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
-    match probe.await {
-        Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) => {
-            eprintln!(
-                "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-            );
-            eprintln!(
-                "==> Run `agent-vm pull` to fetch it. Continuing with the cached image."
-            );
-        }
-        // UpToDate / NotCached: nothing to say.
-        // Ok(Err)/None: registry unreachable etc. — stay quiet.
-        // Err(Elapsed): probe exceeded the budget — stay quiet.
-        _ => {}
+    // Only UpdateAvailable prints. Everything else stays quiet:
+    //   UpToDate / NotCached  — nothing worth saying.
+    //   Ok(Err) / Ok(None)    — registry unreachable etc.
+    //   Err(Elapsed)          — probe exceeded the budget.
+    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
+        eprint!("{}", update_banner(&cached, &remote, std::io::stderr().is_terminal()));
     }
+}
+
+/// Line terminator for a status line written to stderr from the launch path,
+/// given whether stderr is a TTY.
+///
+/// Several launch-path messages are emitted from background tasks — the
+/// update-available banner and the `--auto-publish` port events — that can run
+/// *after* the interactive session has switched the terminal to raw mode
+/// (`crossterm::enable_raw_mode` in the exec path). In raw mode the terminal's
+/// ONLCR output post-processing is off, so a bare `\n` is a line feed with no
+/// carriage return: the cursor drops a row but holds its column, staircasing
+/// the next line off the end of the previous one. A CRLF on a TTY renders
+/// flush-left whether or not raw mode is active. For redirected stderr
+/// (`is_tty == false`) we keep a plain `\n` so logs and pipes don't pick up
+/// stray carriage returns. (Raw mode doesn't change a fd's TTY-ness, so the
+/// choice is stable for the life of the process.)
+fn status_line_ending(is_tty: bool) -> &'static str {
+    if is_tty { "\r\n" } else { "\n" }
+}
+
+/// Render the two-line "update available" banner, each line terminated by
+/// [`status_line_ending`] so both render flush-left even under raw mode.
+fn update_banner(cached: &str, remote: &str, is_tty: bool) -> String {
+    let nl = status_line_ending(is_tty);
+    format!(
+        "==> A newer image is available in the registry (cached {cached}, registry {remote}){nl}\
+         ==> Run `agent-vm pull` to fetch it. Continuing with the cached image.{nl}"
+    )
 }
 
 /// Wall-clock budget for the launch-path update probe. Bounds the worst
