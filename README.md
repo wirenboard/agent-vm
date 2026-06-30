@@ -35,9 +35,9 @@ launch.
 ```bash
 docker build -t agent-vm-image . # build docker images
 
-mkdir -p ~/agent-vm/{agent-vm-work-dir,agent-vm-cache}  # create catalog for persistent data and credential, into user home dir
+install -dm4777 ~/agent-vm/agent-vm-work-dir  # create catalog for persistent data,cache and credentials, into user home dir
 
-docker run --device /dev/kvm --hostname agent-vm -v ~/agent-vm/agent-vm-cache:/root/.local -v ~/agent-vm/agent-vm-work-dir:/agent-vm-work-dir -ti agent-vm-image # run docker container
+docker run --device /dev/kvm -v ~/agent-vm/agent-vm-work-dir:/agent-vm-work-dir -ti agent-vm-image # run docker container with agent
 
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm
 
