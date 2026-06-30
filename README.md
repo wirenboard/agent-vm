@@ -41,11 +41,13 @@ docker run --device /dev/kvm -v ~/agent-vm/agent-vm-work-dir:/agent-vm-work-dir 
 
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm
 
+curl -fsSL https://claude.ai/install.sh | bash        #install claude client for authorization
+
+claude        #run for login in claud.io ONLY https://github.com/wirenboard/agent-vm#credentials
+
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
-mkdir your-project-dir-name        # create catalog for project
-
-cd your-project-dir-name            
+curl -fsSL https://claude.ai/install.sh | bash
 
 agent-vm claude           # or codex / opencode / shell
 ```
@@ -54,9 +56,14 @@ agent-vm claude           # or codex / opencode / shell
 ```bash
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
 
+curl -fsSL https://claude.ai/install.sh | bash        #install claude client for authorization
+
+claude        #run for login in claud.io, more details https://github.com/wirenboard/agent-vm#credentials
+
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 cd ~/your-project
+
 agent-vm claude           # or codex / opencode / shell
 ```
 
