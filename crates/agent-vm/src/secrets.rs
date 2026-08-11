@@ -196,6 +196,14 @@ pub struct HostCredsSnapshot {
 /// microsandbox proxy reads these files on the *host* side, so they
 /// never need to be mounted; we keep them in a sibling `<hash>.secrets/`
 /// directory that is never bind-mounted anywhere.
+/// [`host_secret_dir`] for test cleanup: the token files a test writes
+/// land in a *sibling* of its temp dir, so a `remove_dir_all` of the
+/// temp dir alone leaves them on disk.
+#[cfg(test)]
+pub fn host_secret_dir_for_tests(state_dir: &Path) -> PathBuf {
+    host_secret_dir(state_dir)
+}
+
 fn host_secret_dir(state_dir: &Path) -> PathBuf {
     let name = state_dir
         .file_name()
@@ -247,6 +255,24 @@ pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
 pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
 /// Lock basename for the OpenAI in-guest refresh single-flight.
 pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+
+/// Marker file whose mtime records the last time `_intercept-hook`
+/// *attempted* a host-side rotation for a provider, as opposed to the
+/// last time a token file was written (which happens on every refresh,
+/// including the ones that spawn nothing). Rate-limits host CLI spawns
+/// when a rotation attempt keeps failing to move the host token — see
+/// `intercept_hook::note_host_refresh_attempt`.
+///
+/// Lives in the host-only [`host_secret_dir`], next to the token files
+/// and the locks, and holds no secret — only an mtime.
+pub fn host_refresh_stamp_path(state_dir: &Path, name: &str) -> PathBuf {
+    host_secret_dir(state_dir).join(name)
+}
+
+/// Stamp basename for the Anthropic host-rotation attempt marker.
+pub const REFRESH_STAMP_ANTHROPIC: &str = ".refresh.anthropic.stamp";
+/// Stamp basename for the OpenAI host-rotation attempt marker.
+pub const REFRESH_STAMP_OPENAI: &str = ".refresh.openai.stamp";
 
 #[cfg(test)]
 mod refresh_lock_tests {
