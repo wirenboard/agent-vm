@@ -128,8 +128,14 @@ fn env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// `is_plain_http_registry` consults a process-global env var and
+    /// `env_override_forces_plain_http` sets it, so every test here
+    /// takes the shared environment lock. See `crate::test_env`.
+    use crate::test_env::guard as env_guard;
+
     #[test]
     fn local_registries_are_plain_http() {
+        let _guard = env_guard();
         assert!(is_plain_http_registry("localhost:5000/agent-vm-template:latest"));
         assert!(is_plain_http_registry("127.0.0.1:5000/x"));
         assert!(is_plain_http_registry("0.0.0.0:8080/x"));
@@ -139,6 +145,7 @@ mod tests {
 
     #[test]
     fn public_registries_are_not_plain_http() {
+        let _guard = env_guard();
         assert!(!is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
         assert!(!is_plain_http_registry("docker.io/library/debian:13"));
         assert!(!is_plain_http_registry("registry.example.com/x"));
@@ -148,17 +155,14 @@ mod tests {
 
     // Single test exercising the env-var escape hatch — the heuristic
     // says "secure" for `registry.corp.example` but the env override
-    // wins. Uses a serial-style guard (set + clear) so a parallel test
-    // doesn't observe the var. (cargo test runs tests in parallel by
-    // default — keep the var name unique to this test so it can't
-    // collide with another module setting the same var.)
+    // wins. Holds the environment lock for the whole set-assert-clear
+    // sequence so no sibling test observes the var.
     #[test]
     fn env_override_forces_plain_http() {
-        // SAFETY: cargo test parallelises but env mutations affect the
-        // whole process; restrict to one assertion + cleanup. The
-        // assertions in the OTHER tests in this module don't touch
-        // AGENT_VM_INSECURE_REGISTRY, so no interference.
-        // SAFETY: see rationale above.
+        let _guard = env_guard();
+        // SAFETY: env mutations affect the whole process; the
+        // environment lock keeps other readers and process spawns out
+        // of the window, and the var is cleared before it drops.
         unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", "1") };
         assert!(is_plain_http_registry("registry.corp.example:5000/x"));
         assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));

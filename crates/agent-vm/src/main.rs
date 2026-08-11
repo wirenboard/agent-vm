@@ -15,6 +15,8 @@ mod run;
 mod secrets;
 mod session;
 mod setup;
+#[cfg(test)]
+mod test_env;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
