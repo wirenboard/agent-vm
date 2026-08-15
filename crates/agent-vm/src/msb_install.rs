@@ -304,6 +304,10 @@ fn walkdir(root: &std::path::Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// These tests both mutate `MSB_PATH` and spawn the fake `msb`, and
+    /// `Command::spawn` reads the process environment — so they take the
+    /// shared environment lock. See `crate::test_env`.
+    use crate::test_env::guard as env_guard;
     use std::os::unix::fs::PermissionsExt;
 
     fn write_fake_msb(dir: &std::path::Path, version_output: &str) -> PathBuf {
@@ -318,24 +322,24 @@ mod tests {
 
     #[test]
     fn verify_marker_accepts_patched_version() {
+        let _guard = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let p = write_fake_msb(dir.path(), "msb 0.4.6+agent-vm.phase4");
         verify_patched_marker(&p).expect("patched marker should be accepted");
     }
 
     /// Tests both branches of the rejection-hint logic in one test so
-    /// they don't race on the process-global MSB_PATH env var. cargo
-    /// test parallelises by default and we don't want to pull in
-    /// `serial_test` just for this.
+    /// they don't race on the process-global MSB_PATH env var.
     #[test]
     fn verify_marker_rejects_vanilla_with_branch_specific_hint() {
+        let _guard = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let p = write_fake_msb(dir.path(), "msb 0.4.6");
 
         // Branch 1: MSB_PATH unset → hint mentions reinstall.
-        // SAFETY: see module top — these tests are the only place we
-        // mutate the env var; we serialise them by living in one
-        // function.
+        // SAFETY: the environment lock held above keeps every other
+        // reader — and every other test's process spawn — out of this
+        // window; the prior value is restored before it drops.
         let prior = std::env::var_os("MSB_PATH");
         unsafe { std::env::remove_var("MSB_PATH") };
         let err1 = verify_patched_marker(&p).unwrap_err();
@@ -367,6 +371,7 @@ mod tests {
 
     #[test]
     fn verify_marker_propagates_exec_failure() {
+        let _guard = env_guard();
         // Non-existent path: Command::new(...).output() returns an
         // io::Error before producing a status. We surface it with
         // an "executing" context.

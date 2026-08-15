@@ -2447,6 +2447,9 @@ options ndots:2 timeout:1";
 
     #[test]
     fn detect_github_repos_includes_submodules() {
+        // Spawns `git`, and `Command::spawn` reads the process
+        // environment other tests mutate. See `crate::test_env`.
+        let _guard = crate::test_env::guard();
         let root = workspace_root();
         if !root.join(".gitmodules").is_file() {
             eprintln!("skipping: no .gitmodules at {root:?}");
