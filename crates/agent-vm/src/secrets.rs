@@ -96,6 +96,23 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
 /// agent-vm's `placeholder-copilot-token-injected-by-proxy`.
 pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 
+/// Placeholders for OpenCode's plain-API-key providers (GLM / Z.ai and
+/// Kimi / Moonshot). Unlike the OAuth families above these are static
+/// keys, so there is no refresh leg — only capture, host-side storage,
+/// and outbound substitution.
+///
+/// One placeholder per provider id, never a shared one: substitution is
+/// a byte-level `replace` over the header block, so a placeholder that
+/// is a substring of another would be rewritten with the wrong key.
+/// `placeholders_are_pairwise_distinct` guards that.
+pub const ZAI_KEY_PLACEHOLDER: &str = "msb-zai-placeholder-k-v1";
+pub const ZAI_CODING_KEY_PLACEHOLDER: &str = "msb-zai-coding-placeholder-k-v1";
+pub const ZHIPUAI_KEY_PLACEHOLDER: &str = "msb-zhipuai-placeholder-k-v1";
+pub const ZHIPUAI_CODING_KEY_PLACEHOLDER: &str = "msb-zhipuai-coding-placeholder-k-v1";
+pub const KIMI_CODING_KEY_PLACEHOLDER: &str = "msb-kimi-coding-placeholder-k-v1";
+pub const MOONSHOT_KEY_PLACEHOLDER: &str = "msb-moonshot-placeholder-k-v1";
+pub const MOONSHOT_CN_KEY_PLACEHOLDER: &str = "msb-moonshot-cn-placeholder-k-v1";
+
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
 // docs stay in lockstep.
@@ -126,8 +143,154 @@ pub const GITHUB_OBJECTS_HOST: &str = "objects.githubusercontent.com";
 pub const COPILOT_API_HOST: &str = "api.githubcopilot.com";
 pub const COPILOT_API_INDIVIDUAL_HOST: &str = "api.individual.githubcopilot.com";
 
+/// API endpoints for OpenCode's GLM (Z.ai / Zhipu) and Kimi (Moonshot)
+/// providers. Taken from the provider catalogue OpenCode ships
+/// (`~/.cache/opencode/models.json`, upstream models.dev): each entry's
+/// `api` field is `https://<host>/…`, and the key travels as a header
+/// (`Authorization: Bearer` for the openai-compatible providers,
+/// `x-api-key` for `kimi-for-coding`, which speaks the Anthropic wire
+/// format). Header substitution covers both.
+pub const ZAI_API_HOST: &str = "api.z.ai";
+pub const ZHIPUAI_API_HOST: &str = "open.bigmodel.cn";
+pub const KIMI_API_HOST: &str = "api.kimi.com";
+pub const MOONSHOT_API_HOST: &str = "api.moonshot.ai";
+pub const MOONSHOT_CN_API_HOST: &str = "api.moonshot.cn";
+
 pub const ANTHROPIC_OAUTH_TOKEN_PATH: &str = "/v1/oauth/token";
 pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
+
+/// An OpenCode provider that authenticates with a plain API key —
+/// `auth.json` holds `{"type":"api","key":"…"}` rather than an OAuth
+/// triple. GLM (Z.ai / Zhipu) and Kimi (Moonshot) are these; we capture
+/// the host's key, keep it in a host-only file the proxy reads, and let
+/// the guest see only [`Self::placeholder`].
+///
+/// Only `id` is hand-written per row beyond the placeholder and host:
+/// the token-file basename ([`opencode_api_token_path`]) and the
+/// secret's env-var name (`run.rs`) are derived from it, so there is
+/// one uniqueness invariant to guard instead of three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpencodeApiProvider {
+    /// Provider id — the `auth.json` key OpenCode stores the entry
+    /// under, and the prefix of a model string (`zai/glm-4.6`).
+    pub id: &'static str,
+    /// What the in-guest `auth.json` carries instead of the real key.
+    pub placeholder: &'static str,
+    /// The host the real key is allowed to reach. A placeholder headed
+    /// anywhere else trips microsandbox's violation detector and the
+    /// request is blocked, which is the behaviour we want. One host per
+    /// provider is all any of these need; widen to a slice if that ever
+    /// stops being true.
+    pub host: &'static str,
+}
+
+/// Every OpenCode API-key provider we know how to capture. Both the
+/// direct and the "coding plan" variants of each vendor are listed
+/// because they are separate `auth.json` entries with separate keys
+/// (and, for Z.ai vs Zhipu, separate endpoints — international vs
+/// China). A host that has none of them simply yields no secrets.
+pub const OPENCODE_API_PROVIDERS: &[OpencodeApiProvider] = &[
+    // GLM — Z.ai (international).
+    OpencodeApiProvider {
+        id: "zai",
+        placeholder: ZAI_KEY_PLACEHOLDER,
+        host: ZAI_API_HOST,
+    },
+    OpencodeApiProvider {
+        id: "zai-coding-plan",
+        placeholder: ZAI_CODING_KEY_PLACEHOLDER,
+        host: ZAI_API_HOST,
+    },
+    // GLM — Zhipu AI (China).
+    OpencodeApiProvider {
+        id: "zhipuai",
+        placeholder: ZHIPUAI_KEY_PLACEHOLDER,
+        host: ZHIPUAI_API_HOST,
+    },
+    OpencodeApiProvider {
+        id: "zhipuai-coding-plan",
+        placeholder: ZHIPUAI_CODING_KEY_PLACEHOLDER,
+        host: ZHIPUAI_API_HOST,
+    },
+    // Kimi — the "Kimi For Coding" plan speaks the Anthropic wire
+    // format (`x-api-key`) against its own host.
+    OpencodeApiProvider {
+        id: "kimi-for-coding",
+        placeholder: KIMI_CODING_KEY_PLACEHOLDER,
+        host: KIMI_API_HOST,
+    },
+    // Kimi — Moonshot AI's general API (international / China).
+    OpencodeApiProvider {
+        id: "moonshotai",
+        placeholder: MOONSHOT_KEY_PLACEHOLDER,
+        host: MOONSHOT_API_HOST,
+    },
+    OpencodeApiProvider {
+        id: "moonshotai-cn",
+        placeholder: MOONSHOT_CN_KEY_PLACEHOLDER,
+        host: MOONSHOT_CN_API_HOST,
+    },
+];
+
+impl OpencodeApiProvider {
+    /// Env var this provider's secret is registered under. Nothing in
+    /// the guest reads it (the placeholder lives in `auth.json`), but
+    /// microsandbox requires every secret entry to name one. It must
+    /// also be unique across entries — not because microsandbox
+    /// enforces that (it doesn't: `guest_env_vars` just pushes onto a
+    /// Vec, so a duplicate silently last-write-wins) but because a
+    /// collision would hand the guest one provider's placeholder under
+    /// another's name. Derived from `id`, so the uniqueness of `id`
+    /// (guarded by `opencode_api_provider_ids_are_distinct`) is the
+    /// only invariant to keep.
+    pub fn env_var(&self) -> String {
+        format!(
+            "MSB_AGENT_VM_OPENCODE_{}_UNUSED",
+            self.id.to_uppercase().replace('-', "_")
+        )
+    }
+}
+
+/// Every placeholder string the proxy may substitute, in one list.
+///
+/// Substitution is a byte-level `replace` over the header block, so no
+/// placeholder may be a substring of another — `placeholders_are_
+/// pairwise_distinct` checks exactly that, and it iterates *this* list.
+/// Keeping the list next to the constants is what makes an omission
+/// visible: `COPILOT_TOKEN_PLACEHOLDER` went unchecked for as long as
+/// Copilot existed because the test kept its own hand-written copy.
+///
+/// A new placeholder constant belongs here the moment it is declared.
+pub const ALL_PLACEHOLDERS: &[&str] = &[
+    ANTHROPIC_ACCESS_PLACEHOLDER,
+    ANTHROPIC_REFRESH_PLACEHOLDER,
+    OPENAI_ACCESS_PLACEHOLDER,
+    OPENAI_REFRESH_PLACEHOLDER,
+    OPENAI_ID_PLACEHOLDER,
+    OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+    OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+    GH_TOKEN_PLACEHOLDER,
+    COPILOT_TOKEN_PLACEHOLDER,
+    ZAI_KEY_PLACEHOLDER,
+    ZAI_CODING_KEY_PLACEHOLDER,
+    ZHIPUAI_KEY_PLACEHOLDER,
+    ZHIPUAI_CODING_KEY_PLACEHOLDER,
+    KIMI_CODING_KEY_PLACEHOLDER,
+    MOONSHOT_KEY_PLACEHOLDER,
+    MOONSHOT_CN_KEY_PLACEHOLDER,
+];
+
+/// OpenCode's `auth.json` key for the OpenAI OAuth entry we synthesize
+/// from the host's Codex credentials. Named here because
+/// [`write_opencode_auth`] has to clear it alongside the API-key
+/// providers before rewriting.
+const OPENCODE_OPENAI_PROVIDER_ID: &str = "openai";
+
+/// The `model` default we pin in `opencode-config/opencode.json` when
+/// OpenCode is (or may be) talking to OpenAI. Named so the write and
+/// the retire-our-own-stale-pin branch can't drift apart — see
+/// [`write_default_opencode_config`].
+const OPENCODE_DEFAULT_OPENAI_MODEL: &str = "openai/gpt-5.5";
 
 /// Result of [`refresh`]. `*_token_file` paths only exist if the host
 /// credential file was found and parsed successfully.
@@ -141,6 +304,16 @@ pub struct CredsState {
     pub anthropic_token_file: Option<PathBuf>,
     pub openai_token_file: Option<PathBuf>,
     pub opencode_openai_access_token_file: Option<PathBuf>,
+    /// One entry per OpenCode API-key provider (GLM / Kimi) found in
+    /// the host's `~/.local/share/opencode/auth.json`, paired with the
+    /// host-only file holding that provider's real key. The launcher
+    /// registers a proxy-substitution secret per entry; the guest's
+    /// `auth.json` carries the matching placeholder.
+    ///
+    /// **No in-session refresh** — these are static API keys, so there
+    /// is nothing to rotate. A key revoked on the host mid-session
+    /// keeps being substituted until the next launch re-captures it.
+    pub opencode_api_token_files: Vec<(OpencodeApiProvider, PathBuf)>,
     /// File holding the host's `gh auth token` (a GitHub user OAuth
     /// token). The proxy substitutes `GH_TOKEN_PLACEHOLDER` for this
     /// on outbound traffic to GitHub. Only `Some` when the user has
@@ -245,8 +418,9 @@ pub fn gh_token_path(state_dir: &Path) -> PathBuf {
 /// Note: the launcher's [`refresh`] uses a *different*, single shared
 /// lock ([`ProjectRefreshLock`]) because it does read-modify-write on
 /// per-project state files shared across all providers (`claude.json`,
-/// `claude/settings.json`, `opencode-config/opencode.json`), so its
-/// critical section genuinely spans every provider.
+/// `claude/settings.json`, `opencode-config/opencode.json`,
+/// `opencode/auth.json`), so its critical section genuinely spans
+/// every provider.
 pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
     host_secret_dir(state_dir).join(name)
 }
@@ -318,6 +492,15 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
     openai_token_path(state_dir)
 }
 
+/// Per-project location of one OpenCode API-key provider's real key.
+/// Lives in the host-only [`host_secret_dir`] like every other real
+/// credential, never under the guest bind mount. The basename is
+/// derived from the provider id (`opencode-zai`, …), so the id being
+/// unique is enough to keep two providers off the same file.
+pub fn opencode_api_token_path(state_dir: &Path, provider: &OpencodeApiProvider) -> PathBuf {
+    host_secret_dir(state_dir).join(format!("opencode-{}", provider.id))
+}
+
 /// Read host credentials, write the token file (atomically, 0600) and
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
@@ -326,18 +509,23 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 /// Serialized across concurrent launchers in the same project via an
 /// advisory flock on `<state_dir>/.refresh.lock`. Several files under
 /// `state_dir` (`claude.json`, `claude/settings.json`,
-/// `opencode-config/opencode.json`) are read-modify-write — without
-/// the lock, two `agent-vm` invocations in the same project would
-/// race: both read the same baseline, both write back their
-/// mutations, the later writer silently clobbers the earlier. Token
-/// files themselves use `atomic_write` (tempfile + rename) so are
-/// fine without the lock, but the lock is cheap and the easier API
-/// is "everything refresh touches is serialized."
+/// `opencode-config/opencode.json`, `opencode/auth.json`) are
+/// read-modify-write — without the lock, two `agent-vm` invocations in
+/// the same project would race: both read the same baseline, both
+/// write back their mutations, the later writer silently clobbers the
+/// earlier. Token files themselves use `atomic_write` (tempfile +
+/// rename) so are fine without the lock, but the lock is cheap and the
+/// easier API is "everything refresh touches is serialized."
+///
+/// `want_opencode` gates the GLM/Kimi capture — see the parameter's
+/// use in `refresh_opencode` and the definition of `want_opencode` in
+/// `run.rs`.
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
     use_github: bool,
     want_copilot: bool,
+    want_opencode: bool,
 ) -> Result<CredsState> {
     let _lock = ProjectRefreshLock::acquire(state_dir)
         .context("acquiring per-project refresh lock")?;
@@ -377,22 +565,34 @@ pub fn refresh(
     // proxy substitutes that placeholder for the same real OpenAI
     // access token on outbound traffic. So OpenCode shares the
     // `openai_token_file` with Codex.
-    let opencode_openai_access_token_file = if openai_token_file.is_some() {
-        match refresh_opencode(state_dir) {
-            // Only register the secret when refresh_opencode actually
-            // wrote a placeholder auth.json. `Ok(None)` (host file
-            // missing) means we have nothing to wire up — review
-            // finding #13.
-            Ok(Some(())) => Some(opencode_openai_token_path(state_dir)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "opencode credential refresh failed; skipping");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    //
+    // The same file also carries OpenCode's plain-API-key providers
+    // (GLM / Z.ai and Kimi / Moonshot), captured from the *host's*
+    // OpenCode auth.json — those are independent of the OpenAI leg, so
+    // this runs whether or not Codex credentials exist.
+    let opencode = refresh_opencode(state_dir, openai_token_file.is_some(), want_opencode)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "opencode credential refresh failed; skipping");
+            OpencodeRefresh::default()
+        });
+    // Only register the secret when refresh_opencode actually wrote a
+    // placeholder OpenAI entry — an absent host Codex file means we
+    // have nothing to wire up (review finding #13).
+    let opencode_openai_access_token_file = opencode
+        .openai_wired
+        .then(|| opencode_openai_token_path(state_dir));
+    let opencode_api_token_files = opencode.api_providers;
+
+    // Written *after* the credential capture, because the default model
+    // we pin depends on what that capture wired. Pin unless the only
+    // OpenCode credentials are GLM/Kimi keys: then an `openai/*` default
+    // would start every session on a provider the user cannot reach.
+    // With no credentials at all we still pin, because that is the
+    // first-run bypass someone gets when they log into ChatGPT from
+    // inside the guest.
+    let pin_openai_model =
+        opencode.openai_wired || opencode_api_token_files.is_empty();
+    write_opencode_config_defaults(state_dir, pin_openai_model)?;
 
     // Phase 6: capture the user's `gh auth token` (if any and not
     // suppressed via `--no-git`). The launcher passes
@@ -445,6 +645,7 @@ pub fn refresh(
         anthropic_token_file,
         openai_token_file,
         opencode_openai_access_token_file,
+        opencode_api_token_files,
         gh_token_file,
         copilot_token_file,
         snapshot,
@@ -869,9 +1070,14 @@ fn hash_file(path: &Path) -> Option<String> {
 }
 
 /// Drop the per-agent bypass files (Claude's onboarding flags + Codex's
-/// trust/approval settings) into the per-project state dir. Idempotent
-/// across launches; merges instead of overwrites so user tweaks
-/// survive.
+/// trust/approval settings, and Copilot's when it is the selected
+/// agent) into the per-project state dir. Idempotent across launches;
+/// merges instead of overwrites so user tweaks survive.
+///
+/// Runs before any credential capture, so everything here must be
+/// derivable without one. OpenCode's config is the exception and lives
+/// in [`write_opencode_config_defaults`], called from [`refresh`]
+/// afterwards: the model it pins depends on what the capture wired.
 fn write_agent_config_defaults(
     state_dir: &Path,
     project_guest_path: &str,
@@ -891,20 +1097,6 @@ fn write_agent_config_defaults(
     let codex_dir = state_dir.join("codex");
     std::fs::create_dir_all(&codex_dir)?;
     write_default_codex_config(&codex_dir.join("config.toml"))?;
-
-    // OpenCode reads its config from ~/.config/opencode/opencode.json
-    // (XDG config dir, file named opencode.json — NOT the data dir
-    // and NOT config.json). The launcher symlinks
-    // /root/.config/opencode → /agent-vm-state/opencode-config so
-    // this file lands at the right path inside the guest. Without an
-    // explicit `model`, OpenCode defaults to `openai/gpt-5.5-pro`,
-    // which OpenAI rejects for ChatGPT-OAuth accounts with "model
-    // not supported when using Codex with a ChatGPT account." Pin a
-    // ChatGPT-supported model as the default; users can override
-    // per-run via `opencode run --model ...`.
-    let opencode_config_dir = state_dir.join("opencode-config");
-    std::fs::create_dir_all(&opencode_config_dir)?;
-    write_default_opencode_config(&opencode_config_dir.join("opencode.json"))?;
 
     // D1: GitHub Copilot CLI reads ~/.copilot/config.json. The
     // launcher symlinks /root/.copilot → /agent-vm-state/copilot so
@@ -983,17 +1175,111 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(token_file))
 }
 
-/// Write `<state>/opencode/auth.json` shaped for OpenCode's OAuth
-/// flow, but with placeholder strings everywhere. The `openai.access`
-/// field carries our synthetic JWT placeholder; the proxy substitutes
-/// it with the real OpenAI access token (from the file shared with
-/// Codex) on outbound traffic. `accountId` is derived from the host
-/// Codex JWT when available, so OpenCode picks the right account
-/// without us hard-coding anything user-specific.
+/// What [`refresh_opencode`] wired up for this launch.
+#[derive(Debug, Default)]
+struct OpencodeRefresh {
+    /// True when a placeholder OpenAI OAuth entry was written, i.e. the
+    /// launcher should register the OpenCode-flavoured OpenAI secret.
+    openai_wired: bool,
+    /// Captured API-key providers (GLM / Kimi) and their token files.
+    api_providers: Vec<(OpencodeApiProvider, PathBuf)>,
+}
+
+/// Write `<state>/opencode/auth.json` with placeholder strings for
+/// every provider we can back with a host credential, and stash the
+/// real values in host-only token files.
 ///
-/// Requires that `refresh_openai` has already run (so a host codex
-/// auth file existed and was parseable). Returns `None` if not.
-fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
+/// Two credential families end up in that one file:
+///
+///  * **OpenAI OAuth**, synthesized from the host's *Codex* auth (see
+///    [`build_opencode_openai_entry`]) — only when `want_openai`, i.e.
+///    when `refresh_openai` already captured an access token to
+///    substitute for the placeholder.
+///  * **Plain API keys** for the GLM (Z.ai / Zhipu) and Kimi
+///    (Moonshot) providers, read from the host's own OpenCode
+///    `auth.json` — only when `want_api_keys`, i.e. when the session
+///    is one that can actually use them (see `want_opencode` in
+///    `run.rs`). Each real key is written to `<state>.secrets/
+///    opencode-<id>` and returned so the launcher can register it as a
+///    `SecretValue::File`.
+fn refresh_opencode(
+    state_dir: &Path,
+    want_openai: bool,
+    want_api_keys: bool,
+) -> Result<OpencodeRefresh> {
+    let openai_entry = if want_openai {
+        build_opencode_openai_entry()?
+    } else {
+        None
+    };
+    // Fail soft, and never with `?`: the host's OpenCode auth.json has
+    // nothing to do with the Codex-derived OpenAI leg above, and a
+    // truncated or root-owned copy of it must not take that leg down
+    // with it — that would leave the guest's placeholders wired to no
+    // secret at all, which reads as an opaque 401 inside the VM.
+    let api_keys = if want_api_keys {
+        read_host_opencode_api_keys().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "reading host opencode auth.json failed; no GLM/Kimi keys captured");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    // The real keys: host-only, 0600, outside the guest bind mount.
+    let mut api_providers = Vec::with_capacity(api_keys.len());
+    for (provider, key) in &api_keys {
+        let token_file = opencode_api_token_path(state_dir, provider);
+        atomic_write(&token_file, key.as_bytes(), 0o600)?;
+        api_providers.push((*provider, token_file));
+    }
+    // Drop the token file of any provider the host no longer has a key
+    // for. Nothing references it once it stops being registered as a
+    // secret, so leaving it would just park a stale real key on disk
+    // for the life of the project's state dir. Runs before the
+    // early-return below, and on every launch including the ones that
+    // capture nothing — `auth.json` lives in the guest-writable state
+    // dir and can vanish (in-guest logout, a wiped state dir) while the
+    // host-only token files, which no `rm -rf <state_dir>` touches,
+    // survive with a real key in them.
+    for provider in OPENCODE_API_PROVIDERS {
+        if api_keys.iter().any(|(p, _)| p.id == provider.id) {
+            continue;
+        }
+        let _ = std::fs::remove_file(opencode_api_token_path(state_dir, provider));
+    }
+
+    let auth_path = state_dir.join("opencode").join("auth.json");
+    if openai_entry.is_none() && api_keys.is_empty() && !auth_path.exists() {
+        // Nothing to write and nothing stale to clear — don't create an
+        // empty auth.json for a user who has no credentials at all.
+        return Ok(OpencodeRefresh::default());
+    }
+
+    std::fs::create_dir_all(auth_path.parent().expect("auth.json has a parent"))?;
+    write_opencode_auth(
+        &auth_path,
+        openai_entry.as_ref(),
+        api_keys.iter().map(|(p, _)| *p),
+    )?;
+
+    Ok(OpencodeRefresh {
+        openai_wired: openai_entry.is_some(),
+        api_providers,
+    })
+}
+
+/// Build the placeholder `openai` entry for OpenCode's `auth.json`
+/// from the host's Codex credentials. The `access` field carries our
+/// synthetic JWT placeholder; the proxy substitutes it with the real
+/// OpenAI access token (from the file shared with Codex) on outbound
+/// traffic. `accountId` is derived from the host Codex JWT when
+/// available, so OpenCode picks the right account without us
+/// hard-coding anything user-specific.
+///
+/// Returns `None` when there is no host Codex auth file to derive it
+/// from.
+fn build_opencode_openai_entry() -> Result<Option<Value>> {
     let Some(host_path) = host_codex_auth_path() else {
         return Ok(None);
     };
@@ -1020,25 +1306,173 @@ fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
     // attempts (which would fail against our synthetic JWT).
     let expires_ms: u64 = 9_999_999_999_000;
 
-    let auth = serde_json::json!({
-        "openai": {
-            "type": "oauth",
-            "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
-            "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
-            "expires": expires_ms,
-            "accountId": account_id,
+    Ok(Some(serde_json::json!({
+        "type": "oauth",
+        "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+        "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+        "expires": expires_ms,
+        "accountId": account_id,
+    })))
+}
+
+/// Read the host's OpenCode `auth.json` and pull out the API keys of
+/// the providers in [`OPENCODE_API_PROVIDERS`]. A missing or
+/// credential-free file is not an error — it just means the user
+/// hasn't logged into GLM/Kimi on the host.
+fn read_host_opencode_api_keys() -> Result<Vec<(OpencodeApiProvider, String)>> {
+    let Some(host_path) = host_opencode_auth_path() else {
+        return Ok(Vec::new());
+    };
+    let raw = match std::fs::read_to_string(&host_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
+    };
+    let json: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", host_path.display()))?;
+    Ok(collect_opencode_api_keys(&json))
+}
+
+/// Pure half of [`read_host_opencode_api_keys`], so the shape handling
+/// is testable without a `$HOME` override.
+fn collect_opencode_api_keys(json: &Value) -> Vec<(OpencodeApiProvider, String)> {
+    OPENCODE_API_PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            let entry = json.get(provider.id)?;
+            // Only `type: "api"` entries carry a `key`. A provider the
+            // user happens to have an OAuth entry for is not ours to
+            // substitute — we'd have no placeholder shaped for it.
+            if entry.get("type").and_then(|v| v.as_str()) != Some("api") {
+                return None;
+            }
+            let key = entry.get("key").and_then(|v| v.as_str())?;
+            if key.is_empty() {
+                return None;
+            }
+            Some((*provider, key.to_string()))
+        })
+        .collect()
+}
+
+/// Write the guest-side OpenCode `auth.json`: our managed entries with
+/// placeholders, everything else left alone.
+///
+/// Merge rather than overwrite so a provider the user logged into
+/// *inside* the sandbox (`opencode auth login`) survives the next
+/// launch. Managed ids are cleared first — but only when the stored
+/// entry is *ours*, i.e. it still holds the placeholder we wrote. Two
+/// distinct things can sit under `zai` or `openai`: a stale placeholder
+/// from a previous launch, which must go (unbacked, it would leave the
+/// VM unsubstituted and be blocked by the violation detector), and a
+/// real credential the user typed inside the sandbox, which must stay.
+/// Before this distinction the merge silently wiped in-guest logins for
+/// every id in the table on each launch.
+///
+/// Takes the providers, never the keys: the real key has no business in
+/// the function that writes a guest-readable file, so it isn't passed
+/// one.
+fn write_opencode_auth(
+    path: &Path,
+    openai: Option<&Value>,
+    providers: impl IntoIterator<Item = OpencodeApiProvider>,
+) -> Result<()> {
+    let mut auth = read_guest_json_object(path);
+    let obj = auth
+        .as_object_mut()
+        .expect("read_guest_json_object always yields an object");
+
+    if obj
+        .get(OPENCODE_OPENAI_PROVIDER_ID)
+        .and_then(|e| e.get("access"))
+        .and_then(|v| v.as_str())
+        == Some(OPENCODE_OPENAI_ACCESS_PLACEHOLDER)
+    {
+        obj.remove(OPENCODE_OPENAI_PROVIDER_ID);
+    }
+    for provider in OPENCODE_API_PROVIDERS {
+        if obj
+            .get(provider.id)
+            .and_then(|e| e.get("key"))
+            .and_then(|v| v.as_str())
+            == Some(provider.placeholder)
+        {
+            obj.remove(provider.id);
         }
-    });
+    }
 
-    let opencode_dir = state_dir.join("opencode");
-    std::fs::create_dir_all(&opencode_dir)?;
-    atomic_write(
-        &opencode_dir.join("auth.json"),
-        serde_json::to_vec(&auth)?.as_slice(),
-        0o600,
-    )?;
+    if let Some(entry) = openai {
+        obj.insert(OPENCODE_OPENAI_PROVIDER_ID.to_string(), entry.clone());
+    }
+    for provider in providers {
+        obj.insert(
+            provider.id.to_string(),
+            serde_json::json!({ "type": "api", "key": provider.placeholder }),
+        );
+    }
 
-    Ok(Some(()))
+    atomic_write(path, serde_json::to_vec(&auth)?.as_slice(), 0o600)?;
+    Ok(())
+}
+
+/// Read a JSON object out of a file the *guest* can write, for the
+/// read-modify-write merges under `state_dir`. Always yields an object;
+/// anything unusable degrades to `{}` with a warning.
+///
+/// **Refuses to follow a symlink.** `state_dir` is bind-mounted into
+/// the guest read-write, so every file we merge here is under the
+/// guest's control — including its type. A compromised in-VM agent that
+/// replaces `auth.json` with a symlink to `~/.claude/.credentials.json`
+/// would otherwise have us read the host's real tokens, merge the
+/// unmanaged keys of that file into the result, and write it back into
+/// a file the guest can read: a one-launch exfiltration of exactly the
+/// credentials this whole design keeps out of the VM. `symlink_metadata`
+/// does not traverse, so the check itself is safe; the small
+/// swap-after-check window is closed by [`atomic_write`]'s `O_NOFOLLOW`
+/// on the write side.
+///
+/// The same guard covers the other guest-writable merges in this module
+/// (claude settings, `.claude.json`, opencode config, copilot config) —
+/// they predate this function but share the exposure.
+///
+/// Degrading instead of failing is deliberate: a truncated or
+/// hand-mangled file would otherwise wedge the launcher permanently,
+/// since the bad content is never overwritten. The warning names the
+/// path so the loss is at least diagnosable.
+fn read_guest_json_object(path: &Path) -> Value {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            tracing::warn!(
+                path = %path.display(),
+                "guest-writable state file is a symlink; refusing to follow it, starting from an empty object"
+            );
+            return serde_json::json!({});
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return serde_json::json!({}),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "stat failed; starting from an empty object");
+            return serde_json::json!({});
+        }
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "read failed; starting from an empty object");
+            return serde_json::json!({});
+        }
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(v) if v.is_object() => v,
+        Ok(_) => {
+            tracing::warn!(path = %path.display(), "state file is not a JSON object; starting from an empty object");
+            serde_json::json!({})
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "state file is not valid JSON; starting from an empty object");
+            serde_json::json!({})
+        }
+    }
 }
 
 /// Decode an OpenAI id_token JWT (alg=RS256, but we don't verify) and
@@ -1079,12 +1513,10 @@ fn write_default_claude_settings(path: &Path) -> Result<()> {
     // who tweaked some other setting inside the sandbox keeps their
     // change; force-setting `hasCompletedOnboarding` covers the case
     // where Claude wrote a partial settings.json mid-wizard.
-    let mut settings: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = settings.as_object_mut().context("settings.json is not an object")?;
+    let mut settings = read_guest_json_object(path);
+    let obj = settings
+        .as_object_mut()
+        .expect("read_guest_json_object always yields an object");
     obj.entry("theme".to_string())
         .or_insert(Value::String("dark".into()));
     obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
@@ -1166,12 +1598,10 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     // Merge-on-existing to preserve user-side updates (project entries
     // etc.) but force-set the onboarding + per-folder trust flags
     // every launch.
-    let mut state: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = state.as_object_mut().context("~/.claude.json is not an object")?;
+    let mut state = read_guest_json_object(path);
+    let obj = state
+        .as_object_mut()
+        .expect("read_guest_json_object always yields an object");
     obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
     obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
 
@@ -1410,26 +1840,54 @@ fn write_default_codex_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write a minimal OpenCode config that pins the default model to one
-/// the ChatGPT-OAuth flow accepts. Merge-on-existing so the user's own
-/// settings (model overrides, MCP servers, etc.) survive across
+/// OpenCode reads its config from `~/.config/opencode/opencode.json`
+/// (XDG config dir, file named opencode.json — NOT the data dir and
+/// NOT config.json). The launcher symlinks `/root/.config/opencode` →
+/// `/agent-vm-state/opencode-config` so this file lands at the right
+/// path inside the guest.
+///
+/// Sibling of the `write_default_*` helpers that [`write_agent_config_defaults`]
+/// calls, but invoked from [`refresh`] instead: `pin_openai_model`
+/// isn't known until the credential capture has run.
+fn write_opencode_config_defaults(state_dir: &Path, pin_openai_model: bool) -> Result<()> {
+    let dir = state_dir.join("opencode-config");
+    std::fs::create_dir_all(&dir)?;
+    write_default_opencode_config(&dir.join("opencode.json"), pin_openai_model)
+}
+
+/// Write a minimal OpenCode config. Merge-on-existing so the user's
+/// own settings (model overrides, MCP servers, etc.) survive across
 /// launches; only fields we manage are force-set.
-fn write_default_opencode_config(path: &Path) -> Result<()> {
-    let mut config: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
+///
+/// `pin_openai_model` says whether an `openai/*` default belongs here
+/// this launch — see the comment at the `model` entry below. `model` is
+/// treated as a *managed* key in both directions: when the pin isn't
+/// wanted we also retire a pin we wrote earlier, because every state
+/// dir from before this became conditional already carries one and
+/// `or_insert` would never clear it. A model the user chose is left
+/// alone either way.
+fn write_default_opencode_config(path: &Path, pin_openai_model: bool) -> Result<()> {
+    let mut config = read_guest_json_object(path);
     let obj = config
         .as_object_mut()
-        .context("opencode config.json is not an object")?;
+        .expect("read_guest_json_object always yields an object");
     obj.entry("$schema".to_string())
         .or_insert(Value::String("https://opencode.ai/config.json".into()));
     // ChatGPT-OAuth doesn't accept gpt-5.5-pro (OpenCode's built-in
     // default); pin a model that does. Use `entry().or_insert` so a
     // user who set `model` to something else doesn't get clobbered.
-    obj.entry("model".to_string())
-        .or_insert(Value::String("openai/gpt-5.5".into()));
+    //
+    // Skipped when the only OpenCode credentials are GLM/Kimi API keys:
+    // an OpenAI model would then start every session on a provider the
+    // user can't reach. In that case retire our own stale pin too —
+    // otherwise the upgrade path (every pre-existing state dir has one)
+    // keeps the unreachable default forever.
+    if pin_openai_model {
+        obj.entry("model".to_string())
+            .or_insert(Value::String(OPENCODE_DEFAULT_OPENAI_MODEL.into()));
+    } else if obj.get("model").and_then(|v| v.as_str()) == Some(OPENCODE_DEFAULT_OPENAI_MODEL) {
+        obj.remove("model");
+    }
     obj.entry("autoupdate".to_string())
         .or_insert(Value::Bool(false));
     atomic_write(path, serde_json::to_vec(&config)?.as_slice(), 0o644)?;
@@ -1451,14 +1909,10 @@ fn write_default_opencode_config(path: &Path) -> Result<()> {
 /// Merge-on-existing so a user's own settings survive across launches;
 /// only the fields we manage are force-set.
 fn write_default_copilot_config(path: &Path) -> Result<()> {
-    let mut config: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
+    let mut config = read_guest_json_object(path);
     let obj = config
         .as_object_mut()
-        .context("copilot config.json is not an object")?;
+        .expect("read_guest_json_object always yields an object");
     // Trust everything — the VM itself is the security boundary.
     obj.insert(
         "trusted_folders".into(),
@@ -1477,8 +1931,9 @@ fn write_default_copilot_config(path: &Path) -> Result<()> {
 /// the duration of [`refresh`] so two concurrent `agent-vm` launchers
 /// in the same project don't interleave reads/writes of the shared
 /// per-project state files (`claude.json`, `claude/settings.json`,
-/// `opencode-config/opencode.json` — each is a read-modify-write that
-/// would otherwise lose one launcher's mutation).
+/// `opencode-config/opencode.json`, `opencode/auth.json` — each is a
+/// read-modify-write that would otherwise lose one launcher's
+/// mutation).
 ///
 /// Implemented on top of `flock(2)` (Unix-only). The lock auto-releases
 /// when the fd closes — Drop performs an explicit `LOCK_UN` first for
@@ -1645,7 +2100,7 @@ mod tests {
     fn copilot_token_not_captured_without_use_github_or_want_copilot() {
         let dir = tempfile::tempdir().unwrap();
         let sd = dir.path();
-        let creds = super::refresh(sd, "/workspace/p", false, false).unwrap();
+        let creds = super::refresh(sd, "/workspace/p", false, false, false).unwrap();
         assert!(
             creds.copilot_token_file.is_none(),
             "copilot token captured despite use_github=false and want_copilot=false"
@@ -1668,26 +2123,28 @@ mod tests {
     /// requests. Verify no placeholder is a substring of any other.
     #[test]
     fn placeholders_are_pairwise_distinct() {
-        let all: &[(&str, &str)] = &[
-            ("ANTHROPIC_ACCESS", ANTHROPIC_ACCESS_PLACEHOLDER),
-            ("ANTHROPIC_REFRESH", ANTHROPIC_REFRESH_PLACEHOLDER),
-            ("OPENAI_ACCESS", OPENAI_ACCESS_PLACEHOLDER),
-            ("OPENAI_REFRESH", OPENAI_REFRESH_PLACEHOLDER),
-            ("OPENAI_ID", OPENAI_ID_PLACEHOLDER),
-            ("OPENCODE_ACCESS", OPENCODE_OPENAI_ACCESS_PLACEHOLDER),
-            ("OPENCODE_REFRESH", OPENCODE_OPENAI_REFRESH_PLACEHOLDER),
-            ("GH_TOKEN", GH_TOKEN_PLACEHOLDER),
-        ];
-        for (a_name, a) in all {
-            for (b_name, b) in all {
-                if a_name == b_name {
+        // Iterate the single ALL_PLACEHOLDERS list rather than a copy
+        // maintained here: COPILOT_TOKEN_PLACEHOLDER went unchecked for
+        // as long as Copilot existed because this test kept its own.
+        for (i, a) in ALL_PLACEHOLDERS.iter().enumerate() {
+            for (j, b) in ALL_PLACEHOLDERS.iter().enumerate() {
+                if i == j {
                     continue;
                 }
                 assert!(
                     !a.contains(b) && !b.contains(a),
-                    "placeholder {a_name:?} ({a:?}) and {b_name:?} ({b:?}) overlap as substrings — substitution would swap the wrong token"
+                    "placeholders {a:?} and {b:?} overlap as substrings — substitution would swap the wrong token"
                 );
             }
+        }
+        // ...and the list must actually cover the provider table, which
+        // is the part a new row could silently miss.
+        for provider in OPENCODE_API_PROVIDERS {
+            assert!(
+                ALL_PLACEHOLDERS.contains(&provider.placeholder),
+                "{}: placeholder missing from ALL_PLACEHOLDERS",
+                provider.id
+            );
         }
     }
 
@@ -1800,12 +2257,65 @@ mod tests {
         std::fs::create_dir_all(&tmpdir).unwrap();
         let path = tmpdir.join("opencode.json");
 
-        write_default_opencode_config(&path).unwrap();
+        write_default_opencode_config(&path, true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["model"], "openai/gpt-5.5");
         assert_eq!(v["$schema"], "https://opencode.ai/config.json");
         assert_eq!(v["autoupdate"], false);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// GLM/Kimi-only user: no OpenAI leg to pin a model for, so the
+    /// `model` key is left unset and OpenCode picks from the providers
+    /// whose keys we did wire up.
+    #[test]
+    fn opencode_config_skips_model_pin_without_openai() {
+        let tmpdir = tmp_dir("agent-vm-oc-cfg-nopin");
+        let path = tmpdir.join("opencode.json");
+
+        write_default_opencode_config(&path, false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v.get("model").is_none(), "no OpenAI model pinned");
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(v["autoupdate"], false);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// The upgrade path, and the whole point of the flag: every state
+    /// dir written before the pin became conditional already carries
+    /// `openai/gpt-5.5`. Skipping the *insert* would leave a GLM/Kimi-
+    /// only user starting on an unreachable provider forever, so our
+    /// own stale pin has to be retired — while a model the user chose
+    /// is never touched.
+    #[test]
+    fn opencode_config_retires_our_stale_pin_but_not_a_user_model() {
+        let tmpdir = tmp_dir("agent-vm-oc-cfg-retire");
+
+        let ours = tmpdir.join("ours.json");
+        std::fs::write(
+            &ours,
+            serde_json::to_vec(&serde_json::json!({
+                "model": OPENCODE_DEFAULT_OPENAI_MODEL,
+                "autoupdate": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_default_opencode_config(&ours, false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&ours).unwrap()).unwrap();
+        assert!(v.get("model").is_none(), "our own stale pin retired");
+
+        let theirs = tmpdir.join("theirs.json");
+        std::fs::write(&theirs, r#"{"model": "zai-coding-plan/glm-4.6"}"#).unwrap();
+        write_default_opencode_config(&theirs, false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&theirs).unwrap()).unwrap();
+        assert_eq!(
+            v["model"], "zai-coding-plan/glm-4.6",
+            "a user-chosen model is not ours to remove"
+        );
 
         std::fs::remove_dir_all(&tmpdir).ok();
     }
@@ -1831,7 +2341,7 @@ mod tests {
         )
         .unwrap();
 
-        write_default_opencode_config(&path).unwrap();
+        write_default_opencode_config(&path, true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["model"], "openai/gpt-5-turbo", "user override survived");
@@ -1841,6 +2351,459 @@ mod tests {
         assert_eq!(v["autoupdate"], false);
 
         std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    // ── OpenCode API-key providers (GLM / Kimi) ───────────────────
+
+    /// Each provider needs its own auth.json key, its own on-disk token
+    /// file, and its own secret env var — a collision would have two
+    /// providers overwrite each other's real key.
+    #[test]
+    fn opencode_api_provider_ids_are_distinct() {
+        // `id` is the whole invariant: the token-file basename and the
+        // secret env var are derived from it, so a duplicate id is the
+        // only way two providers can collide on either.
+        let ids: Vec<&str> = OPENCODE_API_PROVIDERS.iter().map(|p| p.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate provider id in {ids:?}");
+
+        // Spot-check the derivations rather than trusting them by eye:
+        // a shell-hostile id would produce an unusable env var name.
+        let zai = OPENCODE_API_PROVIDERS
+            .iter()
+            .find(|p| p.id == "zai-coding-plan")
+            .unwrap();
+        assert_eq!(zai.env_var(), "MSB_AGENT_VM_OPENCODE_ZAI_CODING_PLAN_UNUSED");
+        for p in OPENCODE_API_PROVIDERS {
+            assert!(
+                p.env_var()
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "{}: env var {} is not a shell identifier",
+                p.id,
+                p.env_var()
+            );
+        }
+    }
+
+    /// Real GLM/Kimi keys are real credentials: like every other one,
+    /// they must live outside the directory bind-mounted into the guest.
+    #[test]
+    fn opencode_api_token_files_live_outside_the_guest_mount() {
+        let state_dir = Path::new("/home/u/.local/state/agent-vm/abc123");
+        for provider in OPENCODE_API_PROVIDERS {
+            let token = opencode_api_token_path(state_dir, provider);
+            assert!(
+                !token.starts_with(state_dir),
+                "{} must not be under the bind-mounted state dir",
+                token.display()
+            );
+            assert_eq!(token.parent(), anthropic_token_path(state_dir).parent());
+        }
+    }
+
+    #[test]
+    fn collect_opencode_api_keys_picks_glm_and_kimi() {
+        let host = serde_json::json!({
+            // OAuth entries are someone else's business.
+            "anthropic": {"type": "oauth", "access": "a", "refresh": "r", "expires": 1},
+            "openai": {"type": "oauth", "access": "a", "refresh": "r", "expires": 1},
+            // Ours.
+            "zai-coding-plan": {"type": "api", "key": "zai-real-key"},
+            "kimi-for-coding": {"type": "api", "key": "kimi-real-key"},
+            // Not in the table — left to the user's own in-guest login.
+            "openrouter": {"type": "api", "key": "or-real-key"},
+            // Malformed / empty entries are skipped rather than
+            // registering a secret whose file would be empty.
+            "moonshotai": {"type": "api", "key": ""},
+            "zhipuai": {"type": "api"},
+        });
+        let got = collect_opencode_api_keys(&host);
+        let got: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(p, k)| (p.id, k.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("zai-coding-plan", "zai-real-key"),
+                ("kimi-for-coding", "kimi-real-key"),
+            ]
+        );
+    }
+
+    /// A provider entry the user created *inside* the sandbox survives;
+    /// our managed entries are replaced with the current placeholders;
+    /// a managed entry with no host backing this launch is dropped (a
+    /// leftover placeholder would be sent unsubstituted and blocked).
+    #[test]
+    fn write_opencode_auth_merges_and_clears_managed_entries() {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "agent-vm-oc-auth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("auth.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                // In-guest login for a provider we don't manage.
+                "openrouter": {"type": "api", "key": "user-set-in-guest"},
+                // Stale from a previous launch: our placeholder, no
+                // longer backed by a host key.
+                "moonshotai": {"type": "api", "key": MOONSHOT_KEY_PLACEHOLDER},
+                "openai": {"type": "oauth", "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER},
+                // An in-guest login under an id we *do* manage: a real
+                // key the user typed inside the sandbox. Must survive —
+                // clearing it would make them re-auth every launch.
+                "kimi-for-coding": {"type": "api", "key": "typed-inside-the-vm"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_opencode_auth(&path, None, [provider("zai")]).unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["openrouter"]["key"], "user-set-in-guest");
+        assert_eq!(v["zai"]["type"], "api");
+        assert_eq!(v["zai"]["key"], ZAI_KEY_PLACEHOLDER);
+        assert!(v.get("moonshotai").is_none(), "stale placeholder dropped");
+        assert!(v.get("openai").is_none(), "stale openai placeholder dropped");
+        assert_eq!(
+            v["kimi-for-coding"]["key"], "typed-inside-the-vm",
+            "an in-guest login under a managed id must not be wiped"
+        );
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// The OpenAI OAuth entry is inserted under its own key, next to
+    /// (not instead of) the API-key providers. The shape is what the
+    /// in-guest OpenCode parses, so a nesting or naming slip here breaks
+    /// the Codex-backed login for everyone who has host Codex creds.
+    #[test]
+    fn write_opencode_auth_inserts_the_openai_oauth_entry() {
+        let tmpdir = tmp_dir("agent-vm-oc-auth-oauth");
+        let path = tmpdir.join("auth.json");
+        let openai = serde_json::json!({
+            "type": "oauth",
+            "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+            "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+            "expires": 9_999_999_999_000u64,
+            "accountId": "00000000-0000-0000-0000-000000000000",
+        });
+
+        write_opencode_auth(&path, Some(&openai), [provider("kimi-for-coding")]).unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["openai"]["type"], "oauth");
+        assert_eq!(v["openai"]["access"], OPENCODE_OPENAI_ACCESS_PLACEHOLDER);
+        assert_eq!(v["openai"]["refresh"], OPENCODE_OPENAI_REFRESH_PLACEHOLDER);
+        assert!(v["openai"].get("openai").is_none(), "not double-nested");
+        assert_eq!(v["kimi-for-coding"]["key"], KIMI_CODING_KEY_PLACEHOLDER);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// `state_dir` is bind-mounted into the guest, so the guest can
+    /// replace this file with a symlink to a host path. Following it
+    /// would merge the host's real credentials into a guest-readable
+    /// file — the exfiltration the whole placeholder design exists to
+    /// prevent.
+    #[test]
+    fn write_opencode_auth_refuses_to_follow_a_symlink() {
+        let tmpdir = tmp_dir("agent-vm-oc-auth-symlink");
+        let secret = tmpdir.join("host-credentials.json");
+        std::fs::write(
+            &secret,
+            br#"{"claudeAiOauth":{"accessToken":"sk-real-host-token"}}"#,
+        )
+        .unwrap();
+        let path = tmpdir.join("auth.json");
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+
+        write_opencode_auth(&path, None, [provider("zai")]).unwrap();
+
+        // The symlink was replaced by a regular file (atomic_write
+        // renames over it), the host file is untouched, and none of its
+        // content was merged into the guest-visible result.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("claudeAiOauth"), "host content merged in");
+        assert!(!written.contains("sk-real-host-token"), "host token leaked");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"sk-real-host-token"}}"#,
+            "the host file must not be written through"
+        );
+        let v: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["zai"]["key"], ZAI_KEY_PLACEHOLDER);
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// A guest-mangled state file must not wedge the launcher: valid
+    /// JSON that isn't an object used to abort `refresh_opencode`
+    /// forever, since the bad content was never overwritten.
+    #[test]
+    fn write_opencode_auth_recovers_from_unusable_existing_file() {
+        let tmpdir = tmp_dir("agent-vm-oc-auth-garbage");
+        for bad in [r#"["not","an","object"]"#, "{truncated", ""] {
+            let path = tmpdir.join("auth.json");
+            std::fs::write(&path, bad).unwrap();
+            write_opencode_auth(&path, None, [provider("zai")])
+                .unwrap_or_else(|e| panic!("input {bad:?} should degrade, not fail: {e}"));
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(v["zai"]["key"], ZAI_KEY_PLACEHOLDER, "input {bad:?}");
+        }
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// Look a provider up by id; panics on a typo, which is what a test
+    /// wants.
+    fn provider(id: &str) -> OpencodeApiProvider {
+        *OPENCODE_API_PROVIDERS
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("no such provider: {id}"))
+    }
+
+    /// Unique temp dir for a test that writes files.
+    fn tmp_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Put `$HOME` back where it was. Callers hold the env lock.
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        // SAFETY: caller holds `test_env::guard()`, so no sibling test
+        // is reading the environment or spawning a child concurrently.
+        match prev {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// End-to-end for the capture leg: a host OpenCode `auth.json`
+    /// with a GLM and a Kimi key must yield one host-only token file
+    /// per provider holding the *real* key, and a guest-side
+    /// `auth.json` holding only placeholders.
+    #[test]
+    fn refresh_opencode_captures_host_api_keys() {
+        // Mutates $HOME — take the process-wide env lock. See
+        // `crate::test_env`.
+        let _guard = crate::test_env::guard();
+        let root = std::env::temp_dir().join(format!(
+            "agent-vm-oc-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let home = root.join("home");
+        let state_dir = root.join("state").join("proj");
+        let host_auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(host_secret_dir(&state_dir)).unwrap();
+        std::fs::write(
+            &host_auth,
+            serde_json::to_vec(&serde_json::json!({
+                "zai-coding-plan": {"type": "api", "key": "real-glm-key"},
+                "kimi-for-coding": {"type": "api", "key": "real-kimi-key"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: the env lock is held for the whole test, so no
+        // sibling test reads or spawns concurrently.
+        unsafe { std::env::set_var("HOME", &home) };
+        // want_openai = false: this leg is independent of Codex creds.
+        let got = refresh_opencode(&state_dir, false, true).unwrap();
+        // Restore before asserting: a panic here would otherwise leave
+        // $HOME pointing at a deleted temp dir for the rest of the run.
+        restore_home(prev_home.clone());
+
+        let ids: Vec<&str> = got.api_providers.iter().map(|(p, _)| p.id).collect();
+        assert_eq!(ids, vec!["zai-coding-plan", "kimi-for-coding"]);
+        assert!(!got.openai_wired);
+
+        for (provider, token_file, expected) in [
+            (ids[0], &got.api_providers[0].1, "real-glm-key"),
+            (ids[1], &got.api_providers[1].1, "real-kimi-key"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(token_file).unwrap(),
+                expected,
+                "{provider}: host-only token file holds the real key"
+            );
+            assert!(
+                !token_file.starts_with(&state_dir),
+                "{provider}: real key must stay out of the guest mount"
+            );
+        }
+
+        let guest = std::fs::read_to_string(state_dir.join("opencode/auth.json")).unwrap();
+        assert!(!guest.contains("real-glm-key") && !guest.contains("real-kimi-key"));
+        let v: Value = serde_json::from_str(&guest).unwrap();
+        assert_eq!(v["zai-coding-plan"]["key"], ZAI_CODING_KEY_PLACEHOLDER);
+        assert_eq!(v["kimi-for-coding"]["key"], KIMI_CODING_KEY_PLACEHOLDER);
+
+        // Log out of Kimi on the host: the next launch must not leave
+        // the stale real key parked in the project's secrets dir.
+        let kimi_token = got.api_providers[1].1.clone();
+        std::fs::write(
+            &host_auth,
+            serde_json::to_vec(&serde_json::json!({
+                "zai-coding-plan": {"type": "api", "key": "real-glm-key"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // SAFETY: as above — the env lock is still held.
+        unsafe { std::env::set_var("HOME", &home) };
+        let got = refresh_opencode(&state_dir, false, true).unwrap();
+        restore_home(prev_home);
+        assert_eq!(
+            got.api_providers.iter().map(|(p, _)| p.id).collect::<Vec<_>>(),
+            vec!["zai-coding-plan"]
+        );
+        assert!(!kimi_token.exists(), "stale Kimi key removed from disk");
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(state_dir.join("opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(v.get("kimi-for-coding").is_none(), "stale guest entry gone");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A host `auth.json` that doesn't parse must not take anything
+    /// else down with it. It is written by OpenCode on the host, so a
+    /// truncated or hand-edited copy is plausible — and before this
+    /// capture existed it could not affect anything at all, because the
+    /// file was only ever hashed for the snapshot.
+    #[test]
+    fn refresh_opencode_survives_a_malformed_host_auth_json() {
+        let _guard = crate::test_env::guard();
+        let root = tmp_dir("agent-vm-oc-refresh-bad");
+        let home = root.join("home");
+        let state_dir = root.join("state").join("proj");
+        let host_auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(host_secret_dir(&state_dir)).unwrap();
+        std::fs::write(&host_auth, "{ this is not json").unwrap();
+        // A host codex auth.json, so the OpenAI leg has something to
+        // build from — that leg is what must survive.
+        let codex = home.join(".codex/auth.json");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, r#"{"tokens":{"access_token":"t","account_id":"acct"}}"#).unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("HOME", &home) };
+        let got = refresh_opencode(&state_dir, true, true).unwrap();
+        restore_home(prev_home);
+
+        assert!(
+            got.openai_wired,
+            "a broken opencode auth.json must not disable the Codex-derived OpenAI leg"
+        );
+        assert!(got.api_providers.is_empty(), "no keys to capture");
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(state_dir.join("opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["openai"]["access"], OPENCODE_OPENAI_ACCESS_PLACEHOLDER);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nothing to capture: no guest `auth.json` is invented — but a
+    /// real key left in the host-only secrets dir from an earlier
+    /// launch is still cleaned up. `<state_dir>` is guest-writable and
+    /// users do wipe it; the sibling `.secrets/` survives that, so the
+    /// cleanup can't sit behind the "nothing to write" early return.
+    #[test]
+    fn refresh_opencode_cleans_stale_keys_even_when_it_captures_nothing() {
+        let _guard = crate::test_env::guard();
+        let root = tmp_dir("agent-vm-oc-refresh-empty");
+        let home = root.join("home");
+        let state_dir = root.join("state").join("proj");
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(host_secret_dir(&state_dir)).unwrap();
+        // Left behind by a launch when the user still had a GLM key.
+        let stale = opencode_api_token_path(&state_dir, &provider("zai"));
+        std::fs::write(&stale, "real-glm-key-from-last-time").unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("HOME", &home) };
+        let got = refresh_opencode(&state_dir, false, true).unwrap();
+        restore_home(prev_home);
+
+        assert!(got.api_providers.is_empty());
+        assert!(!got.openai_wired);
+        assert!(!stale.exists(), "stale real key must not survive on disk");
+        assert!(
+            !state_dir.join("opencode/auth.json").exists(),
+            "no credentials means no auth.json to invent"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A non-OpenCode session (claude, codex, copilot) has no use for
+    /// these keys, so it neither captures them nor gets the guest-side
+    /// placeholders that would let it spend the user's quota.
+    #[test]
+    fn refresh_opencode_skips_api_keys_when_not_wanted() {
+        let _guard = crate::test_env::guard();
+        let root = tmp_dir("agent-vm-oc-refresh-gated");
+        let home = root.join("home");
+        let state_dir = root.join("state").join("proj");
+        let host_auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(host_secret_dir(&state_dir)).unwrap();
+        std::fs::write(
+            &host_auth,
+            br#"{"zai-coding-plan": {"type": "api", "key": "real-glm-key"}}"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("HOME", &home) };
+        let got = refresh_opencode(&state_dir, false, false).unwrap();
+        restore_home(prev_home);
+
+        assert!(got.api_providers.is_empty(), "gated off");
+        assert!(
+            !opencode_api_token_path(&state_dir, &provider("zai-coding-plan")).exists(),
+            "no token file written for a session that can't use it"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── write_default_claude_root_state: chrome MCP shape ─────────
