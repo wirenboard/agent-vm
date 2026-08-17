@@ -16,6 +16,10 @@ on:
       version:
         description: 'Version to publish (without leading v). Required when running manually.'
         required: true
+      publish:
+        description: 'Publish to npm. Off by default: a manual run is usually there to get a bundle out of a branch, and publishing one to the public registry is not undoable.'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -556,6 +560,14 @@ jobs:
 
   publish:
     needs: [resolve-version, package]
+    # A tag push is a release and always publishes. A manual run only
+    # publishes when asked: dispatch is how you get a bundle built off a
+    # branch to try it, and `npm publish` from an unmerged branch is a
+    # public, effectively irreversible side effect of what looks like a
+    # build. The `package` job's per-platform artifacts are attached to
+    # the run either way, so a no-publish dispatch still hands you
+    # something runnable.
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

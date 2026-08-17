@@ -61,6 +61,15 @@ pub fn host_copilot_token_path() -> Option<PathBuf> {
 /// `rename`) with the given Unix mode. The tmp file uses a fixed
 /// extension so a crashed run leaves an obvious orphan rather than a
 /// half-written target.
+///
+/// `O_NOFOLLOW` on the tmp file: several callers write into
+/// `state_dir`, which is bind-mounted into the guest read-write, so a
+/// compromised in-VM agent can pre-create `<name>.agent-vm-tmp` as a
+/// symlink to any host path it likes. Without the flag we would open,
+/// truncate and write *through* it — an arbitrary host-file overwrite
+/// running with the launcher's privileges. With it the open fails with
+/// `ELOOP` and the write is refused. (The read side of the same
+/// exposure is handled by `secrets::read_guest_json_object`.)
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let tmp = path.with_extension("agent-vm-tmp");
     {
@@ -69,6 +78,7 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
             .write(true)
             .truncate(true)
             .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
             .with_context(|| format!("opening {}", tmp.display()))?;
         f.write_all(data)

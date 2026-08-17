@@ -448,6 +448,135 @@ rejects it normally, which is at least a comprehensible failure.
 | Anthropic | `api.anthropic.com`, `platform.claude.com` |
 | OpenAI    | `api.openai.com`, `chatgpt.com`, `auth.openai.com` |
 
+### OpenCode's API-key providers — GLM (Z.ai) and Kimi
+
+Everything above is OAuth. OpenCode also speaks to providers that
+authenticate with a plain, non-expiring API key, and two of them are
+worth first-class support because they are what people actually run
+OpenCode against on a coding plan: **GLM** (Z.ai / Zhipu AI) and
+**Kimi** (Moonshot AI). They ride the same machinery — placeholder in
+the guest, real key in a host-only file, substitution on the wire —
+with no Phase 4 refresh leg, because a static key has nothing to
+rotate.
+
+Unlike Claude and Codex there is no separate host CLI to snapshot:
+OpenCode keeps *all* its credentials in one file,
+`~/.local/share/opencode/auth.json`, keyed by provider id —
+
+```json
+{
+  "openai":          {"type": "oauth", "access": "…", "refresh": "…", "expires": 1},
+  "zai-coding-plan": {"type": "api",   "key": "…"},
+  "kimi-for-coding": {"type": "api",   "key": "…"}
+}
+```
+
+`secrets::collect_opencode_api_keys` walks that file for the ids in
+`OPENCODE_API_PROVIDERS` and takes only `type: "api"` entries.
+Everything else in it — an OAuth entry, an `openrouter` key, a provider
+we don't model — is left alone.
+
+| id | placeholder | allowed host |
+|---|---|---|
+| `zai`                  | `msb-zai-placeholder-k-v1`             | `api.z.ai` |
+| `zai-coding-plan`      | `msb-zai-coding-placeholder-k-v1`      | `api.z.ai` |
+| `zhipuai`              | `msb-zhipuai-placeholder-k-v1`         | `open.bigmodel.cn` |
+| `zhipuai-coding-plan`  | `msb-zhipuai-coding-placeholder-k-v1`  | `open.bigmodel.cn` |
+| `kimi-for-coding`      | `msb-kimi-coding-placeholder-k-v1`     | `api.kimi.com` |
+| `moonshotai`           | `msb-moonshot-placeholder-k-v1`        | `api.moonshot.ai` |
+| `moonshotai-cn`        | `msb-moonshot-cn-placeholder-k-v1`     | `api.moonshot.cn` |
+
+The direct and "coding plan" variants of each vendor are separate rows
+because they are separate `auth.json` entries with separate keys, and
+Z.ai (international) vs Zhipu (China) are separate endpoints besides.
+Hosts come from the `api` field of OpenCode's own provider catalogue
+(`~/.cache/opencode/models.json`, upstream models.dev). Only `id`,
+placeholder and host are written per row: the token-file basename
+(`opencode-<id>`) and the secret's env-var name are derived from the
+id, so id uniqueness is the single invariant to test.
+
+**One placeholder per row, never a shared one.** Substitution is a
+byte-level `replace` over the header block, so a placeholder that were a
+substring of another would have the wrong key spliced in. Every
+placeholder in the codebase now lives in one `ALL_PLACEHOLDERS` list
+that `placeholders_are_pairwise_distinct` iterates — the previous
+hand-kept copy inside the test silently omitted the Copilot placeholder
+for as long as Copilot had existed.
+
+**Header shape: Bearer *and* `x-api-key`.** The openai-compatible
+providers send `Authorization: Bearer <key>`; `kimi-for-coding` speaks
+the Anthropic wire format (`@ai-sdk/anthropic`) and sends `x-api-key`.
+microsandbox's header injection substitutes anywhere in a header line,
+not only in `Authorization`, so both are covered by the default
+`inject_headers`. `inject_basic_auth` stays off, as for the other
+streaming providers, to keep the proxy's per-chunk fast path.
+
+**Captured per selected agent**, like the Copilot token and unlike the
+Anthropic/OpenAI ones: only `agent-vm opencode` (and `shell`, which
+runs no agent of its own and is where a user starts OpenCode by hand)
+captures the keys, registers the secrets and opens egress to those
+hosts. A `claude` session that never uses them would otherwise carry a
+guest-readable `auth.json` full of placeholders that a prompt-injected
+agent could spend the user's paid GLM quota with.
+
+### The guest-side `auth.json` is merged, not overwritten
+
+`<state>/opencode/auth.json` is the guest's `~/.local/share/opencode/
+auth.json`, so the user can create entries in it from inside the
+sandbox (`opencode auth login`). The write therefore merges: entries we
+manage are cleared and re-written from what the host backs this launch,
+everything else is left alone.
+
+"Entries we manage" means *by value, not by key*: an entry is cleared
+only when it still holds our placeholder. A stale placeholder must go —
+unbacked, it would leave the VM unsubstituted and be blocked by the
+violation detector — but the same id can also hold a real key the user
+typed inside the sandbox, and clearing that would force a re-auth every
+launch. Host-side token files get the same treatment: a provider that
+disappeared from the host has its `<state>.secrets/opencode-<id>`
+unlinked, on every launch, so a revoked key doesn't stay parked on disk.
+
+### Reading files the guest can write
+
+The merge above turned `auth.json` into a read-modify-write of a file
+under the guest bind mount — and `state_dir` is mounted read-write, so
+the guest controls that file's *type* as well as its content. Following
+a symlink there would be an exfiltration primitive: point `auth.json`
+at `~/.claude/.credentials.json`, and we would read the host's real
+tokens, merge the file's unmanaged keys into the result, and write it
+back somewhere the guest can read.
+
+`secrets::read_guest_json_object` is the single reader for all such
+merges (opencode auth + config, claude settings, `.claude.json`, copilot
+config — the older ones share the exposure and now share the guard). It
+`symlink_metadata`s first and refuses to traverse, and degrades to `{}`
+with a warning for anything unusable, rather than failing: valid JSON
+that isn't an object used to wedge the launcher permanently, since the
+bad content was never overwritten. The write side is covered by
+`atomic_write`'s `O_NOFOLLOW` on its temp file, which also closes the
+"guest plants a symlink at `<name>.agent-vm-tmp`" arbitrary-overwrite
+path.
+
+### The default-model pin is conditional
+
+`opencode-config/opencode.json` pins `model: openai/gpt-5.5` because
+ChatGPT-OAuth rejects OpenCode's built-in `gpt-5.5-pro` default. For a
+user whose only OpenCode credentials are GLM/Kimi keys that pin starts
+every session on a provider they can't reach, so it is skipped in
+exactly that case — GLM/Kimi wired, OpenAI not. With no credentials at
+all we still pin, because that is the first-run bypass someone gets
+when they log into ChatGPT from inside the guest.
+
+`model` is managed in both directions: when the pin isn't wanted, one
+we wrote earlier is also removed. Skipping the insert alone would have
+been inert on every state dir that already existed, which is all of
+them. A model the user chose is never touched.
+
+Because the pin depends on what the capture wired, the config write
+moved out of `write_agent_config_defaults` (which runs before any
+capture) into `write_opencode_config_defaults`, called from `refresh`
+afterwards.
+
 ### `IS_SANDBOX=1`
 
 Claude Code refuses to run as root with

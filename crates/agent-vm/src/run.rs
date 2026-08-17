@@ -526,9 +526,42 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // gh token written to a copilot secret file it never uses.
     let want_copilot = matches!(agent, Agent::Copilot);
 
-    let creds =
-        crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github, want_copilot)
-            .context("snapshotting host credentials")?;
+    // Same least-privilege argument for OpenCode's GLM/Kimi API keys:
+    // OpenCode is the only thing that reads them, so a claude or codex
+    // session has no reason to carry seven substitution secrets, egress
+    // to api.z.ai / open.bigmodel.cn / api.kimi.com / api.moonshot.*,
+    // and — the part that actually bites — a guest-readable auth.json
+    // full of placeholders that a prompt-injected agent could spend the
+    // user's paid GLM quota with.
+    //
+    // `shell` is included deliberately, unlike `want_copilot`: it runs
+    // no agent of its own, so there is nothing there to inject, and it
+    // is the escape hatch where a user invokes `opencode` by hand.
+    let want_opencode = matches!(agent, Agent::Opencode | Agent::Shell);
+
+    let creds = crate::secrets::refresh(
+        &session.state_dir,
+        &project_guest_path,
+        use_github,
+        want_copilot,
+        want_opencode,
+    )
+    .context("snapshotting host credentials")?;
+
+    // The GLM/Kimi keys come from the host's own OpenCode auth.json, so
+    // which ones exist varies per user; say so rather than leaving the
+    // user guessing why `opencode` does or doesn't offer a provider.
+    if !creds.opencode_api_token_files.is_empty() {
+        let ids: Vec<&str> = creds
+            .opencode_api_token_files
+            .iter()
+            .map(|(p, _)| p.id)
+            .collect();
+        eprintln!(
+            "==> OpenCode API keys: {} (proxy-substituted; guest sees placeholders)",
+            ids.join(", ")
+        );
+    }
 
     // D1: when Copilot is the selected agent but no usable token could
     // be captured, fail loudly here. Otherwise the guest would send
@@ -786,6 +819,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the body's refresh_token is a placeholder, not a header.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
+        || !creds.opencode_api_token_files.is_empty()
         || creds.gh_token_file.is_some()
         || creds.copilot_token_file.is_some();
     let auto_publish = args.auto_publish;
@@ -797,6 +831,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let anthropic = creds.anthropic_token_file.clone();
         let openai = creds.openai_token_file.clone();
         let opencode = creds.opencode_openai_access_token_file.clone();
+        let opencode_api = creds.opencode_api_token_files.clone();
         let gh = creds.gh_token_file.clone();
         let has_gh = gh.is_some();
         // D1 least-privilege: only wire the Copilot secret (and thus
@@ -841,11 +876,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             if !has_creds {
                 return n;
             }
-            // We only ever substitute into Authorization: Bearer headers.
-            // Explicitly disable basic_auth so the proxy's per-chunk fast
-            // path can short-circuit when the placeholder isn't present
-            // — critical for post-WebSocket-upgrade binary frames where
-            // a UTF-8 lossy round trip would corrupt the bytes.
+            // We only ever substitute into plain header values —
+            // `Authorization: Bearer` for most providers, `x-api-key`
+            // for kimi-for-coding, which speaks the Anthropic wire
+            // format — never into Basic credentials (gh below is the
+            // one exception). Explicitly disable basic_auth so the
+            // proxy's per-chunk fast path can short-circuit when the
+            // placeholder isn't present — critical for post-WebSocket-
+            // upgrade binary frames where a UTF-8 lossy round trip
+            // would corrupt the bytes.
             if let Some(file) = anthropic {
                 n = n.secret(|s| {
                     s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
@@ -879,6 +918,31 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                         .inject_basic_auth(false)
                         .allow_host(OPENAI_API_HOST)
                         .allow_host(OPENAI_CHATGPT_HOST)
+                });
+            }
+            // OpenCode's plain-API-key providers (GLM / Z.ai, Kimi /
+            // Moonshot). The guest's auth.json holds a per-provider
+            // placeholder; the proxy swaps it for the real key on the
+            // way out, scoped to that provider's own API host — a key
+            // headed anywhere else is a violation and gets blocked.
+            // The openai-compatible providers send it as `Authorization:
+            // Bearer`, kimi-for-coding as `x-api-key`; header
+            // substitution (on by default) covers both, and basic_auth
+            // stays off so the per-chunk fast path survives streaming
+            // responses.
+            //
+            // Only populated for an OpenCode-capable session — see
+            // `want_opencode`. Env-var names are derived from the
+            // provider id (`OpencodeApiProvider::env_var`) rather than
+            // written out here like the five above, because there are
+            // seven of them and the id is the only thing that varies.
+            for (provider, file) in opencode_api {
+                n = n.secret(|s| {
+                    s.env(provider.env_var())
+                        .value(file)
+                        .placeholder(provider.placeholder)
+                        .inject_basic_auth(false)
+                        .allow_host(provider.host)
                 });
             }
             // Phase 6: gh CLI sends `Authorization: token <token>` (or

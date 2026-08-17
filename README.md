@@ -133,18 +133,30 @@ Reads from the host:
 
 - `~/.claude/.credentials.json` (Claude)
 - `~/.codex/auth.json` (Codex, OpenCode)
+- `~/.local/share/opencode/auth.json` — the GLM (`zai`,
+  `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`) and Kimi
+  (`kimi-for-coding`, `moonshotai`, `moonshotai-cn`) API keys, if you
+  have logged into any of them on the host
 - `gh auth token` (git/gh)
 
 The guest gets placeholder strings; the proxy substitutes on the wire.
 Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (0700)
 on the host, **outside** the bind mount the guest sees. A SHA-256
-snapshot of the three credential files is taken at launch and
-re-checked on exit; unexpected mutations print a warning.
+snapshot of the three host credential *files* (Claude, Codex, OpenCode)
+is taken at launch and re-checked on exit; unexpected mutations print a
+warning.
+
+The GLM/Kimi keys are captured only for a session that can use them —
+`agent-vm opencode`, or `agent-vm shell` where you may start OpenCode
+by hand. A `claude` or `codex` session gets neither the keys nor egress
+to those APIs.
 
 For Claude/Codex, when the in-VM agent's bearer expires the
 hook MITMs the OAuth refresh, runs `claude -p`/`codex exec` on the
 host to rotate, and feeds the new placeholder back to the guest — no
-re-attach required.
+re-attach required. The GLM/Kimi keys are static API keys with no
+refresh leg: they're captured at launch, and a key rotated on the host
+mid-session is picked up on the next launch.
 
 ## Project hook
 
