@@ -43,6 +43,10 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
+/// Where the per-project host state dir is bind-mounted inside the
+/// guest. `clipboard_pty::GUEST_ROOT` lives under it (pinned by a test).
+pub const GUEST_STATE_MOUNT: &str = "/agent-vm-state";
+
 /// The guest PATH. Mirrors the `ENV PATH=…` in images/Dockerfile (see
 /// the comment at the use site for why it has to be re-published).
 const GUEST_DEFAULT_PATH: &str =
@@ -230,6 +234,7 @@ Environment:
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                skip the Chrome DevTools MCP setup
+  AGENT_VM_NO_CLIPBOARD_BRIDGE          don't bridge Ctrl+V image pastes into the guest
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
 #[derive(ClapArgs)]
@@ -669,7 +674,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .memory(memory_mib)
         .workdir(krun_workdir)
         .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
-        .volume("/agent-vm-state", |m| m.bind(&session.state_dir));
+        .volume(GUEST_STATE_MOUNT, |m| m.bind(&session.state_dir));
     // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
     // .volume() — and we also have to mkdir the guest path in the
     // patch builder so microsandbox's workdir/rootfs validation passes
@@ -1071,17 +1076,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // the `ENV PATH=…` in images/Dockerfile.
     //
     // When this launch runs under the Ctrl+V image bridge (see
-    // clipboard_pty.rs), the per-launch `xclip`/`wl-paste` shims go
-    // *first* so Claude Code's clipboard probes hit them, not a real
-    // X11/Wayland client that has no display to talk to.
-    let mut guest_path = GUEST_DEFAULT_PATH.to_string();
-    if let Some(dir) = env::var_os(crate::clipboard_pty::CHILD_ENV) {
-        match crate::clipboard_pty::write_guest_shims(Path::new(&dir), &session.state_dir) {
-            Ok(bin) => guest_path = format!("{bin}:{guest_path}"),
-            Err(e) => eprintln!("==> warning: Ctrl+V image bridge disabled in guest: {e:#}"),
-        }
-    }
-    builder = builder.env("PATH", guest_path);
+    // clipboard_pty.rs), the wrapper has already written per-launch
+    // `xclip`/`wl-paste` shims into the state dir; they go *first* so
+    // Claude Code's clipboard probes hit them, not a real X11/Wayland
+    // client that has no display to talk to.
+    builder = builder.env(
+        "PATH",
+        guest_path(crate::clipboard_pty::guest_shim_bin_from_env().as_deref()),
+    );
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
@@ -1950,6 +1952,15 @@ const SEED_CLAUDE_PLUGINS: &str =
 /// agent with its args. Pure and string-only so it can be unit-tested
 /// without booting a sandbox — the launch path calls exactly this, so
 /// the tested behavior and the live behavior cannot drift.
+/// The guest PATH, with the clipboard bridge's shim dir in front when
+/// this launch has one.
+fn guest_path(clipboard_shim_bin: Option<&str>) -> String {
+    match clipboard_shim_bin {
+        Some(bin) => format!("{bin}:{GUEST_DEFAULT_PATH}"),
+        None => GUEST_DEFAULT_PATH.to_string(),
+    }
+}
+
 fn build_agent_shell_line(
     project_guest_path: &str,
     chrome_mcp_prelude: &str,
@@ -2009,6 +2020,21 @@ mod tests {
     }
 
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
+
+    #[test]
+    fn guest_path_prepends_clipboard_shims_and_matches_dockerfile() {
+        assert_eq!(guest_path(None), GUEST_DEFAULT_PATH);
+        assert_eq!(
+            guest_path(Some("/agent-vm-state/clipboard/1/bin")),
+            format!("/agent-vm-state/clipboard/1/bin:{GUEST_DEFAULT_PATH}")
+        );
+        // Drift guard for the "keep in sync with images/Dockerfile" note.
+        let dockerfile = include_str!("../../../images/Dockerfile");
+        assert!(
+            dockerfile.contains(&format!("PATH={GUEST_DEFAULT_PATH}")),
+            "GUEST_DEFAULT_PATH no longer matches the ENV PATH in images/Dockerfile"
+        );
+    }
 
     #[test]
     fn build_agent_shell_line_starts_with_v6_strip_and_execs() {

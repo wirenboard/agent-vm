@@ -124,13 +124,24 @@ picks it up through `xclip`/`wl-paste` shims placed first on the guest
 PATH; Codex, which never shells out, instead receives the file's guest
 path as a paste, which it attaches as an image. Text on the clipboard
 is not bridged — your terminal's own paste shortcut already handles
-that — and the snapshots are deleted when the session ends.
+that.
+
+Every Ctrl+V you type in the session takes a snapshot, whatever is
+running in the guest at that moment (a shell, vim, the agent), so
+whatever image sits on your clipboard becomes readable by the guest
+for a short while: for claude/opencode/copilot/shell it is
+replaced on your next Ctrl+V and deleted when the session ends, for
+codex it stays until the session ends (Codex reads the file when the
+message is sent). Reading the host
+clipboard pauses the session for up to three seconds per tool if the
+clipboard owner is unresponsive.
 
 Requires `wl-paste` (package `wl-clipboard`) or `xclip` on the host,
 and a terminal that passes Ctrl+V through to the application (most
 Linux terminals paste on Ctrl+Shift+V and leave Ctrl+V alone). Set
 `AGENT_VM_NO_CLIPBOARD_BRIDGE=1` to run the agent straight on the
-terminal without the relay.
+terminal without the relay. Redirecting stderr (`2>log`) keeps
+working under the relay.
 
 ## Chrome DevTools MCP
 
