@@ -110,6 +110,27 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 | `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+| `AGENT_VM_NO_CLIPBOARD_BRIDGE` | don't bridge Ctrl+V image pastes into the guest (see below) |
+
+## Pasting images (Ctrl+V)
+
+The guest has no display server, so the agents' own clipboard access
+can't work inside the VM. Interactive launches therefore run under a
+small pty relay in `agent-vm` itself: when you press Ctrl+V in the
+terminal it snapshots the host clipboard as PNG (via `wl-paste` on
+Wayland or `xclip` on X11) into `<state>/clipboard/<pid>/`, visible in
+the guest under `/agent-vm-state/clipboard/<pid>/`. Claude Code then
+picks it up through `xclip`/`wl-paste` shims placed first on the guest
+PATH; Codex, which never shells out, instead receives the file's guest
+path as a paste, which it attaches as an image. Text on the clipboard
+is not bridged — your terminal's own paste shortcut already handles
+that — and the snapshots are deleted when the session ends.
+
+Requires `wl-paste` (package `wl-clipboard`) or `xclip` on the host,
+and a terminal that passes Ctrl+V through to the application (most
+Linux terminals paste on Ctrl+Shift+V and leave Ctrl+V alone). Set
+`AGENT_VM_NO_CLIPBOARD_BRIDGE=1` to run the agent straight on the
+terminal without the relay.
 
 ## Chrome DevTools MCP
 

@@ -303,6 +303,26 @@ Non-TTY mode loses the live streaming TUI experience but gives the caller a
 clean `stdout | other-tool` story. Streaming stdout/stderr during run landed
 in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
+### Ctrl+V image paste: a pty relay around the launcher
+
+Neither agent can read a clipboard inside the VM (no X11/Wayland
+socket), and the SDK's `attach()` reads the terminal itself, so there is
+no hook for the launcher to see keystrokes. `clipboard_pty.rs` solves
+this one level up: an interactive `agent-vm <agent>` re-executes itself
+as a child on a pty (with `AGENT_VM_CLIPBOARD_DIR` set as the marker)
+and the parent relays bytes, watching for Ctrl+V (legacy `0x16` or the
+kitty keyboard protocol's `CSI 118;5 u`, never inside a bracketed
+paste). On a hit it snapshots the host clipboard as
+`<state>/clipboard/<pid>/paste-NNNNNN.png`. Claude Code shells out to
+`xclip`/`wl-paste`, so `run.rs` writes shims by those names into the
+same dir and puts `/agent-vm-state/clipboard/<pid>/bin` first on the
+guest PATH; the key itself is forwarded untouched. Codex uses `arboard`
+directly (no shim possible) but attaches an image whose path is pasted
+into its composer, so for `agent-vm codex` the key is replaced by a
+bracketed paste of the guest path. The Lima-era `clipboard-pty.py`
+did the same job in Python; this is its Rust successor and needs no
+image or SDK change.
+
 ### Credentials: env-var only, deliberately
 
 Phase 2 reads `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from the host

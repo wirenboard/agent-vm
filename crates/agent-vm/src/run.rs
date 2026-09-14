@@ -43,6 +43,11 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
+/// The guest PATH. Mirrors the `ENV PATH=…` in images/Dockerfile (see
+/// the comment at the use site for why it has to be re-published).
+const GUEST_DEFAULT_PATH: &str =
+    "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
+
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
         Some(s) => s,
@@ -1064,10 +1069,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // live there in debian, and dockerd does PATH lookups for its helper
     // binaries at runtime (not just at exec). Keep this list in sync with
     // the `ENV PATH=…` in images/Dockerfile.
-    builder = builder.env(
-        "PATH",
-        "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
-    );
+    //
+    // When this launch runs under the Ctrl+V image bridge (see
+    // clipboard_pty.rs), the per-launch `xclip`/`wl-paste` shims go
+    // *first* so Claude Code's clipboard probes hit them, not a real
+    // X11/Wayland client that has no display to talk to.
+    let mut guest_path = GUEST_DEFAULT_PATH.to_string();
+    if let Some(dir) = env::var_os(crate::clipboard_pty::CHILD_ENV) {
+        match crate::clipboard_pty::write_guest_shims(Path::new(&dir), &session.state_dir) {
+            Ok(bin) => guest_path = format!("{bin}:{guest_path}"),
+            Err(e) => eprintln!("==> warning: Ctrl+V image bridge disabled in guest: {e:#}"),
+        }
+    }
+    builder = builder.env("PATH", guest_path);
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
