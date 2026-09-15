@@ -15,7 +15,7 @@ use std::io::{IsTerminal, Read};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use microsandbox::protocol::fs::FsSetAttrs;
@@ -100,38 +100,46 @@ impl Bridge {
             .await
             .ok()
             .flatten();
+        // Drop the previous image even without a new one, so a text-only
+        // clipboard can't re-paste it.
+        let prev = (self.mode == PasteMode::ForwardKey && self.counter > 0)
+            .then(|| snapshot_path(self.counter));
+        let next = png.as_ref().map(|_| {
+            self.counter += 1;
+            snapshot_path(self.counter)
+        });
+        let expired = (self.mode == PasteMode::PastePath && self.counter > KEEP)
+            .then(|| snapshot_path(self.counter - KEEP));
         let fs = self.sandbox.fs();
-        // Drop the previous image first so a text-only clipboard can't
-        // re-paste it.
-        if self.mode == PasteMode::ForwardKey && self.counter > 0 {
-            let _ = fs.remove(&snapshot_path(self.counter)).await;
-        }
-        let png = png?;
-        self.counter += 1;
-        let path = snapshot_path(self.counter);
-        // Written under a name the shims' `paste-*.png` glob never matches
-        // and the guest can't predict (agentd follows symlinks), then renamed.
-        let nanos = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .map_or(0, |d| d.subsec_nanos());
-        let part = format!("{path}.{nanos:08x}.part");
-        let write = async {
-            fs.write(&part, png).await?;
-            fs.rename(&part, &path).await
-        };
-        match tokio::time::timeout(GUEST_TIMEOUT, write).await {
-            Ok(Ok(())) => {
-                if self.mode == PasteMode::PastePath && self.counter > KEEP {
-                    let _ = fs.remove(&snapshot_path(self.counter - KEEP)).await;
-                }
-                Some(path)
+        let guest = async {
+            if let Some(p) = &prev {
+                let _ = fs.remove(p).await;
             }
-            res => {
-                let err = res.map_or("timed out".into(), |r| {
-                    r.map_or_else(sanitize, |_| String::new())
-                });
-                eprintln!("\r\nagent-vm: clipboard bridge: writing {path}: {err}\r");
+            let Some(path) = next else { return Ok(None) };
+            // The shim globs `paste-*.png`, so a half-written `.part` is never served.
+            let part = format!("{path}.part");
+            let written = async {
+                fs.write(&part, png.unwrap_or_default()).await?;
+                fs.rename(&part, &path).await
+            }
+            .await;
+            if written.is_err() {
                 let _ = fs.remove(&part).await;
+            }
+            written?;
+            if let Some(p) = &expired {
+                let _ = fs.remove(p).await;
+            }
+            anyhow::Ok(Some(path))
+        };
+        match tokio::time::timeout(GUEST_TIMEOUT, guest).await {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
+                eprintln!("\r\nagent-vm: clipboard bridge: {}\r", sanitize(e));
+                None
+            }
+            Err(_) => {
+                eprintln!("\r\nagent-vm: clipboard bridge: guest write timed out\r");
                 None
             }
         }

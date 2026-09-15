@@ -124,7 +124,8 @@ paste shortcut already handles that.
 
 Privacy: every Ctrl+V in such a session copies the current host
 clipboard image into the VM, whatever is on screen. The launcher keeps
-it in guest memory only (claude/opencode: the latest, codex: the last eight),
+it in guest memory only (claude/opencode: the latest, codex: the last eight,
+within a 64 MiB budget),
 but the agent's own session transcript may persist what it attached —
 Claude Code's lives under the project state dir. Reading the clipboard
 can delay that keystroke by a few seconds if the clipboard owner is

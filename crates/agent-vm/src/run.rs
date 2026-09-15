@@ -1979,7 +1979,6 @@ fn guest_path(bridge: bool) -> String {
     }
 }
 
-
 /// Build the `bash -c` line that runs inside the guest: the prelude
 /// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
 /// optional project runtime hook) followed by `exec`'ing the chosen
