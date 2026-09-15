@@ -1,7 +1,7 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod clipboard;
-mod clipboard_pty;
+mod clipboard_bridge;
 mod defaults;
 mod github_graphql;
 mod host_paths;
@@ -93,27 +93,6 @@ fn main() -> Result<()> {
     // before the tokio multi-thread runtime spawns workers (which
     // happens inside `Runtime::new()`). Hence the manual sync `fn
     // main` + manual runtime construction instead of `#[tokio::main]`.
-    // Interactive launches run under the Ctrl+V image bridge: this
-    // process becomes a thin pty relay around a re-exec of itself and
-    // returns the child's exit code (see clipboard_pty.rs). Runs first —
-    // before msb setup and before the runtime — so the relay never
-    // touches either.
-    let paste_mode = match &cli.cmd {
-        Cmd::Codex(_) => Some(clipboard_pty::PasteMode::PastePath),
-        Cmd::Claude(_) | Cmd::Opencode(_) | Cmd::Copilot(_) | Cmd::Shell(_) => {
-            Some(clipboard_pty::PasteMode::ForwardKey)
-        }
-        Cmd::Setup(_) | Cmd::Pull(_) | Cmd::Clipboard(_) | Cmd::InterceptHook(_) => None,
-    };
-    if let Some(mode) = paste_mode {
-        match clipboard_pty::maybe_wrap(mode) {
-            Ok(Some(code)) => std::process::exit(code),
-            Ok(None) => {}
-            // Only pre-spawn failures land here (no pty, unwritable state
-            // dir); the launch itself is unaffected, just without image paste.
-            Err(e) => eprintln!("==> warning: Ctrl+V image bridge disabled: {e:#}"),
-        }
-    }
     let needs_msb_setup = !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_));
     if needs_msb_setup {
         msb_install::point_at_msb()?;

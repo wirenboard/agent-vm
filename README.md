@@ -115,33 +115,27 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 ## Pasting images (Ctrl+V)
 
 The guest has no display server, so the agents' own clipboard access
-can't work inside the VM. Interactive launches therefore run under a
-small pty relay in `agent-vm` itself: when you press Ctrl+V in the
-terminal it snapshots the host clipboard as PNG (via `wl-paste` on
-Wayland or `xclip` on X11) into `<state>/clipboard/<pid>/`, visible in
-the guest under `/agent-vm-state/clipboard/<pid>/`. Claude Code then
-picks it up through `xclip`/`wl-paste` shims placed first on the guest
-PATH; Codex, which never shells out, instead receives the file's guest
-path as a paste, which it attaches as an image. Text on the clipboard
-is not bridged — your terminal's own paste shortcut already handles
-that.
+can't work inside the VM. Instead, `agent-vm` watches the terminal
+input of an interactive session: on Ctrl+V it reads the host clipboard
+as PNG (`wl-paste` on Wayland, `xclip` on X11) and pushes it over the
+in-guest agent into guest tmpfs at `/run/agent-vm/clipboard/`. Claude
+Code picks it up through `xclip`/`wl-paste` shims placed first on the
+guest PATH; Codex, which never shells out, instead receives the file's
+guest path as a paste, which it attaches as an image. Text on the
+clipboard is not bridged — your terminal's own paste shortcut already
+handles that. Nothing is written to the host disk; the images vanish
+with the VM.
 
 Every Ctrl+V you type in the session takes a snapshot, whatever is
-running in the guest at that moment (a shell, vim, the agent), so
-whatever image sits on your clipboard becomes readable by the guest
-for a short while: for claude/opencode/copilot/shell it is
-replaced on your next Ctrl+V and deleted when the session ends, for
-codex it stays until the session ends (Codex reads the file when the
-message is sent). Reading the host
-clipboard pauses the session for up to three seconds per tool if the
+running in the guest at that moment, and the guest can read it until
+your next Ctrl+V (codex: until the session ends). Reading the host
+clipboard pauses input for up to three seconds per tool if the
 clipboard owner is unresponsive.
 
 Requires `wl-paste` (package `wl-clipboard`) or `xclip` on the host,
 and a terminal that passes Ctrl+V through to the application (most
 Linux terminals paste on Ctrl+Shift+V and leave Ctrl+V alone). Set
-`AGENT_VM_NO_CLIPBOARD_BRIDGE=1` to run the agent straight on the
-terminal without the relay. Redirecting stderr (`2>log`) keeps
-working under the relay.
+`AGENT_VM_NO_CLIPBOARD_BRIDGE=1` to turn it off.
 
 ## Chrome DevTools MCP
 

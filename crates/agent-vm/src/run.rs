@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::clipboard_bridge;
 use crate::session::ProjectSession;
 
 /// Paths that the guest will tmpfs-mount at boot, wiping anything our
@@ -43,9 +44,8 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
-/// Where the per-project host state dir is bind-mounted inside the
-/// guest. `clipboard_pty::GUEST_ROOT` lives under it (pinned by a test).
-pub const GUEST_STATE_MOUNT: &str = "/agent-vm-state";
+/// Where the per-project host state dir is bind-mounted inside the guest.
+const GUEST_STATE_MOUNT: &str = "/agent-vm-state";
 
 /// The guest PATH. Mirrors the `ENV PATH=…` in images/Dockerfile (see
 /// the comment at the use site for why it has to be re-published).
@@ -176,6 +176,14 @@ impl Agent {
     /// project would have the later-exiting shell wholesale clobber
     /// the earlier shell's commands (the symlink target is the same
     /// host file, see `run.rs`'s `.symlink(... "/root/.bash_history" ...)`).
+    /// How the Ctrl+V bridge delivers an image (see clipboard_bridge.rs).
+    fn paste_mode(self) -> clipboard_bridge::PasteMode {
+        match self {
+            Agent::Codex => clipboard_bridge::PasteMode::PastePath,
+            _ => clipboard_bridge::PasteMode::ForwardKey,
+        }
+    }
+
     fn default_args(self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["--dangerously-skip-permissions"],
@@ -1075,15 +1083,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // binaries at runtime (not just at exec). Keep this list in sync with
     // the `ENV PATH=…` in images/Dockerfile.
     //
-    // When this launch runs under the Ctrl+V image bridge (see
-    // clipboard_pty.rs), the wrapper has already written per-launch
-    // `xclip`/`wl-paste` shims into the state dir; they go *first* so
-    // Claude Code's clipboard probes hit them, not a real X11/Wayland
-    // client that has no display to talk to.
-    builder = builder.env(
-        "PATH",
-        guest_path(crate::clipboard_pty::guest_shim_bin_from_env().as_deref()),
-    );
+    // The Ctrl+V bridge's `xclip`/`wl-paste` shims go first so Claude
+    // Code's clipboard probes hit them (see clipboard_bridge.rs).
+    let bridge = clipboard_bridge::enabled();
+    builder = builder.env("PATH", guest_path(bridge));
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
@@ -1298,8 +1301,25 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
         // leaves cwd unset, falling back to that placeholder; `attach_with`
         // lets us set it, matching the streaming path below.
+        let filter = if bridge {
+            clipboard_bridge::install(&sandbox)
+                .await
+                .context("installing the clipboard bridge")?;
+            Some(std::sync::Arc::new(clipboard_bridge::Bridge::new(
+                sandbox.clone(),
+                agent.paste_mode(),
+            )))
+        } else {
+            None
+        };
         sandbox
-            .attach_with(cmd, |a| a.args(agent_args).cwd(project_guest_path.clone()))
+            .attach_with(cmd, |a| {
+                let a = a.args(agent_args).cwd(project_guest_path.clone());
+                match filter {
+                    Some(f) => a.stdin_filter(f),
+                    None => a,
+                }
+            })
             .await
             .with_context(|| {
                 format!(
@@ -1946,21 +1966,22 @@ const STRIP_IPV6_NAMESERVERS: &str =
 const SEED_CLAUDE_PLUGINS: &str =
     "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh || true";
 
+/// The guest PATH, with the clipboard bridge's shim dir in front when active.
+fn guest_path(bridge: bool) -> String {
+    if bridge {
+        format!("{}:{GUEST_DEFAULT_PATH}", clipboard_bridge::GUEST_BIN)
+    } else {
+        GUEST_DEFAULT_PATH.to_string()
+    }
+}
+
+
 /// Build the `bash -c` line that runs inside the guest: the prelude
 /// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
 /// optional project runtime hook) followed by `exec`'ing the chosen
 /// agent with its args. Pure and string-only so it can be unit-tested
 /// without booting a sandbox — the launch path calls exactly this, so
 /// the tested behavior and the live behavior cannot drift.
-/// The guest PATH, with the clipboard bridge's shim dir in front when
-/// this launch has one.
-fn guest_path(clipboard_shim_bin: Option<&str>) -> String {
-    match clipboard_shim_bin {
-        Some(bin) => format!("{bin}:{GUEST_DEFAULT_PATH}"),
-        None => GUEST_DEFAULT_PATH.to_string(),
-    }
-}
-
 fn build_agent_shell_line(
     project_guest_path: &str,
     chrome_mcp_prelude: &str,
@@ -2023,10 +2044,10 @@ mod tests {
 
     #[test]
     fn guest_path_prepends_clipboard_shims_and_matches_dockerfile() {
-        assert_eq!(guest_path(None), GUEST_DEFAULT_PATH);
+        assert_eq!(guest_path(false), GUEST_DEFAULT_PATH);
         assert_eq!(
-            guest_path(Some("/agent-vm-state/clipboard/1/bin")),
-            format!("/agent-vm-state/clipboard/1/bin:{GUEST_DEFAULT_PATH}")
+            guest_path(true),
+            format!("{}:{GUEST_DEFAULT_PATH}", clipboard_bridge::GUEST_BIN)
         );
         // Drift guard for the "keep in sync with images/Dockerfile" note.
         let dockerfile = include_str!("../../../images/Dockerfile");

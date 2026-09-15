@@ -144,7 +144,7 @@ fn read_from_system_clipboard() -> Result<Vec<u8>> {
 }
 
 /// First `cmd` on PATH that is a regular file. Shared with the Ctrl+V
-/// image bridge (`clipboard_pty`).
+/// image bridge (`clipboard_bridge`).
 pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {

@@ -303,39 +303,25 @@ Non-TTY mode loses the live streaming TUI experience but gives the caller a
 clean `stdout | other-tool` story. Streaming stdout/stderr during run landed
 in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
-### Ctrl+V image paste: a pty relay around the launcher
+### Ctrl+V image paste: a stdin filter on attach
 
 Neither agent can read a clipboard inside the VM (no X11/Wayland
-socket), and the SDK's `attach()` reads the terminal itself, so there is
-no hook for the launcher to see keystrokes. `clipboard_pty.rs` solves
-this one level up: an interactive `agent-vm <agent>` re-executes itself
-as a child on a pty (with `AGENT_VM_CLIPBOARD_DIR`, the guest path of
-the per-launch dir, set as the marker) and the parent relays bytes,
-watching for Ctrl+V (legacy `0x16`, the kitty keyboard protocol's
-`CSI 118;5 u`, or xterm's `CSI 27;5;118 ~`, never inside a bracketed
-paste; a partial sequence at a read boundary is held back briefly). On
-a hit it snapshots the host clipboard as
-`<state>/clipboard/<pid>/paste-NNNNNN.png`. Claude Code shells out to
-`xclip`/`wl-paste`, so the wrapper writes shims by those names into
-`<pid>/bin` and `run.rs` puts `/agent-vm-state/clipboard/<pid>/bin`
-first on the guest PATH; the key itself is forwarded untouched and the
-snapshot is replaced on the next Ctrl+V (Claude reads it in two
-`xclip` calls, so a timed deletion would risk racing the read). Codex uses `arboard` directly (no
-shim possible) but attaches an image whose path is pasted into its
-composer, so for `agent-vm codex` the key is replaced by a bracketed
-paste of the guest path while Codex has bracketed paste enabled. The
-relay also does job control (Ctrl+Z during boot suspends the whole job)
-and re-raises the child's fatal signal so callers see the real
-termination. The Lima-era `clipboard-pty.py` did the same job in
-Python; this is its Rust successor and needs no image or SDK change.
-
-The state dir is writable from the guest, so the host never trusts a
-path below it: `clipboard/` and the per-launch dir are opened with
-`O_NOFOLLOW`, the descriptors are kept, and every later host operation
-(snapshot writes, unlinks, the sweep of dirs whose `flock`ed lock file
-nobody holds) goes through `/proc/self/fd/<fd>/…`, immune to symlinks
-or renames the guest plants. The child does no host filesystem work at
-all — it only turns the env var into a PATH prefix.
+socket). The wirenboard microsandbox fork's SDK exposes a `StdinFilter`
+hook on `attach()`: every chunk of terminal input passes through it
+before it is sent to the guest, and the chunk waits for the filter's
+future. `clipboard_bridge.rs` implements it: it scans for Ctrl+V
+(legacy `0x16`, kitty `CSI 118;5 u`, xterm `CSI 27;5;118 ~`, never
+inside a bracketed paste), reads the host clipboard as PNG, and writes
+it with `sandbox.fs().write()` over agentd into guest tmpfs
+(`/run/agent-vm/clipboard/paste-N.png`) before letting the key through.
+Claude Code shells out to `xclip`/`wl-paste`, so `install()` writes
+shims by those names into `/run/agent-vm/clipboard/bin`, which `run.rs`
+puts first on the guest PATH. Codex uses `arboard` directly (no shim
+possible) but attaches an image whose path is pasted into its composer,
+so for `agent-vm codex` the key is replaced by a bracketed paste of the
+guest path. The host never touches the guest-writable state mount for
+this, and no pty layer sits between the user and the SDK's own terminal
+handling.
 
 ### Credentials: env-var only, deliberately
 
