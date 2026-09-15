@@ -158,9 +158,9 @@ impl Agent {
     /// vim or readline, not a paste.
     fn paste_mode(self) -> Option<clipboard_bridge::PasteMode> {
         match self {
-            Agent::Claude => Some(clipboard_bridge::PasteMode::ForwardKey),
+            Agent::Claude | Agent::Opencode => Some(clipboard_bridge::PasteMode::ForwardKey),
             Agent::Codex => Some(clipboard_bridge::PasteMode::PastePath),
-            Agent::Opencode | Agent::Copilot | Agent::Shell => None,
+            Agent::Copilot | Agent::Shell => None,
         }
     }
 

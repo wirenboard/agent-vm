@@ -1,10 +1,10 @@
-//! Ctrl+V image bridge for claude and codex.
+//! Ctrl+V image bridge for claude, opencode and codex.
 //!
 //! [`Bridge`] is a `StdinFilter` on the SDK's interactive attach. On
 //! Ctrl+V it reads the host clipboard as PNG, writes it over agentd into
 //! the guest tmpfs `/run/agent-vm/clipboard/paste-N.png`, then lets the
-//! key through. Claude Code shells out to `xclip`/`wl-paste`, so
-//! [`install`] puts a shim by each name first on the guest PATH that
+//! key through. Claude Code and OpenCode shell out to `xclip`/`wl-paste`,
+//! so [`install`] puts a shim by each name first on the guest PATH that
 //! serves the newest PNG. Codex reads the clipboard through X11/Wayland
 //! (no shim possible) but attaches an image whose path is pasted, so its
 //! Ctrl+V becomes a bracketed paste of the guest path.
@@ -33,7 +33,7 @@ const KEEP: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasteMode {
-    /// Forward the key; the guest shims serve the PNG (Claude Code).
+    /// Forward the key; the guest shims serve the PNG (Claude Code, OpenCode).
     ForwardKey,
     /// Replace the key with a bracketed paste of the guest path (Codex).
     PastePath,
@@ -380,9 +380,9 @@ fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Vec<u
 // ---------------------------------------------------------------------
 
 /// Installed as both `xclip` and `wl-paste`; behaves per its own name.
-/// Serves Claude Code's probes: list types → `image/png`, read
-/// `image/png` → newest snapshot; any other read (text, bmp) fails as on
-/// a host without a clipboard tool.
+/// Serves Claude Code's and OpenCode's probes: list types → `image/png`,
+/// read `image/png` → newest snapshot; any other read (text, bmp) fails
+/// as on a host without a clipboard tool.
 const SHIM: &str = r#"#!/bin/sh
 # agent-vm clipboard bridge: serves the host's Ctrl+V image snapshot.
 DIR='@DIR@'

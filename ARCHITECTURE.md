@@ -324,7 +324,7 @@ shape `clipboard_bridge.rs`:
   is on the host-backed overlay). The launcher itself never puts it on
   host disk; the agent's own transcript may.
 
-Mechanics (shims for Claude Code, path paste for Codex, key
+Mechanics (shims for Claude Code and OpenCode, path paste for Codex, key
 detection) are documented in the module.
 
 ### Credentials: env-var only, deliberately
