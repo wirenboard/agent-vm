@@ -110,6 +110,26 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 | `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+| `AGENT_VM_NO_CLIPBOARD_BRIDGE` | don't bridge Ctrl+V image pastes into the guest (see below) |
+
+## Pasting images (Ctrl+V)
+
+Ctrl+V with an image on the host clipboard works in `agent-vm claude`,
+`agent-vm opencode` and `agent-vm codex`: the launcher pushes the image
+into the VM and the agent attaches it. Needs `wl-paste` (package `wl-clipboard`) or
+`xclip` on the host, and a terminal that passes Ctrl+V through to the
+application (most Linux terminals paste on Ctrl+Shift+V and leave
+Ctrl+V alone). Clipboard *text* is not bridged — your terminal's own
+paste shortcut already handles that.
+
+Privacy: every Ctrl+V in such a session copies the current host
+clipboard image into the VM, whatever is on screen. The launcher keeps
+it in guest memory only (claude/opencode: the latest, codex: the last eight,
+within a 64 MiB budget),
+but the agent's own session transcript may persist what it attached —
+Claude Code's lives under the project state dir. Reading the clipboard
+can delay that keystroke by a few seconds if the clipboard owner is
+unresponsive. `AGENT_VM_NO_CLIPBOARD_BRIDGE=1` turns the bridge off.
 
 ## Chrome DevTools MCP
 

@@ -303,6 +303,30 @@ Non-TTY mode loses the live streaming TUI experience but gives the caller a
 clean `stdout | other-tool` story. Streaming stdout/stderr during run landed
 in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
+### Ctrl+V image paste: why a stdin filter over agentd
+
+The guest has no X11/Wayland socket, so the agents' own clipboard code
+cannot work there; the host has to hand the image over. Two choices
+shape `clipboard_bridge.rs`:
+
+- **Where to intercept.** The SDK's `attach()` reads the terminal
+  itself, so the launcher cannot see keystrokes without help; the
+  wirenboard fork's SDK has a `StdinFilter` hook on attach for this.
+  The filter runs on its own task with results injected back into the
+  attach loop: a filter that waits on the guest (it writes the image
+  over agentd) inside the loop would stop the loop draining guest
+  output, and the relay's backpressure could then block the very
+  response the filter waits for.
+- **Where to put the image.** Not on the shared state mount: the guest
+  can rewrite that tree, so any host-side file operation in it is a
+  symlink/FIFO attack surface. The image goes over agentd into an
+  explicit tmpfs volume at `/run/agent-vm/clipboard` (the guest's `/run`
+  is on the host-backed overlay). The launcher itself never puts it on
+  host disk; the agent's own transcript may.
+
+Mechanics (shims for Claude Code and OpenCode, path paste for Codex, key
+detection) are documented in the module.
+
 ### Credentials: env-var only, deliberately
 
 Phase 2 reads `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from the host

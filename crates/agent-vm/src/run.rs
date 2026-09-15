@@ -16,11 +16,13 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::clipboard_bridge;
 use crate::session::ProjectSession;
 
-/// Paths that the guest will tmpfs-mount at boot, wiping anything our
-/// `patch` builder baked into the rootfs underneath them. We refuse to mirror
-/// a host project rooted here and fall back to `/workspace` instead.
+/// Paths the guest treats as volatile at boot (`/tmp` is a tmpfs; the rest
+/// are recreated by agentd), wiping anything our `patch` builder baked into
+/// the rootfs underneath them. We refuse to mirror a host project rooted
+/// here and fall back to `/workspace` instead.
 const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 
 /// Environment variables agent-vm injects into *every* guest, regardless of
@@ -42,6 +44,11 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   exist in the guest image and would silently fall back to C). Also
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
+
+/// The guest PATH. Mirrors the `ENV PATH=…` in images/Dockerfile (see
+/// the comment at the use site for why it has to be re-published).
+const GUEST_DEFAULT_PATH: &str =
+    "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
@@ -146,6 +153,17 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// How the Ctrl+V image bridge serves this agent, if at all
+    /// (see clipboard_bridge.rs). Off for shells: Ctrl+V there is usually
+    /// vim or readline, not a paste.
+    fn paste_mode(self) -> Option<clipboard_bridge::PasteMode> {
+        match self {
+            Agent::Claude | Agent::Opencode => Some(clipboard_bridge::PasteMode::ForwardKey),
+            Agent::Codex => Some(clipboard_bridge::PasteMode::PastePath),
+            Agent::Copilot | Agent::Shell => None,
+        }
+    }
+
     fn command(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
@@ -225,6 +243,7 @@ Environment:
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                skip the Chrome DevTools MCP setup
+  AGENT_VM_NO_CLIPBOARD_BRIDGE          don't bridge Ctrl+V image pastes into the guest
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
 #[derive(ClapArgs)]
@@ -1064,10 +1083,15 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // live there in debian, and dockerd does PATH lookups for its helper
     // binaries at runtime (not just at exec). Keep this list in sync with
     // the `ENV PATH=…` in images/Dockerfile.
-    builder = builder.env(
-        "PATH",
-        "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
-    );
+    //
+    // The Ctrl+V bridge's `xclip`/`wl-paste` shims go first so Claude
+    // Code's clipboard probes hit them (see clipboard_bridge.rs).
+    let paste_mode = agent.paste_mode().filter(|_| clipboard_bridge::enabled());
+    builder = builder.env("PATH", guest_path(paste_mode.is_some()));
+    if paste_mode.is_some() {
+        // /run is on the overlay (host-backed); keep pasted images in memory.
+        builder = builder.volume(clipboard_bridge::GUEST_DIR, |m| m.tmpfs().size(64));
+    }
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
@@ -1282,8 +1306,24 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
         // leaves cwd unset, falling back to that placeholder; `attach_with`
         // lets us set it, matching the streaming path below.
+        let mut filter = None;
+        if let Some(mode) = paste_mode {
+            match clipboard_bridge::install(&sandbox).await {
+                Ok(()) => filter = Some(clipboard_bridge::Bridge::new(sandbox.clone(), mode)),
+                Err(e) => eprintln!(
+                    "==> warning: Ctrl+V image bridge disabled: {}",
+                    clipboard_bridge::sanitize(e)
+                ),
+            }
+        }
         sandbox
-            .attach_with(cmd, |a| a.args(agent_args).cwd(project_guest_path.clone()))
+            .attach_with(cmd, |a| {
+                let a = a.args(agent_args).cwd(project_guest_path.clone());
+                match filter {
+                    Some(f) => a.stdin_filter(f),
+                    None => a,
+                }
+            })
             .await
             .with_context(|| {
                 format!(
@@ -1930,6 +1970,15 @@ const STRIP_IPV6_NAMESERVERS: &str =
 const SEED_CLAUDE_PLUGINS: &str =
     "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh || true";
 
+/// The guest PATH, with the clipboard bridge's shim dir in front when active.
+fn guest_path(bridge: bool) -> String {
+    if bridge {
+        format!("{}:{GUEST_DEFAULT_PATH}", clipboard_bridge::GUEST_BIN)
+    } else {
+        GUEST_DEFAULT_PATH.to_string()
+    }
+}
+
 /// Build the `bash -c` line that runs inside the guest: the prelude
 /// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
 /// optional project runtime hook) followed by `exec`'ing the chosen
@@ -1995,6 +2044,21 @@ mod tests {
     }
 
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
+
+    #[test]
+    fn guest_path_prepends_clipboard_shims_and_matches_dockerfile() {
+        assert_eq!(guest_path(false), GUEST_DEFAULT_PATH);
+        assert_eq!(
+            guest_path(true),
+            format!("{}:{GUEST_DEFAULT_PATH}", clipboard_bridge::GUEST_BIN)
+        );
+        // Drift guard for the "keep in sync with images/Dockerfile" note.
+        let dockerfile = include_str!("../../../images/Dockerfile");
+        assert!(
+            dockerfile.contains(&format!("PATH={GUEST_DEFAULT_PATH}")),
+            "GUEST_DEFAULT_PATH no longer matches the ENV PATH in images/Dockerfile"
+        );
+    }
 
     #[test]
     fn build_agent_shell_line_starts_with_v6_strip_and_execs() {

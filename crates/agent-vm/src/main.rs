@@ -1,6 +1,7 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod clipboard;
+mod clipboard_bridge;
 mod defaults;
 mod github_graphql;
 mod host_paths;
