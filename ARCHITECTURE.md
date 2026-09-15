@@ -303,26 +303,29 @@ Non-TTY mode loses the live streaming TUI experience but gives the caller a
 clean `stdout | other-tool` story. Streaming stdout/stderr during run landed
 in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
-### Ctrl+V image paste: a stdin filter on attach
+### Ctrl+V image paste: why a stdin filter over agentd
 
-Neither agent can read a clipboard inside the VM (no X11/Wayland
-socket). The wirenboard microsandbox fork's SDK exposes a `StdinFilter`
-hook on `attach()`: chunks of terminal input are filtered in order on a
-worker task and the results injected into the guest's stdin, so the
-attach loop keeps draining guest output while a filter waits on the
-guest. `clipboard_bridge.rs` implements it for claude and codex: it
-scans for Ctrl+V (legacy `0x16`, kitty `CSI 118;5 u`, xterm
-`CSI 27;5;118 ~`, never inside a bracketed paste), reads the host
-clipboard as PNG, and writes it with `sandbox.fs().write()` over agentd
-into `/run/agent-vm/clipboard/paste-N.png` — an explicit tmpfs volume,
-since the guest's `/run` sits on the host-backed overlay — before
-letting the key through. Claude Code shells out to `xclip`/`wl-paste`,
-so `install()` writes shims by those names into
-`/run/agent-vm/clipboard/bin`, which `run.rs` puts first on the guest
-PATH. Codex uses `arboard` directly (no shim possible) but attaches an
-image whose path is pasted into its composer, so for `agent-vm codex`
-the key is replaced by a bracketed paste of the guest path. The host
-never writes below the guest-writable state mount for this.
+The guest has no X11/Wayland socket, so the agents' own clipboard code
+cannot work there; the host has to hand the image over. Two choices
+shape `clipboard_bridge.rs`:
+
+- **Where to intercept.** The SDK's `attach()` reads the terminal
+  itself, so the launcher cannot see keystrokes without help; the
+  wirenboard fork's SDK has a `StdinFilter` hook on attach for this.
+  The filter runs on its own task with results injected back into the
+  attach loop: a filter that waits on the guest (it writes the image
+  over agentd) inside the loop would stop the loop draining guest
+  output, and the relay's backpressure could then block the very
+  response the filter waits for.
+- **Where to put the image.** Not on the shared state mount: the guest
+  can rewrite that tree, so any host-side file operation in it is a
+  symlink/FIFO attack surface. The image goes over agentd into an
+  explicit tmpfs volume at `/run/agent-vm/clipboard` (the guest's `/run`
+  is on the host-backed overlay). The launcher itself never puts it on
+  host disk; the agent's own transcript may.
+
+Mechanics (shims for Claude Code, path paste for Codex, key
+detection) are documented in the module.
 
 ### Credentials: env-var only, deliberately
 

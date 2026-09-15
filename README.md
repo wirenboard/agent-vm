@@ -114,28 +114,21 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 
 ## Pasting images (Ctrl+V)
 
-The guest has no display server, so the agents' own clipboard access
-can't work inside the VM. Instead, for `agent-vm claude` and `agent-vm
-codex`, the launcher watches the terminal input: on Ctrl+V it reads the
-host clipboard as PNG (`wl-paste` on Wayland, `xclip` on X11) and pushes
-it over the in-guest agent into a tmpfs at `/run/agent-vm/clipboard/`.
-Claude Code picks it up through `xclip`/`wl-paste` shims placed first on
-the guest PATH; Codex, which never shells out, instead receives the
-file's guest path as a paste, which it attaches as an image. Text on the
-clipboard is not bridged — your terminal's own paste shortcut already
-handles that. Nothing is written to the host disk; the images vanish
-with the VM.
+Ctrl+V with an image on the host clipboard works in `agent-vm claude`
+and `agent-vm codex`: the launcher pushes the image into the VM and
+the agent attaches it. Needs `wl-paste` (package `wl-clipboard`) or
+`xclip` on the host, and a terminal that passes Ctrl+V through to the
+application (most Linux terminals paste on Ctrl+Shift+V and leave
+Ctrl+V alone). Clipboard *text* is not bridged — your terminal's own
+paste shortcut already handles that.
 
-Every Ctrl+V you type in such a session takes a snapshot, whatever is
-on screen at that moment, and the guest can read it until your next
-Ctrl+V (codex: until the session ends). Reading the host clipboard
-delays that keystroke by up to three seconds per tool if the clipboard
-owner is unresponsive; other output keeps flowing.
-
-Requires `wl-paste` (package `wl-clipboard`) or `xclip` on the host,
-and a terminal that passes Ctrl+V through to the application (most
-Linux terminals paste on Ctrl+Shift+V and leave Ctrl+V alone). Set
-`AGENT_VM_NO_CLIPBOARD_BRIDGE=1` to turn it off.
+Privacy: every Ctrl+V in such a session copies the current host
+clipboard image into the VM, whatever is on screen. The launcher keeps
+it in guest memory only (claude: the latest, codex: the last eight),
+but the agent's own session transcript may persist what it attached —
+Claude Code's lives under the project state dir. Reading the clipboard
+can delay that keystroke by a few seconds if the clipboard owner is
+unresponsive. `AGENT_VM_NO_CLIPBOARD_BRIDGE=1` turns the bridge off.
 
 ## Chrome DevTools MCP
 

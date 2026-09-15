@@ -19,9 +19,10 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 use crate::clipboard_bridge;
 use crate::session::ProjectSession;
 
-/// Paths that the guest will tmpfs-mount at boot, wiping anything our
-/// `patch` builder baked into the rootfs underneath them. We refuse to mirror
-/// a host project rooted here and fall back to `/workspace` instead.
+/// Paths the guest treats as volatile at boot (`/tmp` is a tmpfs; the rest
+/// are recreated by agentd), wiping anything our `patch` builder baked into
+/// the rootfs underneath them. We refuse to mirror a host project rooted
+/// here and fall back to `/workspace` instead.
 const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 
 /// Environment variables agent-vm injects into *every* guest, regardless of
@@ -1309,7 +1310,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         if let Some(mode) = paste_mode {
             match clipboard_bridge::install(&sandbox).await {
                 Ok(()) => filter = Some(clipboard_bridge::Bridge::new(sandbox.clone(), mode)),
-                Err(e) => eprintln!("==> warning: Ctrl+V image bridge disabled: {e:#}"),
+                Err(e) => eprintln!(
+                    "==> warning: Ctrl+V image bridge disabled: {}",
+                    clipboard_bridge::sanitize(e)
+                ),
             }
         }
         sandbox
