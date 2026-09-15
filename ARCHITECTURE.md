@@ -307,21 +307,22 @@ in the Phase 4 verification session (2026-05-24) — see PLAN.md.
 
 Neither agent can read a clipboard inside the VM (no X11/Wayland
 socket). The wirenboard microsandbox fork's SDK exposes a `StdinFilter`
-hook on `attach()`: every chunk of terminal input passes through it
-before it is sent to the guest, and the chunk waits for the filter's
-future. `clipboard_bridge.rs` implements it: it scans for Ctrl+V
-(legacy `0x16`, kitty `CSI 118;5 u`, xterm `CSI 27;5;118 ~`, never
-inside a bracketed paste), reads the host clipboard as PNG, and writes
-it with `sandbox.fs().write()` over agentd into guest tmpfs
-(`/run/agent-vm/clipboard/paste-N.png`) before letting the key through.
-Claude Code shells out to `xclip`/`wl-paste`, so `install()` writes
-shims by those names into `/run/agent-vm/clipboard/bin`, which `run.rs`
-puts first on the guest PATH. Codex uses `arboard` directly (no shim
-possible) but attaches an image whose path is pasted into its composer,
-so for `agent-vm codex` the key is replaced by a bracketed paste of the
-guest path. The host never touches the guest-writable state mount for
-this, and no pty layer sits between the user and the SDK's own terminal
-handling.
+hook on `attach()`: chunks of terminal input are filtered in order on a
+worker task and the results injected into the guest's stdin, so the
+attach loop keeps draining guest output while a filter waits on the
+guest. `clipboard_bridge.rs` implements it for claude and codex: it
+scans for Ctrl+V (legacy `0x16`, kitty `CSI 118;5 u`, xterm
+`CSI 27;5;118 ~`, never inside a bracketed paste), reads the host
+clipboard as PNG, and writes it with `sandbox.fs().write()` over agentd
+into `/run/agent-vm/clipboard/paste-N.png` — an explicit tmpfs volume,
+since the guest's `/run` sits on the host-backed overlay — before
+letting the key through. Claude Code shells out to `xclip`/`wl-paste`,
+so `install()` writes shims by those names into
+`/run/agent-vm/clipboard/bin`, which `run.rs` puts first on the guest
+PATH. Codex uses `arboard` directly (no shim possible) but attaches an
+image whose path is pasted into its composer, so for `agent-vm codex`
+the key is replaced by a bracketed paste of the guest path. The host
+never writes below the guest-writable state mount for this.
 
 ### Credentials: env-var only, deliberately
 

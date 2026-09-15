@@ -30,16 +30,20 @@ use microsandbox::sandbox::{Sandbox, StdinFilter};
 use crate::clipboard::which;
 
 pub const DISABLE_ENV: &str = "AGENT_VM_NO_CLIPBOARD_BRIDGE";
-const GUEST_DIR: &str = "/run/agent-vm/clipboard";
+pub const GUEST_DIR: &str = "/run/agent-vm/clipboard";
 pub const GUEST_BIN: &str = "/run/agent-vm/clipboard/bin";
 const TOOL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Cap on one Ctrl+V (clipboard tools plus the guest write); past it the key
+/// is forwarded as if there were no image.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the guest receives for Ctrl+V when the host clipboard holds an image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasteMode {
     /// The key itself; the guest shims serve the PNG.
     ForwardKey,
-    /// A bracketed paste of the PNG's guest path (Codex).
+    /// A bracketed paste of the PNG's guest path (Codex). Sent even before
+    /// Codex enables bracketed paste; the filter can't see guest output.
     PastePath,
 }
 
@@ -107,16 +111,22 @@ impl Bridge {
         let path = {
             let mut st = self.state.lock().unwrap();
             st.counter += 1;
-            format!("{GUEST_DIR}/paste-{:06}.png", st.counter)
+            let path = format!("{GUEST_DIR}/paste-{:06}.png", st.counter);
+            // Recorded before the write so a partial file is cleaned up next time.
+            if self.mode == PasteMode::ForwardKey {
+                st.previous = Some(path.clone());
+            }
+            path
         };
-        if let Err(e) = fs.write(&path, png).await {
-            eprintln!("\r\nagent-vm: clipboard bridge: writing {path}: {e}\r");
-            return None;
+        match fs.write(&path, png).await {
+            Ok(()) => Some(path),
+            Err(e) => {
+                let e: String = e.to_string().chars().filter(|c| !c.is_control()).collect();
+                eprintln!("\r\nagent-vm: clipboard bridge: writing {path}: {e}\r");
+                let _ = fs.remove(&path).await;
+                None
+            }
         }
-        if self.mode == PasteMode::ForwardKey {
-            self.state.lock().unwrap().previous = Some(path.clone());
-        }
-        Some(path)
     }
 }
 
@@ -128,7 +138,12 @@ impl StdinFilter for Bridge {
             for seg in segments {
                 match seg {
                     Segment::Bytes(b) => out.extend_from_slice(&b),
-                    Segment::CtrlV(key) => match (self.mode, self.snapshot().await) {
+                    Segment::CtrlV(key) => match (
+                        self.mode,
+                        tokio::time::timeout(SNAPSHOT_TIMEOUT, self.snapshot())
+                            .await
+                            .unwrap_or(None),
+                    ) {
                         (PasteMode::PastePath, Some(path)) => {
                             out.extend_from_slice(PASTE_START);
                             out.extend_from_slice(path.as_bytes());
@@ -271,12 +286,13 @@ fn parse_key_report(s: &[u8]) -> Option<(usize, bool)> {
             return (s.get(i) == Some(&b'~')).then_some((i + 1, key == 118 && has_ctrl(mods)));
         }
     }
-    (s.get(i) == Some(&b'u')).then_some((i + 1, first == 118 && has_ctrl(mods) && event <= 2))
+    (s.get(i) == Some(&b'u')).then_some((i + 1, first == 118 && has_ctrl(mods) && event == 1))
 }
 
 /// Modifier field of a key report: 1 + bitmask (shift 1, alt 2, ctrl 4).
+/// Ctrl+Shift+V is the terminal's own paste shortcut, not ours.
 fn has_ctrl(mods: u32) -> bool {
-    mods >= 1 && (mods - 1) & 4 != 0
+    mods >= 1 && (mods - 1) & 5 == 4
 }
 
 // ---------------------------------------------------------------------
@@ -424,8 +440,6 @@ mod tests {
         for seq in [
             &b"\x1b[118;5u"[..],
             b"\x1b[118;5:1u",
-            b"\x1b[118;5:2u",
-            b"\x1b[118:86;6u",
             b"\x1b[118:86:118;5u",
             b"\x1b[118;7u",
             b"\x1b[27;5;118~",
@@ -437,7 +451,9 @@ mod tests {
             );
         }
         for seq in [
-            &b"\x1b[118;5:3u"[..], // release
+            &b"\x1b[118;5:2u"[..], // repeat
+            b"\x1b[118;5:3u",      // release
+            b"\x1b[118:86;6u",     // ctrl+shift: the terminal's paste key
             b"\x1b[118u",          // no modifier field
             b"\x1b[118;2u",        // shift only
             b"\x1b[99;5u",         // ctrl+c

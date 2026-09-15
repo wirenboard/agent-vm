@@ -115,22 +115,22 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 ## Pasting images (Ctrl+V)
 
 The guest has no display server, so the agents' own clipboard access
-can't work inside the VM. Instead, `agent-vm` watches the terminal
-input of an interactive session: on Ctrl+V it reads the host clipboard
-as PNG (`wl-paste` on Wayland, `xclip` on X11) and pushes it over the
-in-guest agent into guest tmpfs at `/run/agent-vm/clipboard/`. Claude
-Code picks it up through `xclip`/`wl-paste` shims placed first on the
-guest PATH; Codex, which never shells out, instead receives the file's
-guest path as a paste, which it attaches as an image. Text on the
+can't work inside the VM. Instead, for `agent-vm claude` and `agent-vm
+codex`, the launcher watches the terminal input: on Ctrl+V it reads the
+host clipboard as PNG (`wl-paste` on Wayland, `xclip` on X11) and pushes
+it over the in-guest agent into a tmpfs at `/run/agent-vm/clipboard/`.
+Claude Code picks it up through `xclip`/`wl-paste` shims placed first on
+the guest PATH; Codex, which never shells out, instead receives the
+file's guest path as a paste, which it attaches as an image. Text on the
 clipboard is not bridged — your terminal's own paste shortcut already
 handles that. Nothing is written to the host disk; the images vanish
 with the VM.
 
-Every Ctrl+V you type in the session takes a snapshot, whatever is
-running in the guest at that moment, and the guest can read it until
-your next Ctrl+V (codex: until the session ends). Reading the host
-clipboard pauses input for up to three seconds per tool if the
-clipboard owner is unresponsive.
+Every Ctrl+V you type in such a session takes a snapshot, whatever is
+on screen at that moment, and the guest can read it until your next
+Ctrl+V (codex: until the session ends). Reading the host clipboard
+delays that keystroke by up to three seconds per tool if the clipboard
+owner is unresponsive; other output keeps flowing.
 
 Requires `wl-paste` (package `wl-clipboard`) or `xclip` on the host,
 and a terminal that passes Ctrl+V through to the application (most

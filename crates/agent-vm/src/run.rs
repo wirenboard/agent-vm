@@ -44,9 +44,6 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
-/// Where the per-project host state dir is bind-mounted inside the guest.
-const GUEST_STATE_MOUNT: &str = "/agent-vm-state";
-
 /// The guest PATH. Mirrors the `ENV PATH=…` in images/Dockerfile (see
 /// the comment at the use site for why it has to be re-published).
 const GUEST_DEFAULT_PATH: &str =
@@ -155,6 +152,17 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// How the Ctrl+V image bridge serves this agent, if at all
+    /// (see clipboard_bridge.rs). Off for shells: Ctrl+V there is usually
+    /// vim or readline, not a paste.
+    fn paste_mode(self) -> Option<clipboard_bridge::PasteMode> {
+        match self {
+            Agent::Claude => Some(clipboard_bridge::PasteMode::ForwardKey),
+            Agent::Codex => Some(clipboard_bridge::PasteMode::PastePath),
+            Agent::Opencode | Agent::Copilot | Agent::Shell => None,
+        }
+    }
+
     fn command(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
@@ -176,14 +184,6 @@ impl Agent {
     /// project would have the later-exiting shell wholesale clobber
     /// the earlier shell's commands (the symlink target is the same
     /// host file, see `run.rs`'s `.symlink(... "/root/.bash_history" ...)`).
-    /// How the Ctrl+V bridge delivers an image (see clipboard_bridge.rs).
-    fn paste_mode(self) -> clipboard_bridge::PasteMode {
-        match self {
-            Agent::Codex => clipboard_bridge::PasteMode::PastePath,
-            _ => clipboard_bridge::PasteMode::ForwardKey,
-        }
-    }
-
     fn default_args(self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["--dangerously-skip-permissions"],
@@ -682,7 +682,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .memory(memory_mib)
         .workdir(krun_workdir)
         .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
-        .volume(GUEST_STATE_MOUNT, |m| m.bind(&session.state_dir));
+        .volume("/agent-vm-state", |m| m.bind(&session.state_dir));
     // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
     // .volume() — and we also have to mkdir the guest path in the
     // patch builder so microsandbox's workdir/rootfs validation passes
@@ -1085,8 +1085,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     //
     // The Ctrl+V bridge's `xclip`/`wl-paste` shims go first so Claude
     // Code's clipboard probes hit them (see clipboard_bridge.rs).
-    let bridge = clipboard_bridge::enabled();
-    builder = builder.env("PATH", guest_path(bridge));
+    let paste_mode = agent.paste_mode().filter(|_| clipboard_bridge::enabled());
+    builder = builder.env("PATH", guest_path(paste_mode.is_some()));
+    if paste_mode.is_some() {
+        // /run is on the overlay (host-backed); keep pasted images in memory.
+        builder = builder.volume(clipboard_bridge::GUEST_DIR, |m| m.tmpfs().size(64));
+    }
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
@@ -1301,17 +1305,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
         // leaves cwd unset, falling back to that placeholder; `attach_with`
         // lets us set it, matching the streaming path below.
-        let filter = if bridge {
-            clipboard_bridge::install(&sandbox)
-                .await
-                .context("installing the clipboard bridge")?;
-            Some(std::sync::Arc::new(clipboard_bridge::Bridge::new(
-                sandbox.clone(),
-                agent.paste_mode(),
-            )))
-        } else {
-            None
-        };
+        let mut filter = None;
+        if let Some(mode) = paste_mode {
+            match clipboard_bridge::install(&sandbox).await {
+                Ok(()) => filter = Some(clipboard_bridge::Bridge::new(sandbox.clone(), mode)),
+                Err(e) => eprintln!("==> warning: Ctrl+V image bridge disabled: {e:#}"),
+            }
+        }
         sandbox
             .attach_with(cmd, |a| {
                 let a = a.args(agent_args).cwd(project_guest_path.clone());
