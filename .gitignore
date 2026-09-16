@@ -11,3 +11,6 @@ Cargo.lock.bak
 # never commit). Use .claude/settings.json for shared, reviewed
 # settings instead.
 .claude/settings.local.json
+
+Dockerfile
+.dockerignore
